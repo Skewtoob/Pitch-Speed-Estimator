@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+# analysis outputs and test media
+*_pitchspeed/
+*.mp4
+*.mkv
+*.avi
+*.mpg
+*.vob
+*.dv
+*.mov
+*.wmv
+*.npz
+!tests/data/*.json
