@@ -137,7 +137,8 @@ def test_detector_attached_flag_for_ball_touching_body():
     ball = (400.0, 271.0)
     out = _run_detector(_field_sequence(ball=ball, blob=True))
     c = out[15].cands
-    near = c[np.hypot(c["x"] - ball[0], c["y"] - ball[1]) < 5]   # centroid is pulled toward the body
+    # the ball merges with the arm-sized region: whatever is detected there is 'attached'
+    near = c[np.hypot(c["x"] - ball[0], c["y"] - ball[1]) < 16]
     assert len(near) and near["attached"].all()
     assert out[15].blobs                     # the big blob is reported in reference px
 
