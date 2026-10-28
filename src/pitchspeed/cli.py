@@ -141,11 +141,15 @@ def cmd_calibrate(args) -> int:
     existing, path = _load_calib(args, out_dir)
     view = _ask_view(args.view or (existing.segments[0].view if existing and existing.segments else None))
     settings = _settings_from_args(args, base=existing.settings if existing else None)
+    if view == "side" and settings.pitcher_throws is None:
+        a = (_ask("Pitcher throws right or left? (R/L, Enter = not sure)", "") or "").strip().upper()
+        if a in ("R", "L"):
+            settings.pitcher_throws = a
     reader, scan, source = _open_source(args.video, args.field_order, args.par)
     settings.sar = reader.info.sar
     print(f"\nOpening the calibration window ({view} view). Press H in the window for help.")
     cf = run_calibration_ui(source, reader.info, view, initial=existing, settings=settings,
-                            start_frame=args.frame or 0)
+                            start_frame=args.frame or 0, ui_scale=getattr(args, "ui_scale", None))
     reader.close()
     if cf is None:
         print("Calibration cancelled; nothing saved.")
@@ -177,13 +181,33 @@ def _analyze(args, out_dir: str):
 
 
 def _render(result, source, out_dir: str, mode: str, audio: bool) -> Optional[str]:
-    from pitchspeed.pipeline import load_transforms
+    from pitchspeed.pipeline import Progress, load_transforms
     from pitchspeed.render.overlay import render_annotated
     tf, ts = load_transforms(out_dir)
     out = out_paths(out_dir)["annotated"]
+    if mode == "highlights" and not any(p.status != "rejected" for p in result.pitches):
+        print("\nNo pitches to show, so no highlights video was written.")
+        return None
     print(f"\nWriting annotated video ({mode}) ...")
-    out = render_annotated(result, source, out, mode=mode, transforms=tf, transform_samples=ts, audio=audio)
+    prog = {"p": None}
+
+    def progress(done, total):
+        if prog["p"] is None:
+            prog["p"] = Progress(total, "rendering")
+        prog["p"].update(done)
+
+    info: dict = {}
+    try:
+        out = render_annotated(result, source, out, mode=mode, transforms=tf, transform_samples=ts,
+                               audio=audio, progress=progress, info=info)
+    except ValueError as e:
+        print(f"\nCould not write the annotated video: {e}")
+        return None
+    if prog["p"] is not None:
+        prog["p"].done()
     print(f"Annotated video: {out}")
+    if audio and info.get("audio_status") and not str(info["audio_status"]).startswith("ok"):
+        print(f"  audio: {info['audio_status']}")
     return out
 
 
@@ -219,7 +243,7 @@ def _review(args, out_dir: str, source=None):
 
     print("\nOpening the review window. Press H in the window for help.")
     result = run_review_ui(result, source, cf, make_recompute(cf, result.scan, source), save,
-                           transforms=tf, transform_samples=ts)
+                           transforms=tf, transform_samples=ts, ui_scale=getattr(args, "ui_scale", None))
     save(result)
     return result, source
 
@@ -305,6 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--par", type=float, help="override pixel aspect ratio (x_square = x * par)")
         if calib:
             p.add_argument("--calib", help="calibration file (default: <out>/calibration.json)")
+        p.add_argument("--ui-scale", type=float, help="enlarge (e.g. 1.5) or shrink the click/review windows")
 
     def settings_args(p):
         p.add_argument("--view", choices=["side", "behind"], help="camera position")
@@ -375,6 +400,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if argv and argv[0] == "synth":
         from pitchspeed.synth.cli import main as synth_main
         return int(synth_main(argv[1:]) or 0)
+    for stream in (sys.stdout, sys.stderr):   # file names/notes may not fit a Windows console code page
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = build_parser()
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -382,8 +412,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not getattr(args, "func", None):
         ap.print_help()
         return 0
+    from pitchspeed.ui.gui import GuiUnavailable
     try:
         return int(args.func(args) or 0)
+    except GuiUnavailable as e:
+        print(f"\nerror: cannot open a window: {e}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("\ninterrupted")
         return 130

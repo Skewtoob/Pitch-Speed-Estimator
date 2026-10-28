@@ -36,6 +36,7 @@ def out_paths(out_dir: str) -> dict:
         "results_csv": str(d / "results.csv"),
         "annotated": str(d / "annotated.mp4"),
         "transforms": str(d / "transforms.npz"),
+        "index": str(d / "index.npz"),
         "log": str(d / "log.txt"),
         "debug": str(d / "debug"),
     }
@@ -126,15 +127,49 @@ def _pitch_from_track(tr: PitchTrack, source, calib: Calibration, scan: ScanInfo
     cat = tr.catch
     p = Pitch(number=0, status="auto", release=rel, catch=cat,
               speed=None, track=tr, confidence=tr.confidence, flags=list(tr.flags))
-    p.frame_release = source.locate(rel.s)[0] if rel.s is not None else int(rel.t * source.reader.info.frame_rate)
-    p.frame_catch = source.locate(cat.s)[0] if cat.s is not None else int(cat.t * source.reader.info.frame_rate)
+    s_rel = rel.s if rel.s is not None else source.sample_at_time(rel.t)
+    s_cat = cat.s if cat.s is not None else source.sample_at_time(cat.t)
+    p.frame_release = source.locate(s_rel)[0]
+    p.frame_catch = source.locate(s_cat)[0]
     p.speed = estimate_for(calib, scan, source.sample_dt, p)
     return p
 
 
+DOUBTFUL_CONFIDENCE = 0.3
+
+
+def resolve_field_order(scan: ScanInfo, tracks: list[PitchTrack]) -> str:
+    """Use per-track field-order checks to confirm or contradict the scan verdict.
+
+    Returns 'confirmed' (scan.confidence raised to 'high'), 'flip' (tracks say
+    the order is reversed) or 'unknown'.  Overrides are never second-guessed.
+    """
+    if not scan.interlaced or scan.source == "override":
+        return "unknown"
+    given = flipped = 0
+    for tr in tracks:
+        fo = (tr.diagnostics or {}).get("field_order") or {}
+        n = fo.get("n", 0)
+        rg, rf = fo.get("rms_given"), fo.get("rms_flipped")
+        if n < 12 or rg is None or rf is None:
+            continue
+        if fo.get("conflict") and rg > 3.0 * rf:
+            flipped += 1
+        elif fo.get("preferred") == "given" and rf > 3.0 * max(rg, 0.2):
+            given += 1
+    scan.evidence["tracks"] = {"prefer_given": given, "prefer_flipped": flipped}
+    if flipped >= 1 and flipped > given:
+        return "flip"
+    if given >= 1 and flipped == 0:
+        scan.confidence = "high"
+        scan.evidence["confirmed_by"] = "ball tracks"
+        return "confirmed"
+    return "unknown"
+
+
 def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str] = None,
-            opts: Optional[AnalyzeOptions] = None, show_progress: bool = True):
-    """Run the full analysis.  Returns (AnalysisResult, source, transforms dict)."""
+            opts: Optional[AnalyzeOptions] = None, show_progress: bool = True, _flipped: bool = False):
+    """Run the full analysis.  Returns (AnalysisResult, SampleSource)."""
     from pitchspeed.io.reader import VideoReader
     from pitchspeed.io.interlace import SampleSource, detect_scan
     from pitchspeed.vision.finder import FinderOptions, PitchFinder
@@ -146,7 +181,7 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
     paths = out_paths(out_dir)
     warnings: list[str] = []
 
-    reader = VideoReader(video_path, sar_override=opts.par)
+    reader = VideoReader(video_path, sar_override=opts.par, index_cache=paths["index"])
     info = reader.info
     fo = None if opts.field_order in (None, "auto") else opts.field_order
     scan = detect_scan(reader, override=fo)
@@ -163,21 +198,23 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
         warnings.append(f"{len(info.dropped_frames)} dropped-frame gaps in the capture")
 
     warnings += calib_file.validate()
-    if abs(calib_file.settings.sar - info.sar) > 1e-3:
+    # 8:9 vs 10:11 (the two SD conventions) differ by ~2%, which barely matters here.
+    if abs(calib_file.settings.sar - info.sar) > 0.05 * info.sar:
         warnings.append(f"calibration pixel aspect {calib_file.settings.sar:.4f} differs from the video's "
                         f"{info.sar:.4f}; using the calibration's value for geometry")
 
-    fopts = FinderOptions(**opts.finder) if opts.finder else FinderOptions()
-    if opts.debug and hasattr(fopts, "debug_dir"):
+    fopts = FinderOptions.from_dict(opts.finder)
+    if opts.debug:
         fopts.debug_dir = paths["debug"]
 
-    s_lo = 0 if opts.start_s is None else max(0, int(opts.start_s / source.sample_dt))
-    s_hi = source.n_samples if opts.end_s is None else min(source.n_samples, int(opts.end_s / source.sample_dt) + 1)
+    s_lo = 0 if opts.start_s is None else source.sample_at_time(opts.start_s)
+    s_hi = source.n_samples if opts.end_s is None else min(source.n_samples, source.sample_at_time(opts.end_s) + 1)
 
     pitches: list[Pitch] = []
     rejected: list[PitchTrack] = []
     missed: list[dict] = []
-    tf_s, tf_m, tf_q = [], [], []
+    seg_results = []
+    tf_s, tf_m, tf_q, tf_h = [], [], [], []
     for seg_i, calib in enumerate(calib_file.segment_calibs()):
         seg = calib.segment
         s0 = max(s_lo, source.sample_of(seg.start_frame, 0))
@@ -195,20 +232,59 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
         tf_s.append(np.asarray(fr.sample_index))
         tf_m.append(np.asarray(fr.transforms))
         tf_q.append(np.asarray(fr.transform_quality))
+        h = fr.diagnostics.get("transforms_3x3") if isinstance(fr.diagnostics, dict) else None
+        tf_h.append(np.asarray(h) if h is not None and len(h) == len(fr.sample_index)
+                    else _affine_to_3x3(np.asarray(fr.transforms)))
+        seg_results.append((calib, fr))
+
+    # Field order: the detector can be unsure on real footage, but a well-tracked
+    # ball settles it (wrong order makes the track zig-zag by a field's motion).
+    verdict = resolve_field_order(scan, [tr for _, fr in seg_results for tr in fr.tracks])
+    if verdict == "flip" and not _flipped:
+        flipped = "tff" if scan.field_order == "bff" else "bff"
+        log.warning("ball tracks contradict the detected field order; re-running with %s", flipped)
+        reader.close()
+        o2 = AnalyzeOptions(**{**opts.__dict__, "field_order": flipped})
+        result, source2 = analyze(video_path, calib_file, out_dir, o2, show_progress, _flipped=True)
+        result.scan.source = "tracks"
+        result.scan.confidence = "medium"
+        result.warnings.insert(0, f"field order corrected to {flipped.upper()} from the ball tracks "
+                                  f"(the detector said {scan.field_order.upper()})")
+        write_json(result, paths["results_json"])
+        write_csv(result, paths["results_csv"])
+        return result, source2
+    if verdict == "confirmed":
+        warnings = [w for w in warnings if not w.startswith("interlace/field-order detection is uncertain")]
+
+    for calib, fr in seg_results:
         for tr in fr.tracks:
             if tr.release is None or tr.catch is None:
                 tr.status = "rejected"
                 tr.reject_code = tr.reject_code or "NO_EVENTS"
                 rejected.append(tr)
                 continue
-            pitches.append(_pitch_from_track(tr, source, calib, scan))
+            p = _pitch_from_track(tr, source, calib, scan)
+            if p.speed.label == "none" and tr.confidence < DOUBTFUL_CONFIDENCE:
+                # Probably not a pitch (bird, throw back, ...) and unmeasurable anyway:
+                # list it for review instead of giving it a pitch number.
+                tr.status = "rejected"
+                tr.reject_code = "DOUBTFUL_NO_SPEED"
+                rejected.append(tr)
+                missed.append({"s_start": tr.points[0].s, "s_end": tr.points[-1].s,
+                               "t_start": tr.points[0].t, "t_end": tr.points[-1].t,
+                               "reason": f"unconfirmed moving object (confidence {tr.confidence:.2f}); "
+                                         f"{p.speed.reason or 'speed not measurable'}"})
+                continue
+            pitches.append(p)
         rejected.extend(fr.rejected)
         missed.extend(fr.possible_missed)
 
+    missed.sort(key=lambda m: m.get("t_start", 0.0))
     renumber(pitches)
     if tf_s:
         np.savez_compressed(paths["transforms"], samples=np.concatenate(tf_s),
-                            transforms=np.concatenate(tf_m), quality=np.concatenate(tf_q))
+                            transforms=np.concatenate(tf_m), quality=np.concatenate(tf_q),
+                            transforms_3x3=np.concatenate(tf_h))
 
     params = {
         "field_order_option": opts.field_order or "auto",
@@ -224,6 +300,15 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
     write_json(result, paths["results_json"])
     write_csv(result, paths["results_csv"])
     return result, source
+
+
+def _affine_to_3x3(A: np.ndarray) -> np.ndarray:
+    if A.size == 0:
+        return np.zeros((0, 3, 3))
+    H = np.zeros((len(A), 3, 3))
+    H[:, :2, :] = A
+    H[:, 2, 2] = 1.0
+    return H
 
 
 def load_transforms(out_dir: str):
