@@ -463,6 +463,7 @@ def test_radar_card_moves_left_when_the_path_runs_behind_it():
     high = np.column_stack([np.linspace(600, 950, 50), np.full(50, 100.0)])
     x, y = p._place(sp, high)
     assert x == p.m and y >= p.hud_bottom                            # path behind the card: top left
+    assert y >= p.hint_bottom                                        # ... below the missed-pitch hint line
     assert p._place(sp, None)[0] > 480
 
 
@@ -542,3 +543,48 @@ def test_build_marks_adds_the_path_with_seen_flags():
     assert path.shape[1] == 4 and path[0, 0] == marks[0].points[0, 0] and path[-1, 0] == marks[0].points[-1, 0]
     gap = (path[:, 0] >= 69) & (path[:, 0] < 76)                     # from the last seen point to the next
     assert not path[gap, 3].any() and path[~gap, 3].all()
+
+
+def test_left_card_never_covers_the_missed_pitch_hint():
+    """Pitch path through the top-right card spot + a possible-missed window during the hold:
+    the card goes top left, and the hint line must not overlap it."""
+    for size in ((960, 720), (640, 480), (320, 240)):
+        def render(missed, rejected=False):
+            r = _small_result(1)
+            for q in r.pitches[0].track.points:        # ball high up on the right (reference px)
+                q.x, q.y, q.inlier = 520.0 + 0.5 * (q.s - 60), 60.0, True
+            r.pitches[0].status = "rejected" if rejected else "auto"
+            r.possible_missed = [{"s_start": 100, "s_end": 200, "reason": "x"}] if missed else []
+            return _render(r, H.FakeSource(220), size=size)[1].frames[150].astype(int)
+        bare, card, both = render(False, rejected=True), render(False), render(True)
+        half = size[0] // 2
+        on_card = np.abs(card - bare).sum(axis=2)[:, :half] > 0      # left half: the card only
+        ys, xs = np.nonzero(on_card)
+        assert len(ys) > 100                                         # the card went to the left
+        hint = np.abs(both - card).sum(axis=2)[:, :half] > 0
+        assert hint.sum() > 10                                       # the hint is drawn ...
+        box = np.zeros_like(hint)
+        box[ys.min():ys.max() + 1, xs.min():xs.max() + 1] = True
+        assert not (hint & box).any(), size                          # ... but never on the card
+
+
+def test_stale_model_never_ignores_hand_clicked_points():
+    """A stored fit is not redone after review edits: it must not be used if it misses a manual point."""
+    from pitchspeed.vision.model import TrajModel
+    s = np.arange(60, 87)
+    t = s * H.FIELD_DT
+    m = TrajModel(kind="poly", t0=float(t.mean()), ts=float((t[-1] - t[0]) / 2), a=np.array([300.0, -200.0, 0.0]),
+                  b=np.array([200.0, 0.0, 0.0]), c=np.zeros(2), t_min=float(t[0]), t_max=float(t[-1]))
+    xy = m.eval(t)
+    manual = np.isin(s, [72, 75])
+    xy[manual, 1] += 30.0                                              # the user clicked the ball 30 px lower
+    rows = np.column_stack([s, xy, manual.astype(float), t])
+    path = O.fitted_path(rows, m.to_dict())
+    for k in np.nonzero(manual)[0]:
+        j = int(np.argmin(np.abs(path[:, 0] - s[k])))
+        assert np.hypot(*(path[j, 1:3] - xy[k])) < 1.0                 # the line goes through the clicks
+    one_far = xy.copy()
+    one_far[10, 1] += 40.0                                             # one auto point far off: not ignored either
+    path = O.fitted_path(np.column_stack([s, one_far, np.zeros(len(s)), t]), m.to_dict())
+    j = int(np.argmin(np.abs(path[:, 0] - s[10])))
+    assert np.hypot(*(path[j, 1:3] - m.eval(t[10:11])[0])) > 5.0

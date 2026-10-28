@@ -285,8 +285,8 @@ edits stay). Changing the camera view needs new clicks
 ## Credits
 
 The video graphics use the [Inter](https://github.com/rsms/inter) font
-(Copyright 2016 The Inter Project Authors), included unmodified under the SIL
-Open Font License 1.1: see `src/pitchspeed/render/fonts/OFL.txt`.
+(Copyright (c) 2016 The Inter Project Authors), included unmodified under the
+SIL Open Font License 1.1: see `src/pitchspeed/render/fonts/OFL.txt`.
 
 ## For developers
 

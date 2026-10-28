@@ -28,7 +28,7 @@ pitchspeed = "pitchspeed.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"pitchspeed.render" = ["fonts/*.otf", "fonts/OFL.txt"]
+"pitchspeed.render" = ["fonts/*.otf", "fonts/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

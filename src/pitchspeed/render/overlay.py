@@ -188,16 +188,21 @@ def _track_points(p: Pitch) -> np.ndarray:
     return _track_rows(p)[:, :4]
 
 
-def _fits(pred: np.ndarray, xy: np.ndarray) -> bool:
-    """A curve matches the points if 90% of them (and both ends) are within PATH_TOL_PX."""
+def _fits(pred: np.ndarray, xy: np.ndarray, manual: Optional[np.ndarray] = None) -> bool:
+    """A curve matches the points if 90% of them are within PATH_TOL_PX, both ends within 2x, no
+    point beyond 3x, and every hand-clicked point within PATH_TOL_PX (a stored fit is not redone
+    after review edits, so it must not be allowed to ignore the user's clicks)."""
     if not np.all(np.isfinite(pred)):
         return False
     res = np.hypot(pred[:, 0] - xy[:, 0], pred[:, 1] - xy[:, 1])
-    return bool(np.percentile(res, 90) <= PATH_TOL_PX and max(res[0], res[-1]) <= 2 * PATH_TOL_PX)
+    if manual is not None and np.any(manual) and np.max(res[np.asarray(manual, bool)]) > PATH_TOL_PX:
+        return False
+    return bool(np.percentile(res, 90) <= PATH_TOL_PX and max(res[0], res[-1]) <= 2 * PATH_TOL_PX
+                and np.max(res) <= 3 * PATH_TOL_PX)
 
 
 def _model_path(model: Optional[dict], s: np.ndarray, t: np.ndarray, xy: np.ndarray,
-                ss: np.ndarray) -> Optional[np.ndarray]:
+                ss: np.ndarray, manual: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
     """The tracker's fitted curve at the dense samples ss, or None if it is unusable here."""
     if not isinstance(model, dict) or not all(k in model for k in ("kind", "t0", "ts", "a", "b", "c")):
         return None
@@ -209,7 +214,7 @@ def _model_path(model: Optional[dict], s: np.ndarray, t: np.ndarray, xy: np.ndar
         tt = np.interp(ss, s, t)
         if not np.all(m.denom(tt) > 0.05) or not np.all(m.denom(t) > 0.05):     # no pole in the span
             return None
-        if not _fits(m.eval(t), xy):
+        if not _fits(m.eval(t), xy, manual):
             return None
         out = m.eval(tt)
     except (KeyError, TypeError, ValueError, IndexError, FloatingPointError, np.linalg.LinAlgError):
@@ -217,21 +222,25 @@ def _model_path(model: Optional[dict], s: np.ndarray, t: np.ndarray, xy: np.ndar
     return out if np.all(np.isfinite(out)) else None
 
 
-def _simple_path(s: np.ndarray, xy: np.ndarray, ss: np.ndarray) -> np.ndarray:
-    """Quadratic in time if it matches the points, else the points joined (lightly smoothed)."""
+def _simple_path(s: np.ndarray, xy: np.ndarray, ss: np.ndarray,
+                 manual: Optional[np.ndarray] = None) -> np.ndarray:
+    """Quadratic in time if it matches the points, else the points joined (lightly smoothed;
+    hand-clicked points are kept exactly)."""
     n = len(s)
     if n >= 4:
         u = (s - s.mean()) / max(1.0, float(np.ptp(s)))
         uu = (ss - s.mean()) / max(1.0, float(np.ptp(s)))
         try:
             cx, cy = np.polyfit(u, xy[:, 0], 2), np.polyfit(u, xy[:, 1], 2)
-            if _fits(np.column_stack([np.polyval(cx, u), np.polyval(cy, u)]), xy):
+            if _fits(np.column_stack([np.polyval(cx, u), np.polyval(cy, u)]), xy, manual):
                 return np.column_stack([np.polyval(cx, uu), np.polyval(cy, uu)])
         except (ValueError, np.linalg.LinAlgError):
             pass
     sm = xy.copy()
     if n >= 3:
         sm[1:-1] = (xy[:-2] + 2 * xy[1:-1] + xy[2:]) / 4.0
+        if manual is not None:
+            sm[np.asarray(manual, bool)] = xy[np.asarray(manual, bool)]
     return np.column_stack([np.interp(ss, s, sm[:, 0]), np.interp(ss, s, sm[:, 1])])
 
 
@@ -255,16 +264,19 @@ def fitted_path(rows: np.ndarray, model: Optional[dict] = None) -> np.ndarray:
     rows = np.asarray(rows, dtype=np.float64)
     if len(rows) == 0:
         return np.zeros((0, 3))
+    man = rows[:, 3] > 0 if rows.shape[1] > 3 else np.zeros(len(rows), bool)
+    order = np.lexsort((~man, rows[:, 0]))                           # by sample; a hand-clicked point first
+    rows, man = rows[order], man[order]
     s, xy, t = rows[:, 0], rows[:, 1:3], rows[:, 4] if rows.shape[1] > 4 else np.full(len(rows), np.nan)
     keep = np.concatenate([[True], np.diff(s) > 0])                  # one point per sample
-    s, xy, t = s[keep], xy[keep], t[keep]
+    s, xy, t, man = s[keep], xy[keep], t[keep], man[keep]
     if len(s) == 1:
         return np.array([[s[0], xy[0, 0], xy[0, 1]]])
     n = int(min(20000, (s[-1] - s[0]) * PATH_DENSITY + 1))
     ss = np.linspace(s[0], s[-1], max(2, n))
-    out = _model_path(model, s, t, xy, ss)
+    out = _model_path(model, s, t, xy, ss, man)
     if out is None:
-        out = _simple_path(s, xy, ss)
+        out = _simple_path(s, xy, ss, man)
     return np.column_stack([ss, out])
 
 
@@ -661,6 +673,9 @@ class RadarPainter(Painter):
         self.card_top = self.list_y + int(round((G.LIST_H + 8) * self.k))
         _, tht, base = self._size("00:00:00.000", self.font, 0.6 * self.k, max(1, int(round(self.k))))
         self.hud_bottom = tht + base + 2 * self.m
+        th = max(1, int(round(self.k)))
+        _, _, hbase = self._size("possible missed pitch", self.font, 0.55 * self.k, th)
+        self.hint_bottom = int(round(62 * self.k)) + hbase + 2 * th     # see Painter.hint
 
     def pitch_trail(self, img, m, M, s, flying, opacity=1.0):
         if M is None:
@@ -694,10 +709,10 @@ class RadarPainter(Painter):
         return min(self.k, (self.w - 2 * self.m) / w)          # never wider than the frame
 
     def _place(self, sp: G.Sprite, path: Optional[np.ndarray]) -> tuple[int, int]:
-        """Top-right under the running list, or top-left under the HUD if the path would pass
-        behind the card there and less so on the left."""
+        """Top-right under the running list, or top-left under the HUD and the 'possible missed
+        pitch' hint line if the path would pass behind the card there and less so on the left."""
         right = (self.w - self.m - sp.w, self.card_top)
-        left = (self.m, self.hud_bottom + self.m)
+        left = (self.m, max(self.hud_bottom, self.hint_bottom) + self.m // 2)
         if path is None or not len(path):
             return right
         g = 6 * self.k

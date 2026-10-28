@@ -20,6 +20,9 @@ def test_bundled_fonts_load_and_carry_their_licence():
     with open(os.path.join(G.FONT_DIR, "OFL.txt"), encoding="utf-8") as fh:
         text = fh.read()
     assert "SIL OPEN FONT LICENSE Version 1.1" in text and "The Inter Project Authors" in text
+    # the licence must be the verbatim text (quotes and dashes of the original included)
+    assert '"Font Software" refers to' in text and "-- in part or in whole --" in text
+    assert 'PROVIDED "AS IS"' in text
 
 
 def test_card_texts_follow_the_honesty_rules():
