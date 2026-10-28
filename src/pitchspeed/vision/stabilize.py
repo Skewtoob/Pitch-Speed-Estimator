@@ -57,6 +57,11 @@ from pitchspeed.vision import geometry as G
 log = logging.getLogger("pitchspeed.vision")
 
 
+# Static-overlay (date stamp) detection limits
+OVERLAY_MIN_CAMERA_MOTION_PX = 1.5   # camera must visibly move to tell overlay from scene
+OVERLAY_MAX_AREA_FRAC = 0.08         # a date stamp covers a few % of the frame, not a scene
+
+
 @dataclass
 class StabilizerOptions:
     max_features: int = 300
@@ -311,18 +316,32 @@ class Stabilizer:
                 spread = float(np.sqrt(max(np.linalg.det(np.cov(pts.T) + 1e-6 * np.eye(2)), 0.0))) if len(sel) > 2 else 0.0
                 cands.append((Ah, sel, r, ident, spread))
             (A1, s1, r1, i1, sp1), (A2, s2, r2, i2, sp2) = cands
+            # The camera hypothesis must move clearly (sub-pixel shake is ambiguous),
+            # and the zero-motion group must be small and compact like a date stamp:
+            # on a near-static tripod shot the whole scene has ~zero raw motion and
+            # must never be taken for an overlay.
             moving = lambda Ah, sel: float(np.median(np.linalg.norm(
-                G.apply(G.invert(Ah), src_f[sel]) - src_f[sel], axis=1))) > 0.8
-            if i1 and not i2 and sp2 > sp1 and moving(A2, s2):
+                G.apply(G.invert(Ah), src_f[sel]) - src_f[sel], axis=1))) > OVERLAY_MIN_CAMERA_MOTION_PX
+            if i1 and not i2 and sp2 > sp1 and self._compact(src_f[s1]) and len(s1) < len(s2) \
+                    and moving(A2, s2):
                 votes[idx[s1]] += 1
                 A, inl, rms = A2, np.isin(np.arange(len(src_f)), s2), r2
-            elif i2 and not i1 and sp1 > sp2 and moving(A1, s1):
+            elif i2 and not i1 and sp1 > sp2 and self._compact(src_f[s2]) and moving(A1, s1):
                 votes[idx[s2]] += 1
         newly = (votes >= 3) & ~flags
         if newly.any():
             flags |= newly
             log.info("flagged %d static-overlay features (date stamp?) in parity %d", int(newly.sum()), p)
         return A, inl, rms
+
+    def _compact(self, pts: np.ndarray) -> bool:
+        """True if field-grid points span a small box (<= OVERLAY_MAX_AREA_FRAC of the frame)."""
+        if len(pts) == 0:
+            return False
+        w = float(np.ptp(pts[:, 0]))
+        h = float(np.ptp(pts[:, 1])) * self.row_scale
+        return (w * h <= OVERLAY_MAX_AREA_FRAC * self.W * self.H and w <= 0.5 * self.W
+                and h <= 0.35 * self.H)
 
     def overlay_boxes(self, pad: float = 10.0) -> list:
         """Bounding boxes (frame px, x0, y0, x1, y1) of flagged overlay feature clusters."""
@@ -344,7 +363,13 @@ class Stabilizer:
                     break
             else:
                 boxes.append([x, y, x, y])
-        return [(b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad) for b in boxes]
+        out = []
+        for b in boxes:
+            if (b[2] - b[0]) * (b[3] - b[1]) > OVERLAY_MAX_AREA_FRAC * self.W * self.H:
+                log.info("ignoring implausibly large overlay region %s", [round(v) for v in b])
+                continue
+            out.append((b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad))
+        return out
 
     # ------------------------------------------------------------ public
     def register(self, image: np.ndarray, parity: int) -> StabResult:

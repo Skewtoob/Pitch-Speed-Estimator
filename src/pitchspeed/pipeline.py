@@ -138,29 +138,78 @@ def _pitch_from_track(tr: PitchTrack, source, calib: Calibration, scan: ScanInfo
 DOUBTFUL_CONFIDENCE = 0.3
 
 
-def resolve_field_order(scan: ScanInfo, tracks: list[PitchTrack]) -> str:
-    """Use per-track field-order checks to confirm or contradict the scan verdict.
+def _timing_rms(t: np.ndarray, x: np.ndarray, y: np.ndarray, deg: int = 3) -> float:
+    """RMS (px) of a smooth polynomial fit of x(t), y(t)."""
+    tc = t - t.mean()
+    r = []
+    for v in (x, y):
+        c = np.polyfit(tc, v, deg)
+        r.append(v - np.polyval(c, tc))
+    return float(np.sqrt(np.mean(np.concatenate(r) ** 2)))
+
+
+def track_timing_votes(tracks: list[PitchTrack], source, frame_dt: float) -> dict:
+    """Which field timing makes each ball track smooth?
+
+    For interlaced input every track point carries the time of its field.
+    Re-timing the same points as 'flipped' (the other field order) or as
+    'progressive' (both fields of a frame at the same instant) and refitting a
+    smooth curve shows which hypothesis the video really follows: the wrong
+    ones make the track zig-zag by about one field of motion.
+    """
+    votes = {"given": 0, "flipped": 0, "progressive": 0, "unclear": 0}
+    for tr in tracks:
+        pts = [p for p in tr.points if p.inlier and not p.manual]
+        if len(pts) < 12:
+            continue
+        t = np.array([p.t for p in pts])
+        x = np.array([p.x for p in pts])
+        y = np.array([p.y for p in pts])
+        k = np.array([source.locate(p.s)[1] for p in pts], dtype=float)
+        hyp = {"given": t, "flipped": t + (1.0 - 2.0 * k) * frame_dt / 2.0, "progressive": t - k * frame_dt / 2.0}
+        rms = {h: _timing_rms(tt, x, y, 3 if len(pts) >= 16 else 2) for h, tt in hyp.items()}
+        best = min(rms, key=rms.get)
+        others = min(v for h, v in rms.items() if h != best)
+        if others > 3.0 * max(rms[best], 0.2):
+            votes[best] += 1
+        else:
+            votes["unclear"] += 1
+        tr.diagnostics["timing_rms"] = rms
+    return votes
+
+
+def resolve_field_order(scan: ScanInfo, tracks: list[PitchTrack], source=None, frame_dt: float = 0.0) -> str:
+    """Use the ball tracks to confirm or contradict the scan verdict.
 
     Returns 'confirmed' (scan.confidence raised to 'high'), 'flip' (tracks say
-    the order is reversed) or 'unknown'.  Overrides are never second-guessed.
+    the field order is reversed), 'progressive' (tracks say the fields are
+    not separated in time) or 'unknown'.  User overrides are never second-guessed.
+    With `source` given, the three timing hypotheses are tested directly;
+    otherwise the finder's own given-vs-flipped check is used.
     """
     if not scan.interlaced or scan.source == "override":
         return "unknown"
-    given = flipped = 0
-    for tr in tracks:
-        fo = (tr.diagnostics or {}).get("field_order") or {}
-        n = fo.get("n", 0)
-        rg, rf = fo.get("rms_given"), fo.get("rms_flipped")
-        if n < 12 or rg is None or rf is None:
-            continue
-        if fo.get("conflict") and rg > 3.0 * rf:
-            flipped += 1
-        elif fo.get("preferred") == "given" and rf > 3.0 * max(rg, 0.2):
-            given += 1
-    scan.evidence["tracks"] = {"prefer_given": given, "prefer_flipped": flipped}
+    if source is not None:
+        v = track_timing_votes(tracks, source, frame_dt)
+        given, flipped, prog = v["given"], v["flipped"], v["progressive"]
+    else:
+        given = flipped = prog = 0
+        for tr in tracks:
+            fo = (tr.diagnostics or {}).get("field_order") or {}
+            n = fo.get("n", 0)
+            rg, rf = fo.get("rms_given"), fo.get("rms_flipped")
+            if n < 12 or rg is None or rf is None:
+                continue
+            if fo.get("conflict") and rg > 3.0 * rf:
+                flipped += 1
+            elif fo.get("preferred") == "given" and rf > 3.0 * max(rg, 0.2):
+                given += 1
+    scan.evidence["tracks"] = {"prefer_given": given, "prefer_flipped": flipped, "prefer_progressive": prog}
+    if prog >= 1 and prog > given and prog >= flipped:
+        return "progressive"
     if flipped >= 1 and flipped > given:
         return "flip"
-    if given >= 1 and flipped == 0:
+    if given >= 1 and flipped == 0 and prog == 0:
         scan.confidence = "high"
         scan.evidence["confirmed_by"] = "ball tracks"
         return "confirmed"
@@ -239,17 +288,27 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
 
     # Field order: the detector can be unsure on real footage, but a well-tracked
     # ball settles it (wrong order makes the track zig-zag by a field's motion).
-    verdict = resolve_field_order(scan, [tr for _, fr in seg_results for tr in fr.tracks])
-    if verdict == "flip" and not _flipped:
-        flipped = "tff" if scan.field_order == "bff" else "bff"
-        log.warning("ball tracks contradict the detected field order; re-running with %s", flipped)
+    verdict = resolve_field_order(scan, [tr for _, fr in seg_results for tr in fr.tracks],
+                                  source, 1.0 / info.frame_rate)
+    if verdict in ("flip", "progressive") and not _flipped:
+        if verdict == "flip":
+            new_order = "tff" if scan.field_order == "bff" else "bff"
+            msg = (f"field order corrected to {new_order.upper()} from the ball tracks "
+                   f"(the detector said {scan.field_order.upper()})")
+        else:
+            new_order = "progressive"
+            msg = ("the ball tracks show the two fields of each frame were captured at the same "
+                   "instant (deinterlaced or progressive video): using whole frames")
+        log.warning("%s; re-running", msg)
+        if show_progress:
+            print(f"  note: {msg}; re-running")
         reader.close()
-        o2 = AnalyzeOptions(**{**opts.__dict__, "field_order": flipped})
+        o2 = AnalyzeOptions(**{**opts.__dict__, "field_order": new_order})
         result, source2 = analyze(video_path, calib_file, out_dir, o2, show_progress, _flipped=True)
         result.scan.source = "tracks"
         result.scan.confidence = "medium"
-        result.warnings.insert(0, f"field order corrected to {flipped.upper()} from the ball tracks "
-                                  f"(the detector said {scan.field_order.upper()})")
+        result.params["field_order_option"] = "auto (corrected from tracks)"
+        result.warnings.insert(0, msg)
         write_json(result, paths["results_json"])
         write_csv(result, paths["results_csv"])
         return result, source2

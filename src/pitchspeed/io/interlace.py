@@ -292,6 +292,11 @@ def combine_tests(comb: dict, blob: dict) -> tuple[str, str, list[str]]:
     sc, sb = bool(comb.get("strong")), bool(blob.get("strong"))
     notes: list[str] = []
     c_ok, b_ok = vc in _DECIDED, vb in _DECIDED
+    if b_ok and vb == "progressive" and not sb and comb.get("combing"):
+        # The comb test sees the two fields differ in time: a weak "progressive"
+        # vote from the blob test (slow blobs give q ~ 0.5) must not overrule it.
+        notes.append("blob test weakly says progressive but the fields are combed; ignoring it")
+        b_ok = False
     if c_ok and b_ok:
         # Field-shifted progressive looks like weak BFF to the blob test (q ~ 0.75).
         if vc == vb or (vc == "shifted" and vb == "bff" and not sb):

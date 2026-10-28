@@ -205,6 +205,15 @@ class PitchFinder:
             return
         self._n_overlay = n
         boxes = self.stab.overlay_boxes(pad=8.0)
+        # Never let auto-masks blank out a large part of the ball's corridor.
+        cx0, cy0, cx1, cy1 = self.geom.bbox
+        c_area = max(1.0, (cx1 - cx0) * (cy1 - cy0))
+        def _inter(b):
+            return max(0.0, min(b[2], cx1) - max(b[0], cx0)) * max(0.0, min(b[3], cy1) - max(b[1], cy0))
+        if sum(_inter(b) for b in boxes) > 0.15 * c_area:
+            kept = [b for b in boxes if _inter(b) == 0.0]
+            self._diag["overlay_boxes_dropped"] = [list(map(float, b)) for b in boxes if _inter(b) > 0.0]
+            boxes = kept
         H, W = self.shape
         m = np.full((H, W), 255, np.uint8)
         for (x0, y0, x1, y1) in boxes:

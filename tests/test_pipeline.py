@@ -76,3 +76,40 @@ def test_renumber_chronological_skips_rejected():
 def test_cli_parses(argv):
     args = build_parser().parse_args(argv)
     assert args.func is not None
+
+
+class _Src:
+    """Minimal SampleSource stand-in: sample s = 2*frame + k."""
+    def locate(self, s):
+        return (s // 2, s % 2, s % 2)
+
+
+def _sim_track(kind, n=30, frame_dt=1001 / 30000, v=600.0, a=-300.0):
+    """Ball at x = v t + a t^2 / 2 (px), sampled per field, timed as interlaced fields."""
+    pts = []
+    for s in range(n):
+        f, k = s // 2, s % 2
+        t_field = f * frame_dt + k * frame_dt / 2          # time the pipeline assigns
+        if kind == "interlaced":
+            t_true = t_field
+        elif kind == "flipped":                            # real order is the other one
+            t_true = f * frame_dt + (1 - k) * frame_dt / 2
+        else:                                              # progressive: both fields at frame time
+            t_true = f * frame_dt
+        x = v * t_true + 0.5 * a * t_true ** 2
+        y = 200.0 + 40.0 * t_true
+        pts.append(TrackPoint(s=s, t=t_field, x=x, y=y))
+    return PitchTrack(track_id=0, points=pts)
+
+
+@pytest.mark.parametrize("kind,expected", [("interlaced", "confirmed"), ("flipped", "flip"),
+                                           ("progressive", "progressive")])
+def test_track_timing_hypotheses(kind, expected):
+    scan = _scan()
+    assert resolve_field_order(scan, [_sim_track(kind)], _Src(), 1001 / 30000) == expected
+
+
+def test_slow_ball_is_unclear():
+    scan = _scan()
+    # ~0.3 px per field: no timing hypothesis can be told apart
+    assert resolve_field_order(scan, [_sim_track("interlaced", v=18.0, a=0.0)], _Src(), 1001 / 30000) == "unknown"
