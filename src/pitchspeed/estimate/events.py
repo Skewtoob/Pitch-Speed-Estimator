@@ -53,11 +53,19 @@ def manual_sigma(sample_dt: float) -> float:
 
 
 def manual_event(sample_time_of_marked_field: float, sample_dt: float, kind: str,
-                 s: Optional[int] = None) -> EventTime:
-    """EventTime for a field the user marked as release or catch (see module doc)."""
+                 s: Optional[int] = None, point: Optional[str] = None) -> EventTime:
+    """EventTime for a field the user marked as release or catch (see module doc).
+
+    point='contact' (catch only) marks the end of the flight as BAT CONTACT:
+    the first field in which the ball touches or has just left the bat.  The
+    timing semantics are the same as for the glove.
+    """
+    if point not in (None, "contact") or (point is not None and kind != "catch"):
+        raise ValueError("point must be None or 'contact' (and only for the catch)")
     if kind not in MANUAL_KINDS:
         raise ValueError(f"kind must be one of {MANUAL_KINDS}, not {kind!r}")
     if not (sample_dt > 0 and math.isfinite(sample_dt)):
         raise ValueError("sample_dt must be a positive number")
     t = float(sample_time_of_marked_field)
-    return EventTime(t=t - 0.5 * sample_dt, sigma=sample_dt / math.sqrt(12.0), method="manual", s=s)
+    return EventTime(t=t - 0.5 * sample_dt, sigma=sample_dt / math.sqrt(12.0), method="manual", s=s,
+                     point=point)

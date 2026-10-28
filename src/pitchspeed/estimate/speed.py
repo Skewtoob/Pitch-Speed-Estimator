@@ -147,7 +147,10 @@ def _estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
     # A hand-marked catch is "the first field with the ball in the glove"
     # (estimate.events): the flight ends at the glove, whatever the finder
     # thought the end of its track was (e.g. a 'contact' from a swing).
-    end_kind = "catch" if cat_manual else auto_end
+    if cat_manual:
+        end_kind = "contact" if getattr(catch, "point", None) == "contact" else "catch"
+    else:
+        end_kind = auto_end
     # Track flags about how an automatic event was found are stale once the
     # user has marked that event.
     stale = (K.RELEASE_EVENT_TRACK_FLAGS if rel_manual else frozenset()) | \
@@ -158,7 +161,10 @@ def _estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
     problems: list[str] = []
     comps: list[SpeedComponent] = []
     own_notes: list[str] = []
-    if cat_manual and auto_end == "contact":
+    if cat_manual and end_kind == "contact":
+        own_notes.append("bat contact marked by hand: the flight ends where the bat met the ball "
+                         "(assumed about half a foot in front of the plate, +/-1 ft)")
+    elif cat_manual and auto_end == "contact":
         own_notes.append("catch marked by hand: the flight ends at the glove (the automatic track had "
                          "ended at a possible bat contact)")
     if rel_manual != cat_manual and release is not None and catch is not None:

@@ -282,7 +282,9 @@ on ground truth, and "not observed" when more than ~10 fields are hidden.
 field with the ball in the glove.  The event is placed half a field earlier
 with quantization sigma dt/sqrt(12), plus an assumed human-judgement term
 (one-field slip with p = 0.25), about 0.58 field in total.  A manual C
-always ends the flight at the glove (never an automatic 'contact').  Stale
+ends the flight at the glove (never an automatic 'contact'); a manual B
+(bat contact, `EventTime.point == 'contact'`) ends it at the assumed contact
+point (front of the plate + 0.5 ft, +/-1 ft).  Stale
 flags of the automatic event are removed after a manual mark.
 
 **Capture glitches.**  Duplicated, dropped or undecodable frames inside a

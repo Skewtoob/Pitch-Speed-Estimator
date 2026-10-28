@@ -87,7 +87,8 @@ PITCH_MARGIN = 60          # fields shown before the release / after the catch (
 WINDOW_MARGIN = 30         # fields around a possible-missed window or rejected track
 POINT_TOLERANCE = 3        # ball points may be added this many fields outside R..C
 
-MANUAL_HINT = "R = FIRST field with the ball out of the hand | C = FIRST field with the ball in the glove"
+MANUAL_HINT = ("R = FIRST field with the ball out of the hand | C = FIRST field with the ball in the glove"
+               " | B = FIRST field with the ball on/off the bat (if the batter hit it)")
 
 BINDINGS: dict[str, list[str]] = {
     "prev_field": ["left", "a"],
@@ -100,6 +101,7 @@ BINDINGS: dict[str, list[str]] = {
     "goto_catch": ["end"],
     "set_release": ["r"],
     "set_catch": ["c"],
+    "set_contact": ["b"],
     "toggle_marker": ["tab"],
     "nudge_back": [",", "<"],
     "nudge_fwd": [".", ">"],
@@ -130,13 +132,15 @@ HELP_TEXT: dict[str, str] = {
     "goto_release": "go to the release (R)",
     "goto_catch": "go to the catch (C)",
     "set_release": "release = this field (FIRST field with the ball out of the hand)",
-    "set_catch": "catch = this field (FIRST field with the ball in the glove; a ball the batter hit has no catch)",
+    "set_catch": "catch = this field (FIRST field with the ball in the glove; if the batter hit the ball, use B)",
+    "set_contact": "bat contact = this field (FIRST field with the ball touching or just off the bat); "
+                   "use instead of C when the batter hit the ball",
     "toggle_marker": "select the R or the C marker for nudging",
     "nudge_back": "move the selected marker 1 field earlier",
     "nudge_fwd": "move the selected marker 1 field later",
     "accept": "accept this pitch (restores a rejected one) and go to the next",
     "reject": "reject (kept as 'rejected') / mark a window 'no pitch'",
-    "new_manual": "new manual pitch: release here, then C at the catch",
+    "new_manual": "new manual pitch: release here, then C at the catch (or B at the bat contact)",
     "retrack": "re-run the ball tracker between R and C",
     "play": "play / pause (loops around the pitch)",
     "faster": "faster playback (up to 1x)",
@@ -739,7 +743,7 @@ class ReviewState:
             self._say("no pitch selected here: press N at the release field to add one", "warn")
         return e
 
-    def _set_event(self, kind: str, s: int) -> None:
+    def _set_event(self, kind: str, s: int, point: Optional[str] = None) -> None:
         e = self._need_pitch()
         if e is None:
             return
@@ -753,10 +757,12 @@ class ReviewState:
             self._say(f"catch must be after the release (field {r})", "error")
             return
         old = r if kind == "release" else c
-        if old == s and (p.release if kind == "release" else p.catch).method == "manual":
-            self._say(f"{kind} is already at field {s}")
+        old_ev = p.release if kind == "release" else p.catch
+        if old == s and old_ev.method == "manual" and getattr(old_ev, "point", None) == point:
+            self._say(f"{'bat contact' if point == 'contact' else kind} is already at field {s}")
             return
         ev = self.make_event(s, kind)
+        ev.point = point if kind == "catch" else None
         frame = int(self.tl.locate(s)[0])
 
         def mutate(pp: Pitch) -> None:
@@ -768,11 +774,15 @@ class ReviewState:
         self._edit(e, "set_" + kind, mutate, from_s=old, to_s=s)
         self.marker = "R" if kind == "release" else "C"
         p = self.current_pitch()
+        if point == "contact":
+            self._say(f"bat contact set to field {s}: {speed_text(p.speed if p else None)}", "ok")
+            return
         if kind == "catch" and p is not None and _track_end(p) == "contact":
             # A C mark is the glove (estimate.events): the speed now uses the glove distance,
             # about 6 % more than the bat-contact distance the automatic track ended at.
             self._say(f"catch set to field {s} = ball IN THE GLOVE: {speed_text(p.speed)}. The automatic "
-                      f"track ended at a possible bat contact; if the batter hit the ball, press U", "warn")
+                      f"track ended at a possible bat contact; if the batter hit the ball, press B here "
+                      f"instead (or U to undo)", "warn")
             return
         self._say(f"{kind} set to field {s}: {speed_text(p.speed if p else None)}", "ok")
 
@@ -789,6 +799,18 @@ class ReviewState:
             self._start_draft()
             return
         self._set_event("release", self.s)
+
+    def _do_set_contact(self) -> None:
+        """B: the flight ended at the bat (a hit ball has no catch)."""
+        if self._single_field_needed("mark the bat contact"):
+            return
+        if self.draft is not None:
+            self._finish_draft(point="contact")
+            return
+        if self.current_entry() is None:
+            self._say("press N (or R) at the release field first, then B at the bat contact", "warn")
+            return
+        self._set_event("catch", self.s, point="contact")
 
     def _do_set_catch(self) -> None:
         if self._single_field_needed("mark the catch"):
@@ -921,9 +943,9 @@ class ReviewState:
         self.draft = {"s_release": self.s, "item": self.cur}
         self.marker = "R"
         self._say(f"manual pitch: release at field {self.s}. Step to the FIRST field with the ball in the "
-                  f"glove and press C (Esc cancels)", "ok")
+                  f"glove and press C, or B if the batter hit it (Esc cancels)", "ok")
 
-    def _finish_draft(self) -> None:
+    def _finish_draft(self, point: Optional[str] = None) -> None:
         d = self.draft
         sr, sc = int(d["s_release"]), self.s
         if sc <= sr:
@@ -937,8 +959,10 @@ class ReviewState:
             ops.append(("rtrack", origin.ref, copy.deepcopy(tr.diagnostics)))
             tr.diagnostics["review"] = "promoted_to_manual_pitch"
             track = _track_copy(tr, sr - 2, sc + 2)
+        end_ev = self.make_event(sc, "catch")
+        end_ev.point = point
         p = Pitch(number=0, status="manual", release=self.make_event(sr, "release"),
-                  catch=self.make_event(sc, "catch"),
+                  catch=end_ev,
                   speed=SpeedEstimate(v_release_mph=None, reason="not computed yet"),
                   frame_release=int(self.tl.locate(sr)[0]), frame_catch=int(self.tl.locate(sc)[0]),
                   track=track, confidence=0.0,
@@ -1192,7 +1216,7 @@ class ReviewState:
         if self.draft is not None:
             sr = self.draft["s_release"]
             return (f"NEW MANUAL PITCH | release field {sr} ({format_time(self.tl.sample_time(sr))}) | "
-                    f"now at field {self.s} (+{self.s - sr}) | press C at the catch, Esc cancels")
+                    f"now at field {self.s} (+{self.s - sr}) | press C at the catch (B if hit), Esc cancels")
         if it is None:
             return f"no item selected | field {self.s} | PgUp/PgDn: pitches | N: add a pitch at its release"
         if it.key.kind == "missed":
@@ -1326,13 +1350,15 @@ def effective_end(p: Pitch) -> str:
     bat contact; 'lost' / 'occluded' tracks still end at the glove).
     """
     if p.catch is not None and p.catch.method == "manual":
-        return "catch"
+        return "contact" if getattr(p.catch, "point", None) == "contact" else "catch"
     return "contact" if _track_end(p) == "contact" else "catch"
 
 
 def end_text(p: Pitch) -> str:
     """Info-line note on the end point, '' for the usual automatic glove catch."""
     if effective_end(p) == "contact":
+        if p.catch is not None and p.catch.method == "manual":
+            return "ends at BAT CONTACT (B marked)"
         return "ends at a possible BAT CONTACT (C at the glove if it was caught)"
     if _track_end(p) == "contact":
         return "ends at the glove (C marked)"

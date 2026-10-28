@@ -103,6 +103,8 @@ class EventTime:
     sigma: float                   # 1-sigma (seconds)
     method: str                    # e.g. 'first_free_field', 'extrapolated', 'side_fit', 'manual'
     s: Optional[int] = None        # nearest sample index (for UI / reports)
+    point: Optional[str] = None    # hand-marked END event only: 'contact' = bat contact (B key);
+                                   # None = the glove (C key)
 
 
 @dataclass

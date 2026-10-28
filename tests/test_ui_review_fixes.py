@@ -61,7 +61,7 @@ def test_manual_catch_on_contact_track_ends_at_the_glove():
     assert p.catch.method == "manual" and p.catch.s == 130
     assert p.speed.assumptions["end_point"] == "catch"        # glove distance, not the contact one
     assert effective_end(p) == "catch" and "ends at the glove (C marked)" in st.info_text()
-    assert st.message.level == "warn" and "IN THE GLOVE" in st.message.text and "press U" in st.message.text
+    assert st.message.level == "warn" and "IN THE GLOVE" in st.message.text and "press B" in st.message.text
     assert p.track.end_kind == "contact"     # the finder's observation is kept (diagnostics)
     keys(st, "u")
     p = st.current_pitch()

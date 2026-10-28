@@ -129,10 +129,11 @@ Steps through every pitch and every "possible missed pitch". The main keys:
 | `[` / `]` | previous / next pitch |
 | **R** | release = this field (the **first** field where the ball is out of the hand) |
 | **C** | catch = this field (the **first** field where the ball is in the glove) |
+| **B** | bat contact = this field, for a ball the batter **hit** (the **first** field where the ball touches or has just left the bat); use it instead of C |
 | Tab, `,` `.` | select the R or C marker and nudge it by one field |
 | **Y** / Enter | accept the pitch |
 | **X** / Del | reject it (kept in the file as "rejected") |
-| **N** | add a pitch the tool missed: press N at the release, then C at the catch |
+| **N** | add a pitch the tool missed: press N at the release, then C at the catch (or B if it was hit) |
 | **E** | re-run the ball tracker between R and C |
 | Space | play/pause, loops around the pitch; `+`/`-` change speed |
 | U | undo |
@@ -140,6 +141,13 @@ Steps through every pitch and every "possible missed pitch". The main keys:
 | Q / Esc | save and quit |
 
 Every edit re-computes that pitch's speed immediately and saves the results.
+
+**Balls the batter hit.** The tool usually notices a hit by itself and ends
+the flight at the bat (the table shows the flag `contact_end`). If it got a hit
+ball wrong, mark the release with **R** and the contact with **B**, not C.
+C means "in the glove", which is about 3 ft farther, so a C mark would make a
+hit ball read about 6 % too fast. In a side view the speed comes mostly from
+the flight before the swing, so a hit barely matters there.
 
 **Running again.** Dragging the same video onto `pitchspeed.bat` again asks
 whether to keep the saved results and go straight to review (the default)

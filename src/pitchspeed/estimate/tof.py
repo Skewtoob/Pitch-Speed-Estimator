@@ -114,7 +114,7 @@ def tof_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
     if not (K.finite(release.t) and K.finite(catch.t)):
         raise K.NotMeasurable("release or catch time is not a number")
     if catch.method == "manual":
-        end_kind = "catch"
+        end_kind = "contact" if getattr(catch, "point", None) == "contact" else "catch"
     T = float(catch.t) - float(release.t)
     if T <= 0:
         raise K.NotMeasurable(f"catch ({catch.t:.3f} s) is not after release ({release.t:.3f} s)")

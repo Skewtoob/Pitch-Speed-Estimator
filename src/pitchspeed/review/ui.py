@@ -149,7 +149,9 @@ def _draw_event_badge(img: np.ndarray, state: ReviewState, vw: int) -> None:
     if state.shows(mk.get("R")):
         tags.append(("R = release", cv.GREEN))
     if state.shows(mk.get("C")):
-        tags.append(("C = catch", cv.RED))
+        pc = state.current_pitch()
+        hit = pc is not None and pc.catch is not None and getattr(pc.catch, "point", None) == "contact"
+        tags.append(("B = bat contact" if hit else "C = catch", cv.RED))
     x = vw - 10
     for text, color in tags:
         w = cv.text_size(text, 0.7, 2)[0]
