@@ -63,7 +63,8 @@ def pitch(number: int, s0: int, s1: int, sp: SpeedEstimate, status="auto", notes
     rel = EventTime(t=s0 * FIELD_DT - 0.004, sigma=0.006,
                     method="manual" if status == "manual" else "first_free_field", s=s0)
     cat = EventTime(t=s1 * FIELD_DT + 0.002, sigma=0.004,
-                    method="manual" if status == "manual" else "extrapolated", s=s1)
+                    method="manual" if status == "manual" else "extrapolated", s=s1,
+                    point="contact" if status == "manual" else None)   # manual pitch: a hit ball (B)
     hist = [{"action": "set_release", "s": s0, "t": rel.t}] if status in ("edited", "manual") else []
     return Pitch(number=number, status=status, release=rel, catch=cat, speed=sp,
                  frame_release=s0 // 2, frame_catch=s1 // 2, track=tr, confidence=0.83,

@@ -68,10 +68,13 @@ def test_rich_result_populates_every_field():
     r = H.rich_result()
     seen_types = set()
     for obj in [r, r.video, r.scan, r.pitches[5], r.pitches[5].speed, r.pitches[5].speed.components[0],
-                r.rejected_tracks[0], r.pitches[5].track.points[0], r.pitches[5].release]:
+                r.rejected_tracks[0], r.pitches[5].track.points[0], r.pitches[5].release,
+                r.pitches[4].catch]:
         seen_types.add(type(obj))
         for f in dataclasses.fields(obj):
             v = getattr(obj, f.name)
+            if f.name == "point" and obj is r.pitches[5].release:
+                continue        # end-event-only field; checked on the manual pitch's catch
             default = f.default if f.default is not dataclasses.MISSING else (
                 f.default_factory() if f.default_factory is not dataclasses.MISSING else object())
             if f.name in ("schema",):
