@@ -200,8 +200,20 @@ def format_time(t: float) -> str                              # hh:mm:ss.sss
 def render_annotated(result: AnalysisResult, source: SampleSource, out_path: str,
                      mode: str = "full",                      # 'full' | 'highlights'
                      transforms: np.ndarray | None = None, transform_samples: np.ndarray | None = None,
-                     size=(960, 720), audio: bool = True, progress=None) -> str
+                     size=(960, 720), audio: bool = True, progress=None, *,
+                     style: str = "radar") -> str               # 'radar' | 'classic'
 ```
+
+The 'radar' style (render/graphics.py) draws the speed as a radar gun (red
+seven-segment digits, the +-1 sigma and the 90% range below; '~'/EST/rough
+for label 'poor', '--' for 'none') and the ball's path as the tracker's
+fitted curve (`PitchTrack.model`, used only if it passes within 5 px of 90%
+of the tracked points; else a quadratic or the points joined), drawn only
+between the first and last tracked point, dashed across gaps of more than 3
+samples, with a dot at each tracked point.  Card and labels are Pillow
+sprites drawn once (Inter font, bundled); per frame only alpha blending and
+the path (OpenCV) remain.  Without Pillow or the font it falls back to the
+classic OpenCV style.
 
 ### 3.5 UI (agent UI)
 

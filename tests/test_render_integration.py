@@ -76,8 +76,8 @@ def _expected_onsets(src_onsets, segments):
 
 
 def _panel_brightness(img) -> float:
-    """Mean brightness where the card's dark panel sits (static test-pattern bars there)."""
-    return float(img[612:688, 340:620].mean())
+    """Mean brightness where the radar card's dark bezel sits (top right of 960x720)."""
+    return float(img[60:180, 700:930].mean())
 
 
 def test_full_render_real_io(clip, tmp_path):
@@ -98,7 +98,8 @@ def test_full_render_real_io(clip, tmp_path):
     np.testing.assert_allclose(got, src_onsets, atol=SYNC_TOL_S)
     s_catch = int(3.0 / H.FIELD_DT)
     before, during = _panel_brightness(_frame(out, s_catch - 5)), _panel_brightness(_frame(out, s_catch + 30))
-    assert during < 0.7 * before                                     # card panel shown after the catch
+    assert during < 0.4 * before                                     # card shown after the catch
+    assert info["style"] == "radar"
 
 
 def test_highlights_real_io_per_segment_audio(clip, tmp_path):

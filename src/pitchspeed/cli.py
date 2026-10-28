@@ -462,7 +462,7 @@ def _wait_until_writable(path: str) -> None:
             return
 
 
-def _render(result, source, out_dir: str, mode: str, audio: bool) -> Optional[str]:
+def _render(result, source, out_dir: str, mode: str, audio: bool, style: str = "radar") -> Optional[str]:
     from pitchspeed.pipeline import Progress, load_transforms
     from pitchspeed.render.overlay import render_annotated
     tf, ts = load_transforms(out_dir)
@@ -482,7 +482,7 @@ def _render(result, source, out_dir: str, mode: str, audio: bool) -> Optional[st
     info: dict = {}
     try:
         out = render_annotated(result, source, out, mode=mode, transforms=tf, transform_samples=ts,
-                               audio=audio, progress=progress, info=info)
+                               audio=audio, progress=progress, info=info, style=style)
     except ValueError as e:
         print(f"\nCould not write the annotated video: {e}")
         return None
@@ -554,7 +554,7 @@ def cmd_render(args) -> int:
     out_dir = _out_dir(args)
     result = _load_results(out_dir)
     source = _source_for_results(args, out_dir, result)
-    _render(result, source, out_dir, args.mode, not args.no_audio)
+    _render(result, source, out_dir, args.mode, not args.no_audio, getattr(args, "style", "radar"))
     return 0
 
 
@@ -734,6 +734,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("render", help="write the annotated video from saved results")
     common(p, calib=False)
     p.add_argument("--mode", choices=["full", "highlights"], default="full")
+    p.add_argument("--style", choices=["radar", "classic"], default="radar",
+                   help="radar: radar-gun speed display and ball path (default); classic: plain text")
     p.add_argument("--no-audio", action="store_true")
     p.set_defaults(func=cmd_render)
 

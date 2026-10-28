@@ -15,6 +15,7 @@ dependencies = [
     "av>=12",
     "imageio-ffmpeg>=0.5",
     "opencv-python>=4.8",
+    "pillow>=10.1",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +26,9 @@ pitchspeed = "pitchspeed.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"pitchspeed.render" = ["fonts/*.otf", "fonts/OFL.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

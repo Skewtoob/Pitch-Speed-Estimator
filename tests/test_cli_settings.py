@@ -176,3 +176,11 @@ def test_main_reports_locked_files_without_traceback(monkeypatch, capsys):
     monkeypatch.setattr(cli, "cmd_probe", locked)
     assert cli.main(["probe", "v.avi"]) == 1
     assert "locked by another program" in capsys.readouterr().err
+
+
+def test_render_style_option():
+    ap = cli.build_parser()
+    assert ap.parse_args(["render", "v.mp4"]).style == "radar"
+    assert ap.parse_args(["render", "v.mp4", "--style", "classic"]).style == "classic"
+    with pytest.raises(SystemExit):
+        ap.parse_args(["render", "v.mp4", "--style", "fancy"])

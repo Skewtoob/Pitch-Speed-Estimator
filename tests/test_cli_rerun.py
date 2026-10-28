@@ -154,11 +154,13 @@ def test_review_and_render_use_the_scan_saved_with_the_results(clip, monkeypatch
     assert not src.interlaced and src.n_samples == r.video.n_frames             # frames, not re-detected fields
 
     def fake_render(result, source, out_path, **kw):
-        seen["render"] = source
+        seen["render"], seen["style"] = source, kw.get("style")
         return out_path
     monkeypatch.setattr(overlay, "render_annotated", fake_render)
     assert cli.main(["render", video, "--no-audio"]) == 0
     assert not seen["render"].interlaced and seen["render"].n_samples == r.video.n_frames
+    assert seen["style"] == "radar"
+    assert cli.main(["render", video, "--no-audio", "--style", "classic"]) == 0 and seen["style"] == "classic"
     with pytest.raises(SystemExit, match="analyze again"):
         cli.main(["review", video, "--field-order", "bff"])
 

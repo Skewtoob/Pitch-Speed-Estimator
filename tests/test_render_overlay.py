@@ -10,6 +10,7 @@ import pytest
 
 import render_helpers as H
 from pitchspeed.io.display import display_transform, map_points
+from pitchspeed.render import graphics as G
 from pitchspeed.render import overlay as O
 from pitchspeed.types import EventTime
 
@@ -179,7 +180,12 @@ def _small_result(n_pitches=2, gap=400):
     return r
 
 
-CARD_ROI = (slice(600, 700), slice(300, 660))       # where the card sits on 960x720
+CARD_ROI = (slice(600, 700), slice(300, 660))       # where the classic card sits on 960x720
+RADAR_ROI = (slice(60, 180), slice(700, 930))       # where the radar card sits (top right)
+
+
+def _radar_card_visible(img) -> bool:
+    return float(img[RADAR_ROI].mean()) < 110          # the dark bezel over the bright grey ramp
 
 
 def _card_visible(img) -> bool:
@@ -190,7 +196,8 @@ def _card_visible(img) -> bool:
 def test_render_full_frame_per_sample_and_card_timing():
     r = _small_result()
     src = H.FakeSource(600)
-    out, w, info = _render(r, src)
+    out, w, info = _render(r, src, style="classic")
+    assert info["style"] == "classic"
     assert out == "unused.mp4" and w.closed and w.fps == "60000/1001"
     assert len(w.frames) == 600 and info["frames_written"] == 600 and info["filler_frames"] == 0
     assert w.audio_src is None and info["audio_status"].startswith("skipped")
@@ -213,9 +220,16 @@ def test_rejected_pitch_is_not_drawn():
     r = _small_result()
     r.pitches[1].status = "rejected"
     src = H.FakeSource(600)
-    _, w, info = _render(r, src)
+    _, w, info = _render(r, src, style="classic")
     assert info["marks"] == 1
     assert not _card_visible(w.frames[488])
+    _, w, info = _render(r, src)
+    assert info["style"] == "radar" and not _radar_card_visible(w.frames[500])
+
+
+def _path_near(img, u, v, r=8) -> int:
+    """Number of radar-path pixels (white dot or cyan line) within r px of display point (u, v)."""
+    return _green_near(img, u, v, r, color=G.DOT_BGR) + _green_near(img, u, v, r, color=G.PATH_BGR)
 
 
 def _green_near(img, u, v, r=8, color=O.GREEN) -> int:
@@ -232,15 +246,21 @@ def test_trail_is_drawn_where_the_track_is_and_follows_transforms():
         p.x, p.y, p.inlier = 400.0, 300.0, True
     src = H.FakeSource(300)
     A = display_transform(720, 480, 8 / 9, (960, 720))
-    _, w, _ = _render(r, src)
+    _, w, _ = _render(r, src, style="classic")
     u, v = map_points(A, [(400.0, 300.0)])[0]
     u2, _ = map_points(A, [(380.0, 300.0)])[0]
     assert _green_near(w.frames[70], u, v) > 15 and _green_near(w.frames[70], u2, v) == 0
     assert _green_near(w.frames[59], u, v) == 0                     # before release: nothing
     # camera moved: sample -> reference is a +20 px x shift, so the ball sits 20 frame px left
     Ts = np.stack([np.array([[1.0, 0.0, 20.0], [0.0, 1.0, 0.0]])] * 300)
-    _, w, _ = _render(r, src, transforms=Ts, transform_samples=np.arange(300))
+    _, w, _ = _render(r, src, transforms=Ts, transform_samples=np.arange(300), style="classic")
     assert _green_near(w.frames[70], u2, v) > 15 and _green_near(w.frames[70], u, v) == 0
+    # the radar style: a white dot (and the cyan line) at the same places
+    _, w, _ = _render(r, src)
+    assert _path_near(w.frames[70], u, v) > 15 and _path_near(w.frames[70], u2, v) == 0
+    assert _path_near(w.frames[59], u, v) == 0
+    _, w, _ = _render(r, src, transforms=Ts, transform_samples=np.arange(300))
+    assert _path_near(w.frames[70], u2, v) > 15 and _path_near(w.frames[70], u, v) == 0
 
 
 def test_highlights_only_windows_and_progress():
@@ -349,8 +369,10 @@ def test_trail_follows_homographies():
     u, v = map_points(A, [(400.0, 300.0)])[0]
     u2, _ = map_points(A, [(380.0, 300.0)])[0]
     Hs = np.stack([np.array([[1.0, 0.0, 20.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])] * 300)
-    _, w, _ = _render(r, src, transforms=Hs, transform_samples=np.arange(300))
+    _, w, _ = _render(r, src, transforms=Hs, transform_samples=np.arange(300), style="classic")
     assert _green_near(w.frames[70], u2, v) > 15 and _green_near(w.frames[70], u, v) == 0
+    _, w, _ = _render(r, src, transforms=Hs, transform_samples=np.arange(300))
+    assert _path_near(w.frames[70], u2, v) > 15 and _path_near(w.frames[70], u, v) == 0
 
 
 def test_checked_missed_windows_get_no_hint():
@@ -408,3 +430,115 @@ def test_close_failure_keeps_the_rendered_video(tmp_path):
                              writer_factory=LateLock, info=info)
     assert out == str(tmp_path / "annotated-1.mp4") and open(out, "rb").read() == b"complete video"
     assert "kept as annotated-1.mp4" in info["note"]
+
+
+# ------------------------------------------------------------ radar style
+def test_radar_card_timing_and_fades():
+    r = _small_result()
+    src = H.FakeSource(600)
+    _, w, info = _render(r, src)
+    assert info["style"] == "radar" and "note" not in info
+    hold = round(3.0 / src.sample_dt)
+    assert not _radar_card_visible(w.frames[87])
+    assert not _radar_card_visible(w.frames[88])                     # first frame: fading in
+    assert _radar_card_visible(w.frames[98]) and _radar_card_visible(w.frames[88 + hold - 40])
+    late, full = w.frames[88 + hold - 3][RADAR_ROI].mean(), w.frames[88 + hold // 2][RADAR_ROI].mean()
+    assert late > full + 30                                          # fading out at the end of the hold
+    assert not _radar_card_visible(w.frames[88 + hold])
+    assert not _radar_card_visible(w.frames[459]) and _radar_card_visible(w.frames[500])
+
+
+def test_radar_card_cut_short_by_the_next_pitch_does_not_fade():
+    r = _small_result(2, gap=100)                                   # pitch 2 released at 160 < 88 + hold
+    src = H.FakeSource(400)
+    _, w, _ = _render(r, src)
+    assert _radar_card_visible(w.frames[159]) and not _radar_card_visible(w.frames[160])
+
+
+def test_radar_card_moves_left_when_the_path_runs_behind_it():
+    p = O.RadarPainter((960, 720))
+    sp = G.radar_card(3, H.speed(80.0, 1.5, "good"), p._card_scale(H.speed(80.0, 1.5, "good")))
+    low = np.column_stack([np.linspace(100, 900, 50), np.full(50, 400.0)])
+    assert p._place(sp, low)[0] > 480                                # path elsewhere: top right
+    high = np.column_stack([np.linspace(600, 950, 50), np.full(50, 100.0)])
+    x, y = p._place(sp, high)
+    assert x == p.m and y >= p.hud_bottom                            # path behind the card: top left
+    assert p._place(sp, None)[0] > 480
+
+
+def test_radar_card_always_fits_the_frame():
+    for size in ((480, 360), (320, 240), (960, 720)):
+        p = O.RadarPainter(size)
+        for v in (8.0, 81.0, 123.0):
+            sp = H.speed(v, 1.5, "good")
+            kk = p._card_scale(sp)
+            assert G.card_size(sp)[0] * kk <= p.w - 2 * p.m + 1e-9
+    r = _small_result(1)
+    r.pitches[0].speed = H.speed(123.0, 2.0, "good")
+    _, w, _ = _render(r, H.FakeSource(200), size=(320, 240))
+    assert w.frames[100].shape == (240, 320, 3)
+
+
+def test_radar_style_falls_back_to_classic_without_pillow(monkeypatch):
+    monkeypatch.setattr(O.G, "available", lambda: (False, "ModuleNotFoundError: No module named 'PIL'"))
+    r = _small_result()
+    _, w, info = _render(r, H.FakeSource(600))
+    assert info["style"] == "classic" and "No module named 'PIL'" in info["note"]
+    assert _card_visible(w.frames[100])                              # the classic card instead
+
+
+def test_bad_style_is_refused():
+    with pytest.raises(ValueError, match="style"):
+        O.render_annotated(_small_result(), H.FakeSource(10), "x.mp4", writer_factory=H.FakeWriter,
+                           style="fancy")
+
+
+def test_fitted_path_follows_a_matching_model_and_spans_only_the_tracked_points():
+    from pitchspeed.vision.model import TrajModel
+    s = np.arange(10, 41)
+    t = s * H.FIELD_DT
+    m = TrajModel(kind="poly", t0=float(t.mean()), ts=float((t[-1] - t[0]) / 2), a=np.array([400.0, -250.0, 6.0]),
+                  b=np.array([200.0, 15.0, 9.0]), c=np.zeros(2), t_min=float(t[0]), t_max=float(t[-1]))
+    xy = m.eval(t) + np.random.default_rng(1).normal(0, 0.4, (len(t), 2))
+    rows = np.column_stack([s, xy, np.zeros(len(s)), t])
+    path = O.fitted_path(rows, m.to_dict())
+    assert path[0, 0] == 10 and path[-1, 0] == 40                    # never beyond the tracked points
+    assert len(path) == (40 - 10) * O.PATH_DENSITY + 1
+    np.testing.assert_allclose(path[:, 1:3], m.eval(np.interp(path[:, 0], s, t)), atol=1e-9)
+    bad = m.to_dict()
+    bad["a"][0] += 30.0                                              # 30 px off the points: not used
+    p2 = O.fitted_path(rows, bad)
+    assert np.max(np.abs(np.interp(s, p2[:, 0], p2[:, 1]) - xy[:, 0])) < 2.0
+    pole = m.to_dict()
+    pole["c"] = [0.0, -1.5]                                          # denominator crosses zero in the span
+    p3 = O.fitted_path(rows, pole)
+    assert np.all(np.isfinite(p3)) and np.max(np.abs(np.interp(s, p3[:, 0], p3[:, 2]) - xy[:, 1])) < 2.0
+
+
+def test_fitted_path_without_a_model():
+    rows = np.array([[5, 10.0, 20.0, 0, np.nan], [9, 50.0, 60.0, 0, np.nan]])
+    p = O.fitted_path(rows, None)
+    assert p[0, 0] == 5 and p[-1, 0] == 9
+    np.testing.assert_allclose(p[len(p) // 2, 1:3], [30.0, 40.0])     # straight between the two points
+    assert O.fitted_path(np.zeros((0, 5))).shape == (0, 3)
+    np.testing.assert_allclose(O.fitted_path(rows[:1]), [[5, 10.0, 20.0]])
+
+
+def test_seen_flags_mark_long_gaps():
+    pts = np.array([10, 11, 12, 13, 20, 21])
+    ps = np.arange(10, 21.01, 0.25)
+    f = O.seen_flags(ps, pts)
+    assert f[ps < 13].all() and not f[(ps >= 13) & (ps < 20)].any() and f[ps >= 20].all()
+    assert O.seen_flags(np.array([10.5, 12.0]), np.array([10, 13])).all()    # 2 missing samples: still seen
+    assert O.seen_flags(np.array([1.0, 2.0]), np.array([4])).all()
+
+
+def test_build_marks_adds_the_path_with_seen_flags():
+    r = _small_result(1)
+    tr = r.pitches[0].track
+    tr.points = [q for q in tr.points if not (70 <= q.s <= 75)]                 # a 6-sample gap
+    marks = O.build_marks(r, lambda t: int(round(t / H.FIELD_DT)))
+    path = marks[0].path
+    assert path.shape[1] == 4 and path[0, 0] == marks[0].points[0, 0] and path[-1, 0] == marks[0].points[-1, 0]
+    gap = (path[:, 0] >= 69) & (path[:, 0] < 76)                     # from the last seen point to the next
+    assert not path[gap, 3].any() and path[~gap, 3].all()

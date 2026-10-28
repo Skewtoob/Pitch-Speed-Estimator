@@ -12,23 +12,49 @@ dropped-frame PTS gap, VFR jitter), filler frames saying "no picture" are
 inserted, so the picture stays in step with the source time and with the
 passed-through audio; nothing is silently skipped.
 
-WHAT IS DRAWN (all text plain ASCII - OpenCV's fonts have no other glyphs -
-with a dark outline / panel so it stays legible on bright video):
-* top-left HUD: source time hh:mm:ss.sss, frame number, field number;
+STYLES.  style='radar' (the default) draws the speed as a retro radar gun
+and the ball's path as a glowing line with dots (`pitchspeed.render.graphics`,
+needs Pillow and the bundled Inter font); style='classic' is the plain
+OpenCV look.  If the radar style cannot load Pillow or the font, the video
+is drawn in the classic style and `info['note']` says why.
+
+WHAT IS DRAWN, both styles:
+* top-left HUD: source time hh:mm:ss.sss, frame number, field number
+  (plain ASCII - OpenCV's fonts have no other glyphs - with a dark panel);
 * during each pitch's flight (release <= s < catch): a "P3" tag next to the
-  ball and the trail (last 8 samples solid, older ones smaller and pale;
-  green = auto, yellow = edited/manual, manual points as squares);
-* from the catch: a card "Pitch 3: 78 mph" / "+/-3 mph (90%: 74-82) |
-  release speed | TOF", held 3 s or until the next pitch's release.  Label
-  'poor' -> "~78 mph?" in orange; label 'none' -> "Pitch 3: speed n/a" with
-  a short reason in grey;
+  ball and its path so far;
+* from the catch: the speed card, held 3 s or until the next pitch's
+  release, and the pitch's whole path with it;
 * top-right: running list "P1 76  P2 79  P3 78" (whole mph) of the pitches
-  caught so far ('poor' as "65?" in orange - a small '~' looks like a minus
-  sign -, 'none' as "n/a" in grey; only the most recent that fit);
+  caught so far (only the most recent that fit);
 * rejected pitches are not drawn (they stay in results.csv / .json);
   'possible missed pitch' windows get an orange hint under the HUD (full
   mode; highlights only cover accepted pitches) unless the user already
   checked the window in review.
+
+RADAR STYLE.
+* card: black bezel, red seven-segment digits (whole mph, release speed),
+  'PITCH 3' and 'PEAK' above, '+-2  90%: 78-84' below.  Label 'poor' -> an
+  amber '~' before the digits, 'EST' and 'rough'; label 'none' -> '--' and
+  'not measurable'.  It fades in at the catch and out at the end of the
+  hold; it sits top-right under the running list, or top-left under the HUD
+  when the path would pass behind it;
+* path: the tracker's fitted curve (`PitchTrack.model`, checked against the
+  tracked points; a simpler fit or the points themselves when it does not
+  match), drawn only between the first and the last position where the ball
+  was seen, plus a white dot at each tracked position (dots closer than
+  about two dot widths are left out so they never pile up).  Nothing is
+  drawn where the ball was not seen.
+
+CLASSIC STYLE.
+* trail: one dot per tracked position (last 8 samples solid, older ones
+  smaller and pale; green = auto, yellow = edited/manual, manual points as
+  squares);
+* card: "Pitch 3: 78 mph" / "+/-3 mph (90%: 74-82) | release speed | TOF"
+  bottom centre.  Label 'poor' -> "~78 mph?" in orange; label 'none' ->
+  "Pitch 3: speed n/a" with a short reason in grey;
+* running list: 'poor' as "65?" in orange (a small '~' looks like a minus
+  sign in OpenCV's font), 'none' as "n/a" in grey.
 
 TRACK COORDINATES.  Track points are in calibration-reference-frame
 coordinates.  For the displayed sample s they are mapped to that sample's
@@ -70,6 +96,7 @@ from typing import Any, Callable, Optional, Sequence
 import cv2
 import numpy as np
 
+from pitchspeed.render import graphics as G
 from pitchspeed.render.text import (ascii_text, ci90_text, format_time, has_number, method_name,
                                     round_half_up, shorten, sigma_text, speed_reason, speed_short)
 from pitchspeed.types import AnalysisResult, EventTime, Pitch, SpeedEstimate
@@ -77,14 +104,20 @@ from pitchspeed.types import AnalysisResult, EventTime, Pitch, SpeedEstimate
 log = logging.getLogger(__name__)
 
 __all__ = ["render_annotated", "PitchMark", "FrameState", "Timeline", "TransformLookup",
-           "build_marks", "highlight_windows", "reference_to_display", "apply_affine", "card_lines",
-           "running_items", "audio_filter_graph", "output_fps", "missed_windows",
-           "mux_segment_audio", "can_write", "alternative_path", "move_into_place"]
+           "build_marks", "fitted_path", "seen_flags", "highlight_windows", "reference_to_display", "apply_affine",
+           "card_lines", "running_items", "audio_filter_graph", "output_fps", "missed_windows",
+           "mux_segment_audio", "can_write", "alternative_path", "move_into_place", "STYLES"]
 
+STYLES = ("radar", "classic")
 HOLD_S = 3.0                 # card hold after the catch
 PRE_S = 2.0                  # highlights: seconds before release
 POST_S = 3.0                 # highlights: seconds after catch
-TRAIL_SOLID = 8              # trail: the last N samples drawn solid
+TRAIL_SOLID = 8              # classic trail: the last N samples drawn solid
+FADE_IN_S = 0.12             # radar card fade-in at the catch
+FADE_OUT_S = 0.4             # radar card and path fade-out at the end of the hold
+PATH_TOL_PX = 5.0            # a fitted path must pass this close (90% of points, reference px)
+PATH_DENSITY = 4             # path points per sample interval
+PATH_MAX_GAP = 3             # tracked points further apart (samples) -> dashed: the ball was not seen
 MAX_FILL_S = 30.0            # never insert more filler than this per gap
 FFMPEG_TIMEOUT_S = 3600.0
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0       # CREATE_NO_WINDOW on Windows
@@ -109,6 +142,7 @@ class PitchMark:
     s_catch: int
     speed: Optional[SpeedEstimate]
     points: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))   # (N, 4): s, x, y, manual
+    path: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))     # (M, 4): s (float), x, y, seen
 
     @property
     def edited(self) -> bool:
@@ -129,16 +163,109 @@ def _event_sample(ev: Optional[EventTime], to_sample: Callable[[float], int]) ->
     return int(to_sample(float(ev.t)))
 
 
-def _track_points(p: Pitch) -> np.ndarray:
+def _track_rows(p: Pitch) -> np.ndarray:
+    """(N, 5): s, x, y, manual, t of the pitch's inlier track points, sorted by s (t NaN if unknown)."""
     if p.track is None or not p.track.points:
-        return np.zeros((0, 4))
-    rows = [(tp.s, tp.x, tp.y, 1.0 if tp.manual else 0.0) for tp in p.track.points
-            if tp.inlier and tp.x is not None and tp.y is not None
-            and math.isfinite(tp.x) and math.isfinite(tp.y)]
+        return np.zeros((0, 5))
+    rows = []
+    for tp in p.track.points:
+        if not (tp.inlier and tp.s is not None and tp.x is not None and tp.y is not None):
+            continue
+        try:
+            s, x, y = int(tp.s), float(tp.x), float(tp.y)
+            t = float(tp.t) if tp.t is not None else math.nan
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x) and math.isfinite(y):
+            rows.append((s, x, y, 1.0 if tp.manual else 0.0, t))
     if not rows:
-        return np.zeros((0, 4))
+        return np.zeros((0, 5))
     a = np.asarray(rows, dtype=np.float64)
     return a[np.argsort(a[:, 0], kind="stable")]
+
+
+def _track_points(p: Pitch) -> np.ndarray:
+    return _track_rows(p)[:, :4]
+
+
+def _fits(pred: np.ndarray, xy: np.ndarray) -> bool:
+    """A curve matches the points if 90% of them (and both ends) are within PATH_TOL_PX."""
+    if not np.all(np.isfinite(pred)):
+        return False
+    res = np.hypot(pred[:, 0] - xy[:, 0], pred[:, 1] - xy[:, 1])
+    return bool(np.percentile(res, 90) <= PATH_TOL_PX and max(res[0], res[-1]) <= 2 * PATH_TOL_PX)
+
+
+def _model_path(model: Optional[dict], s: np.ndarray, t: np.ndarray, xy: np.ndarray,
+                ss: np.ndarray) -> Optional[np.ndarray]:
+    """The tracker's fitted curve at the dense samples ss, or None if it is unusable here."""
+    if not isinstance(model, dict) or not all(k in model for k in ("kind", "t0", "ts", "a", "b", "c")):
+        return None
+    if not (np.all(np.isfinite(t)) and np.all(np.diff(t) > 0)):
+        return None
+    try:
+        from pitchspeed.vision.model import model_from_dict
+        m = model_from_dict(model)
+        tt = np.interp(ss, s, t)
+        if not np.all(m.denom(tt) > 0.05) or not np.all(m.denom(t) > 0.05):     # no pole in the span
+            return None
+        if not _fits(m.eval(t), xy):
+            return None
+        out = m.eval(tt)
+    except (KeyError, TypeError, ValueError, IndexError, FloatingPointError, np.linalg.LinAlgError):
+        return None
+    return out if np.all(np.isfinite(out)) else None
+
+
+def _simple_path(s: np.ndarray, xy: np.ndarray, ss: np.ndarray) -> np.ndarray:
+    """Quadratic in time if it matches the points, else the points joined (lightly smoothed)."""
+    n = len(s)
+    if n >= 4:
+        u = (s - s.mean()) / max(1.0, float(np.ptp(s)))
+        uu = (ss - s.mean()) / max(1.0, float(np.ptp(s)))
+        try:
+            cx, cy = np.polyfit(u, xy[:, 0], 2), np.polyfit(u, xy[:, 1], 2)
+            if _fits(np.column_stack([np.polyval(cx, u), np.polyval(cy, u)]), xy):
+                return np.column_stack([np.polyval(cx, uu), np.polyval(cy, uu)])
+        except (ValueError, np.linalg.LinAlgError):
+            pass
+    sm = xy.copy()
+    if n >= 3:
+        sm[1:-1] = (xy[:-2] + 2 * xy[1:-1] + xy[2:]) / 4.0
+    return np.column_stack([np.interp(ss, s, sm[:, 0]), np.interp(ss, s, sm[:, 1])])
+
+
+def seen_flags(ps: np.ndarray, point_s: np.ndarray, max_gap: int = PATH_MAX_GAP) -> np.ndarray:
+    """True for path samples ps lying between two tracked points at most max_gap samples apart;
+    False inside a longer gap, where the ball was not seen and the line only bridges it."""
+    ps = np.asarray(ps, dtype=np.float64)
+    pt = np.unique(np.asarray(point_s, dtype=np.float64))
+    if len(pt) < 2:
+        return np.ones(len(ps), bool)
+    i = np.clip(np.searchsorted(pt, ps, side="right") - 1, 0, len(pt) - 2)
+    return (pt[i + 1] - pt[i]) <= max_gap
+
+
+def fitted_path(rows: np.ndarray, model: Optional[dict] = None) -> np.ndarray:
+    """(M, 3) s (float), x, y (reference px): the ball's path from the first to the last tracked
+    point, PATH_DENSITY points per sample interval.  Never extends beyond the tracked points.
+
+    rows: `_track_rows` output (s, x, y, manual, t).  model: `PitchTrack.model` (the tracker's
+    fit), used when it matches the points; otherwise a quadratic, or the points joined."""
+    rows = np.asarray(rows, dtype=np.float64)
+    if len(rows) == 0:
+        return np.zeros((0, 3))
+    s, xy, t = rows[:, 0], rows[:, 1:3], rows[:, 4] if rows.shape[1] > 4 else np.full(len(rows), np.nan)
+    keep = np.concatenate([[True], np.diff(s) > 0])                  # one point per sample
+    s, xy, t = s[keep], xy[keep], t[keep]
+    if len(s) == 1:
+        return np.array([[s[0], xy[0, 0], xy[0, 1]]])
+    n = int(min(20000, (s[-1] - s[0]) * PATH_DENSITY + 1))
+    ss = np.linspace(s[0], s[-1], max(2, n))
+    out = _model_path(model, s, t, xy, ss)
+    if out is None:
+        out = _simple_path(s, xy, ss)
+    return np.column_stack([ss, out])
 
 
 def build_marks(result: AnalysisResult, to_sample: Callable[[float], int]) -> list[PitchMark]:
@@ -157,8 +284,15 @@ def build_marks(result: AnalysisResult, to_sample: Callable[[float], int]) -> li
             continue
         if s_cat < s_rel:
             s_rel, s_cat = s_cat, s_rel
+        rows = _track_rows(p)
+        try:
+            path = fitted_path(rows, p.track.model if p.track is not None else None)
+            path = np.column_stack([path, seen_flags(path[:, 0], rows[:, 0])])
+        except Exception as e:                               # noqa: BLE001 - the dots still show the track
+            log.warning("pitch %s: could not build the path line (%s); drawing the dots only", p.number, e)
+            path = np.zeros((0, 4))
         marks.append(PitchMark(number=p.number, status=p.status, s_release=s_rel, s_catch=s_cat,
-                               speed=p.speed, points=_track_points(p)))
+                               speed=p.speed, points=rows[:, :4], path=path))
     marks.sort(key=lambda m: (m.s_release, m.number))
     return marks
 
@@ -477,40 +611,171 @@ class Painter:
         self.text(img, msg, ((self.w - tw) / 2, self.h / 2), sc, RED, th)
         return img
 
+    # ------------------------------------------------ per-pitch elements
+    # (the hooks _FrameDrawer calls; RadarPainter overrides them)
+    style = "classic"
+
+    def pitch_trail(self, img, m: PitchMark, M: Optional[np.ndarray], s: int, flying: bool,
+                    opacity: float = 1.0) -> tuple:
+        """Draw m's trail at sample s.  Returns (head, display points): head = where the ball is
+        (or was last seen), both None when nothing could be drawn."""
+        pts = m.points[m.points[:, 0] <= s] if len(m.points) else m.points
+        if not len(pts) or M is None:
+            return None, None
+        disp = apply_affine(M, pts[:, 1:3])
+        ok = np.all(np.isfinite(disp), axis=1)
+        if not np.any(ok):
+            return None, None
+        self.trail(img, disp[ok], pts[ok, 0], pts[ok, 3] > 0, s, m.color, all_faded=not flying)
+        return (float(disp[ok][-1, 0]), float(disp[ok][-1, 1])), disp[ok]
+
+    def speed_card(self, img, i: int, m: PitchMark, opacity: float = 1.0,
+                   path: Optional[np.ndarray] = None) -> None:
+        l1, l2, col = card_lines(m)
+        self.card(img, l1, l2, col)
+
+    def pitch_list(self, img, marks: Sequence[PitchMark], done: Sequence[int]) -> None:
+        self.running_list(img, running_items(marks, done))
+
+
+def _on_screen(p: np.ndarray) -> np.ndarray:
+    """Mask of the (n, 2) display points that are finite and not absurdly far off screen."""
+    return np.all(np.isfinite(p), axis=1) & np.all(np.abs(p) < 1e5, axis=1)
+
+
+class RadarPainter(Painter):
+    """The radar style (pitchspeed.render.graphics): radar-gun card, fitted path with dots,
+    Inter-font list and tags.  HUD, hints and gap frames are the classic ones."""
+
+    style = "radar"
+
+    def __init__(self, size: tuple[int, int]):
+        super().__init__(size)
+        self.cards = G.SpriteCache(6)
+        self.labels = G.SpriteCache(32)
+        self.lists = G.SpriteCache(4)
+        self.card_pos: dict[int, tuple[int, int]] = {}
+        st = G.path_style(self.k)
+        self.dot_gap = 2.2 * (st["dot"] + st["rim"])
+        self.list_y = max(2, int(round(6 * self.k)))
+        self.card_top = self.list_y + int(round((G.LIST_H + 8) * self.k))
+        _, tht, base = self._size("00:00:00.000", self.font, 0.6 * self.k, max(1, int(round(self.k))))
+        self.hud_bottom = tht + base + 2 * self.m
+
+    def pitch_trail(self, img, m, M, s, flying, opacity=1.0):
+        if M is None:
+            return None, None
+        if len(m.path):
+            path = m.path if m.path.shape[1] > 3 else np.column_stack([m.path, np.ones(len(m.path))])
+        elif len(m.points):                          # no fitted path: join the dots
+            path = np.column_stack([m.points[:, :3], seen_flags(m.points[:, 0], m.points[:, 0])])
+        else:
+            path = np.zeros((0, 4))
+        dots = m.points
+        if flying:
+            path = path[path[:, 0] <= s] if len(path) else path
+            dots = dots[dots[:, 0] <= s] if len(dots) else dots
+        line, seen, pts = np.zeros((0, 2)), np.zeros(0, bool), np.zeros((0, 2))
+        if len(path):
+            disp = apply_affine(M, path[:, 1:3])
+            ok = _on_screen(disp)
+            line, seen = disp[ok], path[ok, 3] > 0
+        if len(dots):
+            disp = apply_affine(M, dots[:, 1:3])
+            pts = disp[_on_screen(disp)]
+        if not len(line) and not len(pts):
+            return None, None
+        G.draw_path(img, line, G.thin_dots(pts, self.dot_gap), self.k, opacity, seen=seen)
+        src = pts if len(pts) else line
+        return (float(src[-1, 0]), float(src[-1, 1])), (line if len(line) else pts)
+
+    def _card_scale(self, sp: Optional[SpeedEstimate]) -> float:
+        w, _ = G.card_size(sp)
+        return min(self.k, (self.w - 2 * self.m) / w)          # never wider than the frame
+
+    def _place(self, sp: G.Sprite, path: Optional[np.ndarray]) -> tuple[int, int]:
+        """Top-right under the running list, or top-left under the HUD if the path would pass
+        behind the card there and less so on the left."""
+        right = (self.w - self.m - sp.w, self.card_top)
+        left = (self.m, self.hud_bottom + self.m)
+        if path is None or not len(path):
+            return right
+        g = 6 * self.k
+
+        def hits(x, y):
+            return int(((path[:, 0] >= x - g) & (path[:, 0] <= x + sp.w + g)
+                        & (path[:, 1] >= y - g) & (path[:, 1] <= y + sp.h + g)).sum())
+        n_right = hits(*right)
+        return left if n_right and hits(*left) < n_right else right
+
+    def speed_card(self, img, i, m, opacity=1.0, path=None):
+        kk = self._card_scale(m.speed)
+        sp = self.cards.get((i, kk), lambda: G.radar_card(m.number, m.speed, kk))
+        if i not in self.card_pos:                   # decided once, so the card never jumps
+            self.card_pos[i] = self._place(sp, path)
+        G.blend(img, sp, *self.card_pos[i], opacity=opacity)
+
+    def tag(self, img, text, head, color, slot=0):
+        sp = self.labels.get((text, self.k), lambda: G.tag_label(text, self.k))
+        if head is None:
+            x, y = self.m, int(70 * self.k) + slot * (sp.h + self.m)
+        else:
+            x, y = head[0] + 10 * self.k, head[1] - 10 * self.k - sp.h
+        x = min(max(self.m, x), self.w - sp.w - self.m)
+        y = min(max(self.hud_bottom + self.m, y), self.h - sp.h - self.m)
+        G.blend(img, sp, int(round(x)), int(round(y)))
+
+    def pitch_list(self, img, marks, done):
+        items = tuple((f"P{marks[i].number}", speed_short(marks[i].speed))
+                      for i in sorted(done, key=lambda i: marks[i].number))
+        if not items:
+            return
+        max_w = 0.45 * self.w
+        sp = self.lists.get((items, self.k), lambda: G.running_strip(items, self.k, max_w))
+        if sp is not None:
+            G.blend(img, sp, self.w - self.m - sp.w, self.list_y)
+
 
 # ================================================================= frames
 class _FrameDrawer:
     """Draws one output frame for one sample."""
 
     def __init__(self, marks: list[PitchMark], timeline: Timeline, lookup: TransformLookup,
-                 painter: Painter, interlaced: bool, missed: Sequence[tuple[int, int]] = ()):
+                 painter: Painter, interlaced: bool, missed: Sequence[tuple[int, int]] = (),
+                 sample_dt: float = 1001 / 60000):
         self.marks, self.timeline, self.lookup = marks, timeline, lookup
         self.p, self.interlaced = painter, interlaced
         self.missed = list(missed)
+        self.fade_in = max(1, round_half_up(FADE_IN_S / sample_dt))
+        self.fade_out = max(1, round_half_up(FADE_OUT_S / sample_dt))
+
+    def _fade_out(self, i: int, s: int) -> float:
+        """1 -> 0 over the last FADE_OUT_S of the hold; 1 when the next pitch cuts the hold short."""
+        end = int(self.timeline.card_end[i])
+        if end != int(self.timeline.cat[i]) + self.timeline.hold:
+            return 1.0
+        return float(min(1.0, max(0.0, (end - s) / self.fade_out)))
+
+    def _card_opacity(self, i: int, s: int) -> float:
+        age = s - int(self.timeline.cat[i])
+        return float(min(1.0, (age + 1) / self.fade_in)) * self._fade_out(i, s)
 
     def draw(self, img: np.ndarray, A: np.ndarray, s: int, t: float, frame: Optional[int]) -> np.ndarray:
         st = self.timeline.state(s)
-        M = None
         live = list(st.in_flight) + ([st.card] if st.card is not None and st.card not in st.in_flight else [])
+        M = reference_to_display(self.lookup.get(s), A) if live else None
+        card_path = None
         for slot, i in enumerate(live):
             m = self.marks[i]
-            pts = m.points[m.points[:, 0] <= s] if len(m.points) else m.points
-            head = None
-            if len(pts):
-                if M is None:
-                    M = reference_to_display(self.lookup.get(s), A)
-                disp = apply_affine(M, pts[:, 1:3])
-                ok = np.all(np.isfinite(disp), axis=1)
-                if np.any(ok):
-                    self.p.trail(img, disp[ok], pts[ok, 0], pts[ok, 3] > 0, s, m.color,
-                                 all_faded=i not in st.in_flight)
-                    head = (float(disp[ok][-1, 0]), float(disp[ok][-1, 1]))
-            if i in st.in_flight:
+            flying = i in st.in_flight
+            head, disp = self.p.pitch_trail(img, m, M, s, flying, 1.0 if flying else self._fade_out(i, s))
+            if flying:
                 self.p.tag(img, f"P{m.number}", head, m.color, slot)
+            elif i == st.card:
+                card_path = disp
         if st.card is not None:
-            l1, l2, col = card_lines(self.marks[st.card])
-            self.p.card(img, l1, l2, col)
-        self.p.running_list(img, running_items(self.marks, st.done[-40:]))     # only the last ones fit
+            self.p.speed_card(img, st.card, self.marks[st.card], self._card_opacity(st.card, s), card_path)
+        self.p.pitch_list(img, self.marks, st.done[-40:])                     # only the last ones fit
         self.p.hud(img, t, frame, s, self.interlaced)
         if any(a <= s <= b for a, b in self.missed):
             self.p.hint(img, "possible missed pitch here? (not measured - check in review)")
@@ -708,10 +973,13 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
                      transforms: Optional[np.ndarray] = None, transform_samples: Optional[np.ndarray] = None,
                      size=(960, 720), audio: bool = True, progress=None, *,
                      writer_factory: Optional[Callable[..., Any]] = None,
-                     info: Optional[dict] = None) -> str:
+                     info: Optional[dict] = None, style: str = "radar") -> str:
     """Write the annotated video; returns the path actually written.
 
     mode: 'full' (whole video) or 'highlights' (around each pitch).
+    style: 'radar' (radar-gun card, fitted path with dots) or 'classic'
+        (plain OpenCV look).  'radar' falls back to 'classic' when Pillow or
+        the bundled font cannot be loaded (info['style'] / info['note']).
     transforms / transform_samples: per-sample (n, 2, 3) or (n, 3, 3)
         (sample -> reference) stabilization transforms and their sample
         indices (pipeline.load_transforms); None = static camera.
@@ -729,6 +997,8 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     """
     if mode not in ("full", "highlights"):
         raise ValueError(f"mode must be 'full' or 'highlights', got {mode!r}")
+    if style not in STYLES:
+        raise ValueError(f"style must be one of {', '.join(STYLES)}, got {style!r}")
     out_path = os.fspath(out_path)
     notes: list[str] = []
     if not can_write(out_path):
@@ -752,9 +1022,9 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
                          "no accepted pitches for a highlights video (use mode='full')"))
     audio_src = _source_path(source, result) if audio else None
     factory = writer_factory or _default_writer
-    painter = Painter((w, h))
+    painter = _make_painter((w, h), style, notes)
     drawer = _FrameDrawer(marks, timeline, TransformLookup(transforms, transform_samples), painter,
-                          bool(getattr(source, "interlaced", False)), missed_windows(result))
+                          bool(getattr(source, "interlaced", False)), missed_windows(result), sample_dt)
     sar = _sar(source, result)
     highlights_audio = mode == "highlights" and audio_src is not None
     video_target = (os.path.splitext(out_path)[0] + ".highlights-tmp.mp4") if highlights_audio else out_path
@@ -763,7 +1033,7 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
                      audio_src=audio_src if mode == "full" else None,
                      audio_start_s=t_first if mode == "full" else 0.0, audio_duration_s=None)
     stats = {"mode": mode, "fps": str(fps), "segments": [], "frames_written": 0, "filler_frames": 0,
-             "samples_rendered": 0, "marks": len(marks)}
+             "samples_rendered": 0, "marks": len(marks), "style": painter.style}
     total = sum(b - a for a, b in windows)
     ctx = _WindowContext(source, drawer, painter, writer, sar, (w, h), out_dt,
                          bool(getattr(source, "interlaced", False)), progress, total)
@@ -818,6 +1088,17 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     if info is not None:
         info.update(stats)
     return final
+
+
+def _make_painter(size: tuple[int, int], style: str, notes: list[str]) -> Painter:
+    if style == "radar":
+        ok, why = G.available()
+        if ok:
+            return RadarPainter(size)
+        notes.append(f"the radar-gun graphics could not be loaded ({why}), so the video uses the plain "
+                     f"style; installing pitchspeed again (on Windows: windows\\install.bat) fixes this")
+        log.warning("%s", notes[-1])
+    return Painter(size)
 
 
 def _finish_highlights(video_path: str, out_path: str, audio_src: str, segments: list[dict],

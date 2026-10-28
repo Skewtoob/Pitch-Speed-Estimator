@@ -38,6 +38,11 @@ timing precision compared with counting frames.
 3. Double-click **`windows\install.bat`**. It creates a private Python
    environment in `.venv` and installs everything (a few minutes the first time).
 
+**Updating to a new version:** download and unzip the new ZIP the same way,
+then double-click `windows\install.bat` again. A new version can need extra
+packages (for example Pillow, for the radar-gun graphics), and the installer
+adds them.
+
 To analyze a video, **drag the video file onto `windows\pitchspeed.bat`**.
 A console window walks you through the steps below.
 
@@ -164,10 +169,29 @@ so and the backup keeps them).
 
 Writes `<video name>_pitchspeed\annotated.mp4`, standard H.264 video with
 the original sound. It should play in the Windows Films & TV app and in VLC
-(not yet tested on a Windows PC). While a pitch is in flight it shows the pitch
-number and the ball's path. At the catch it shows a card with the speed and
-its ± range. A running list of the pitches so far stays in the corner.
-`--mode highlights` writes only the pitches.
+(not yet tested on a Windows PC). `--mode highlights` writes only the pitches.
+
+- **Ball path.** While a pitch is in flight, its path grows behind the ball:
+  a glowing line with a white dot at each place the tool saw the ball (one
+  per video field, or frame; dots that would overlap are left out). Where the ball was
+  hidden for a few fields, the line is thin and dashed: that part is
+  estimated, not seen. Nothing is drawn before the ball was first seen or
+  after it was last seen. After the catch the whole path stays on screen
+  with the speed.
+- **Radar gun.** At the catch a radar-gun display shows the release speed
+  (the "out of the hand" speed a radar gun shows) in red LED digits, with the
+  margin of error underneath: `±2  90%: 78–84` means the estimate is usually
+  within 2 mph of the true speed (about 2 times in 3), and there is a 90%
+  chance the true speed is between 78 and 84. A rough estimate shows
+  an amber `~` in front of the number, `EST` at the top and `rough` at the
+  end; a pitch that could not be measured shows `--` and "not measurable".
+  It sits in the top-right corner, or top-left if the ball's path runs
+  through the top-right corner. It stays for 3 seconds, or until the next
+  pitch is thrown.
+- **Running list.** The pitches so far (`P1 76  P2 ~65?  P3 n/a`) stay in
+  the top-right corner.
+
+`pitchspeed render VIDEO --style classic` gives the earlier plain-text look.
 
 ## Output files
 
@@ -257,6 +281,12 @@ edits stay). Changing the camera view needs new clicks
   the CSV again (or quit `pitchspeed review` later, which rewrites it).
 - **annotated.mp4 is open in a video player**: close the player and press
   Enter, or let the tool write `annotated-1.mp4` instead.
+
+## Credits
+
+The video graphics use the [Inter](https://github.com/rsms/inter) font
+(Copyright 2016 The Inter Project Authors), included unmodified under the SIL
+Open Font License 1.1: see `src/pitchspeed/render/fonts/OFL.txt`.
 
 ## For developers
 
