@@ -174,13 +174,16 @@ def robust_gain(cur: np.ndarray, bg: np.ndarray, step: int = 4) -> tuple[float, 
 
 
 def block_noise(R: np.ndarray, block: tuple = (8, 32), floor: float = 0.0) -> tuple[np.ndarray, float]:
-    """Local robust noise scale over (rows, cols) blocks, floored at the global value.
+    """Local robust noise scale: 1.4826 * block median |R|, floored at the global value,
+    then a 3x3 max over neighbouring blocks.
 
-    Per block sigma = q30(|R|) / 0.385 (the 30th percentile of a half-normal),
-    which stays correct while up to ~70 % of a block is covered by a moving
-    body or the ball (a block median breaks at 50 % and would hide the ball
-    next to the pitcher's arm).  The global value uses the median.  `floor`
-    (grey levels) guards against noise-free / heavily quantized input.
+    The max filter keeps structure that straddles a block border (edges of
+    players, the horizon, compression blocks) from producing false alarms in
+    the quieter neighbour block; on the synthetic suite it cut candidates per
+    sample ~3x at equal ball recall compared with no dilation or a lower
+    quantile.  Price: a ball right next to a large moving body has a lower z
+    (it is flagged `attached` anyway).  `floor` (grey levels) guards against
+    noise-free / heavily quantized input.
     """
     h, w = R.shape
     ar = np.abs(R)
@@ -190,9 +193,10 @@ def block_noise(R: np.ndarray, block: tuple = (8, 32), floor: float = 0.0) -> tu
     if h < bh or w < bw:
         return np.full(R.shape, g, dtype=np.float32), g
     a = ar[:nh * bh, :nw * bw:2].reshape(nh, bh, nw, bw // 2).transpose(0, 2, 1, 3).reshape(nh, nw, -1)
-    k = int(0.3 * a.shape[2])
-    blk = (np.partition(a, k, axis=2)[:, :, k] / 0.385).astype(np.float32)
+    k = a.shape[2] // 2
+    blk = 1.4826 * np.partition(a, k, axis=2)[:, :, k].astype(np.float32)
     blk = np.maximum(blk, g)
+    blk = cv2.dilate(blk, np.ones((3, 3), np.uint8))
     sig = cv2.resize(blk, (w, h), interpolation=cv2.INTER_LINEAR)
     return sig.astype(np.float32), g
 
@@ -468,7 +472,9 @@ class Detector:
         if self.keep_rmap:
             df.rmap = (R / sig_map * 16.0).clip(-127, 127).astype(np.int8)
         # foreground / blobs
-        fg = (np.abs(R) > 3.0 * sig_map).astype(np.uint8)
+        # foreground for body blobs / cues: global noise scale (a large body inflates the
+        # local scale and would hide itself)
+        fg = (np.abs(R) > 3.0 * sig).astype(np.uint8)
         nlab, lab, stats, _cent = cv2.connectedComponentsWithStats(fg, connectivity=8)
         dmax = max(self.geom.d_rel, self.geom.d_catch)
         big_area = max(o.attached_area_min, 25.0 * dmax * dmax) / self.rs

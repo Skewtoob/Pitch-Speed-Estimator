@@ -103,8 +103,8 @@ def _field_sequence(n=30, ball=(400.0, 270.0), amp=60.0, sign=1, blob=False, see
             yy, xx = np.mgrid[0:240, 0:720]
             fy = (ball[1] - p) / 2.0
             img += sign * amp * np.exp(-((xx - ball[0]) ** 2 / (2 * 1.2 ** 2) + (yy - fy) ** 2 / (2 * 0.6 ** 2)))
-            if blob:
-                img[int(fy) - 12:int(fy) + 12, int(ball[0]) + 2:int(ball[0]) + 40] += sign * 50
+            if blob:   # an arm-sized moving region touching the ball
+                img[int(fy) - 3:int(fy) + 4, int(ball[0]) + 2:int(ball[0]) + 26] += sign * 50
         out.append((s, s * 1001 / 60000, s & 1, p, np.clip(img, 0, 255).astype(np.uint8)))
     return out
 

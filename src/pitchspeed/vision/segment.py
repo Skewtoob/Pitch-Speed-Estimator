@@ -343,56 +343,78 @@ class Segmenter:
         p_last = float(prog[-1])
         v = m.vel([last.t])[0]
         v_sq = float(np.hypot(v[0] * g.sar, v[1]))             # square px / s
+        catch_sig_ft = float(self.opts.extra.get("catch_sigma_ft", C.CATCH_SIGMA_FT))
+        lmf = EventTime(t=last.t + dt / 2, sigma=dt / math.sqrt(12), method="last_moving_field", s=last.s + 1)
         # contact: a fast departing track
         if self._contact(tr, m, last):
             flags.append("contact")
-            return EventTime(t=last.t + dt / 2, sigma=dt / math.sqrt(12), method="last_moving_field",
-                             s=last.s + 1), "contact"
-        if p_last >= o.catch_near_progress or (g.view == "behind" and p_last >= o.catch_near_progress - 0.1):
-            stop = self._stop_point(tr, m, last)
-            if stop is not None:
-                t_c, gpt = stop
-                diag["glove_point"] = [float(gpt[0]), float(gpt[1])]
-                return EventTime(t=float(t_c), sigma=0.003, method="extrapolated", s=last.s), "catch"
-            return EventTime(t=last.t + dt / 2, sigma=dt / math.sqrt(12), method="last_moving_field",
-                             s=last.s + 1), "catch"
-        # track ended early: extrapolate to the catch progress
-        end_kind = "occluded" if self._end_occluded(tr, +1) else "lost"
-        flags.append("catch_extrapolated")
-        t_c = _cross_time(m, g, 1.0, last.t, last.t + 0.6)
-        if t_c is None:
+            return lmf, "contact"
+        # crossing of the catch point (progress 1) by the model
+        t_c = _cross_time(m, g, 1.0, P[0].t, last.t + 0.6)
+        if t_c is None and p_last < 1.0:
             rate = _progress_rate(m, g, last.t)
             if rate > 1e-6:
                 t_c = last.t + (1.0 - p_last) / rate
-        # plausible interval from the flight-time window
+        diag["catch_point_crossing_t"] = t_c
+        stop = self._stop_point(tr, m, last)
+        if stop is not None and p_last >= 0.6:
+            t_s, gpt = stop
+            diag["glove_point"] = [float(gpt[0]), float(gpt[1])]
+            return EventTime(t=float(t_s), sigma=dt / math.sqrt(12), method="extrapolated", s=last.s), "catch"
         T_lo, T_hi = g.t_window
-        lo = last.t + dt / 2
-        hi = last.t + T_hi
+        lo, hi = last.t + dt / 2, last.t + T_hi
         if rel is not None:
             lo = max(lo, rel.t + T_lo)
             hi = max(lo + dt, rel.t + T_hi)
-        n_extra = (t_c - last.t) / dt if t_c is not None else float("inf")
-        diag["catch_extrapolation_s"] = (t_c - last.t) if t_c is not None else None
-        # behind view: extrapolating the image track over a long occlusion is
-        # degenerate (perspective scale / time ambiguity, math.md 4b)
-        unreliable = (t_c is None or not (lo <= t_c <= hi)
-                      or (g.view == "behind" and n_extra > max(6.0, 0.3 * (last.t - P[0].t) / dt)))
-        if unreliable:
+
+        def prior(kind):
             flags.append("catch_not_observed")
             t_mid = 0.5 * (lo + hi)
             return EventTime(t=float(t_mid), sigma=float((hi - lo) / math.sqrt(12.0)), method="extrapolated",
-                             s=self._nearest_s(t_mid)), end_kind
-        sig_m = _time_sigma(m, g, t_c)
+                             s=self._nearest_s(t_mid)), kind
+
+        def extrap(t_x, sig_g, kind):
+            sig_m = _time_sigma(m, g, t_x)
+            sigma = math.sqrt(min(sig_m, 1.0) ** 2 + min(sig_g, 1.0) ** 2 + dt * dt / 12)
+            diag["catch_extrapolation_s"] = t_x - last.t
+            if t_x - last.t > 0.15:
+                flags.append("catch_far_extrapolated")
+            return EventTime(t=float(t_x), sigma=float(sigma), method="extrapolated", s=self._nearest_s(t_x)), kind
+
         if g.view == "side":
-            v_fts = v_sq / g.scale_rel
-            sig_g = self.opts.extra.get("catch_sigma_ft", C.CATCH_SIGMA_FT) / max(v_fts, 1.0)
-        else:
-            rate = abs(_progress_rate(m, g, t_c))
-            sig_g = 0.15 / max(rate, 1e-6)
-        sigma = math.sqrt(min(sig_m, 1.0) ** 2 + min(sig_g, 1.0) ** 2 + dt * dt / 12)
-        if t_c - last.t > 0.15:
-            flags.append("catch_far_extrapolated")
-        return EventTime(t=float(t_c), sigma=float(sigma), method="extrapolated", s=self._nearest_s(t_c)), end_kind
+            L_ft = max(1.0, g.length_ft)
+            v_fts = max(v_sq / max(g.scale_rel, 1e-6), 1.0)
+            if p_last > 1.0 + 2.0 / L_ft and t_c is not None and t_c < last.t:
+                # the track ran > 2 ft past the catch point: the last detections are most
+                # likely glove / catcher motion on the extrapolated path
+                flags.append("track_past_catch_point")
+                return extrap(t_c, catch_sig_ft / v_fts, "catch")
+            if (1.0 - p_last) * L_ft <= 1.5:
+                return lmf, "catch"
+            end_kind = "occluded" if self._end_occluded(tr, +1) else "lost"
+            flags.append("catch_extrapolated")
+            if t_c is None or not (lo <= t_c <= hi) or t_c - last.t > 0.25:
+                return prior(end_kind)
+            return extrap(t_c, catch_sig_ft / v_fts, end_kind)
+        # behind view: image progress is non-linear; judge in samples of remaining motion
+        if t_c is None:
+            if p_last >= o.catch_near_progress - 0.1:
+                return lmf, "catch"
+            flags.append("catch_extrapolated")
+            return prior("occluded" if self._end_occluded(tr, +1) else "lost")
+        n_rem = (t_c - last.t) / dt
+        diag["catch_remaining_samples"] = n_rem
+        if n_rem <= 1.0:
+            return lmf, "catch"
+        end_kind = "occluded" if self._end_occluded(tr, +1) else "lost"
+        flags.append("catch_extrapolated")
+        # long extrapolations are degenerate behind the plate (perspective scale / time
+        # ambiguity, math.md 4b); a few samples toward the clicked glove point are fine
+        if n_rem > 6.0 or not (lo <= t_c <= hi):
+            return prior(end_kind)
+        rate = abs(_progress_rate(m, g, t_c))
+        sig_g = max(0.15 / max(rate, 1e-6), 0.35 * (t_c - last.t))
+        return extrap(t_c, sig_g, end_kind)
 
     def _stop_point(self, tr, m, last):
         """Ball seen in the next field short of the prediction (stopped in the glove)."""

@@ -152,6 +152,7 @@ class ViewGeometry:
     v_max_px: float                      # max plausible image speed (square px / sample)
     distance_ft: float
     t_window: tuple                      # plausible flight-time window (s)
+    length_ft: float = 0.0               # release -> catch distance along the pitch axis (ft)
     extra: dict = field(default_factory=dict)
 
     # -------- helpers
@@ -265,7 +266,8 @@ def view_geometry(calib: Calibration, sample_dt: float) -> ViewGeometry:
                         bbox=(float(x0), float(y0), float(x1), float(y1)), axis_sq=axis, length_sq=L,
                         scale_rel=s_rel, scale_catch=s_c, scale_known=known, d_rel=float(d_rel),
                         d_catch=float(d_c), v_min_px=float(v_lo), v_max_px=float(v_hi), distance_ft=D,
-                        t_window=(float(t_lo), float(t_hi)), extra=extra)
+                        t_window=(float(t_lo), float(t_hi)),
+                        length_ft=float(calib.release_y_ft - calib.catch_y_ft), extra=extra)
 
 
 def polygon_mask(poly: np.ndarray, shape: tuple, row_scale: int = 1, parity: float = 0.0,
