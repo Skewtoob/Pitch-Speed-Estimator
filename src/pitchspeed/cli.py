@@ -304,6 +304,11 @@ def _source_for_results(args, out_dir: str, result, check_field_order: bool = Tr
     sc = result.scan
     stored = sc.field_order if sc.mode == "interlaced" else "progressive"
     fo = getattr(args, "field_order", None)
+    if check_field_order and fo not in (None, "auto") and fo != stored and \
+            (result.params or {}).get("mode") == "marked_by_hand":
+        raise SystemExit(f"error: these pitches were marked with field order '{stored}'. To switch it, open the "
+                         f"marking window and press K (your marks stay on the same pictures):\n"
+                         f"       pitchspeed mark \"{args.video}\"")
     if check_field_order and fo not in (None, "auto") and fo != stored:
         raise SystemExit(f"error: these results were made with field order '{stored}'. To use '{fo}', "
                          f"analyze again (your review edits are backed up):\n"
@@ -404,7 +409,10 @@ def cmd_calibrate(args) -> int:
     out_dir = _out_dir(args)
     os.makedirs(out_dir, exist_ok=True)
     existing, path = _load_calib(args, out_dir)
-    view = _ask_view(args.view or (existing.segments[0].view if existing and existing.segments else None))
+    from pitchspeed.calib.model import is_manual
+    marked_by_hand = is_manual(existing)
+    view = _ask_view(args.view or (existing.segments[0].view if existing and existing.segments
+                                   and not marked_by_hand else None))
     settings = _settings_from_args(args, base=existing.settings if existing else None)
     if view == "side" and settings.pitcher_throws is None:
         a = (_ask("Pitcher throws right or left? (R/L, Enter = not sure)", "") or "").strip().upper()
@@ -413,7 +421,8 @@ def cmd_calibrate(args) -> int:
     reader, scan, source = _open_source(args.video, args.field_order, args.par)
     settings.sar = reader.info.sar
     print(f"\nOpening the calibration window ({view} view). Press H in the window for help.")
-    cf = run_calibration_ui(source, reader.info, view, initial=existing, settings=settings,
+    cf = run_calibration_ui(source, reader.info, view, initial=None if marked_by_hand else existing,
+                            settings=settings,
                             start_frame=args.frame or 0, ui_scale=getattr(args, "ui_scale", None))
     reader.close()
     if cf is None:
@@ -587,9 +596,11 @@ def _review(args, out_dir: str, source=None, result=None, cf=None, mode: Optiona
     if mode is None:
         mode = "mark" if (is_marking_session(result) or is_manual(cf)) else "review"
     if mode == "mark":
-        print("\nOpening the video. Space plays (+ faster, - slower), J/L jump 1 second, click the bar at the\n"
-              "bottom to jump anywhere. At each pitch press N at the release, then C at the glove (or B if\n"
-              "the batter hit it). H shows all keys; Q saves and quits. Everything is saved as you go.")
+        print("\nOpening the video. Space plays and pauses (+ faster, - slower), J/L jump 1 second, click the\n"
+              "bar at the bottom to jump anywhere. At each pitch: pause, step with A/D to the first field with\n"
+              "the ball out of the hand and press N, then to the first field with the ball in the glove and\n"
+              "press C (or B if the batter hit it). H shows all keys; Q saves and quits. Everything is saved\n"
+              "as you go.")
     else:
         print("\nOpening the review window. Press H in the window for help.")
     recompute = make_recompute(cf, result.scan, source, video=result.video,
@@ -630,7 +641,7 @@ def _ask_method() -> str:
 def _marking_setup(args, out_dir: str):
     """(result, source, calibration) for marking pitches by hand: the saved session (or saved
     results of any kind) when there is one for this video, else a new session.  None = stopped."""
-    from pitchspeed.calib.model import manual_calibration
+    from pitchspeed.calib.model import is_manual, manual_calibration
     from pitchspeed.pipeline import start_marking, video_fingerprint
     from pitchspeed.render.report import load_json
     p = out_paths(out_dir)
@@ -653,6 +664,10 @@ def _marking_setup(args, out_dir: str):
         if saved is not None:
             print(f"\nnote: the saved results are for a video with {saved.video.n_frames} frames, this one has "
                   f"{info.n_frames}: starting a new session (the old results are backed up)")
+    if cf is not None and is_manual(cf) and cf.video != video_fingerprint(args.video, info):
+        cf.video = video_fingerprint(args.video, info)      # settings only: nothing to fit to the picture
+        cf.image_size = (int(info.width), int(info.height))
+        cf.save(cpath)
     if cf is None:
         print("\nSettings (marking by hand needs no clicks on the picture, only the pitching distance):")
         st = _settings_from_args(args)
@@ -661,7 +676,7 @@ def _marking_setup(args, out_dir: str):
                                 video=video_fingerprint(args.video, info))
         cf.save(cpath)
         print(f"Saved the settings: {cpath}")
-    elif not _check_calibration(cf, args.video, info, interactive=True):
+    elif not is_manual(cf) and not _check_calibration(cf, args.video, info, interactive=True):
         print("Stopped; nothing was changed.")
         return None
     print("\nOpening the video (checking the interlacing and field order) ...")

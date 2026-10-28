@@ -335,8 +335,13 @@ here, so a low-confidence scan widens the timing sigma (estimate.tof).
 **One clip per pitch (`render --mode clips`, render/clips.py).**  Per pitch:
 an overlay clip (`render_annotated` highlights mode on one window, running
 list hidden) and an untouched stream copy of the original (`ffmpeg -c
-copy`, started 1 s early because copies start at key frames and MPEG-PS
-seeking can land after the target; `.mkv` if the container refuses the
-streams).  `clips/clips.json` lists what was written, so re-rendering
-removes only its own stale files.
+copy`).  Copies start at key frames and MPEG-PS seeking can land after the
+target, so each copy is checked by demuxing (its video must span the whole
+overlay clip) and cut again 3 s / 10 s earlier if not; a copy that still
+misses the pitch is deleted and reported (`.mkv` if the container refuses
+the streams).  `clips/clips.json` lists every file written (updated after
+each one); re-rendering deletes only listed files that were superseded -
+not those of a kind not made this time, of a pitch whose new file failed,
+or that are locked (deleted next time).  Marking keys pressed while the
+video plays only pause it: a mark must be on the exact field.
 

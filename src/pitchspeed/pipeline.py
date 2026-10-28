@@ -808,7 +808,10 @@ def start_marking(video_path: str, calib_file: CalibrationFile, out_dir: Optiona
     fo = None if opts.field_order in (None, "auto") else opts.field_order
     scan = detect_scan(reader, override=fo)
     source = SampleSource(reader, scan)
-    warnings = notes + _video_warnings(video_path, reader, scan, source, calib_file)
+    warnings = notes + [
+        (w.split("; use --field-order")[0] + "; in the marking window press K if motion jumps back and forth "
+         "when you step field by field") if w.startswith("interlace/field-order detection is uncertain") else w
+        for w in _video_warnings(video_path, reader, scan, source, calib_file)]
     params = {
         "mode": "marked_by_hand",
         "field_order_option": opts.field_order or "auto",

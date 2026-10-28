@@ -114,10 +114,12 @@ def test_rerendering_clips_replaces_only_its_own_files(tape, monkeypatch):
     P.save_results(r, out)
     assert cli.main(["render", video, "--mode", "clips", "--no-audio", "--no-originals"]) == 0
     now = json.load(open(os.path.join(folder, "clips.json")))["files"]
-    assert any(n.startswith("P01_12mph") for n in now) and not any(n.startswith("originals/") for n in now)
-    for n in old:
+    assert any(n.startswith("P01_12mph") for n in now)
+    old_originals = [n for n in old if n.startswith("originals/")]
+    assert old_originals and all(n in now and os.path.exists(os.path.join(folder, n)) for n in old_originals)
+    for n in old:                                                 # --no-originals keeps the originals
         if n not in now:
-            assert not os.path.exists(os.path.join(folder, n))   # stale clip and originals removed
+            assert not os.path.exists(os.path.join(folder, n))   # the stale clip is removed
     assert os.path.exists(mine)                                   # never touches other files
 
 
@@ -132,3 +134,60 @@ def test_mark_command_with_flags_needs_no_questions(tmp_path, monkeypatch, capsy
     r = load_json(P.out_paths(P.default_out_dir(video))["results_json"])
     assert len(r.pitches) == 1 and r.pitches[0].speed.v_release_mph is not None
     assert not os.path.exists(os.path.join(P.default_out_dir(video), "clips"))
+
+
+def _fresh(tmp_path, name="t.mpg", **cfg):
+    video = str(tmp_path / name)
+    generate_clip(small(duration_s=4.0, pitches={"count": 1}, **cfg), video)
+    return video, load_gt(gt_path_for(video))
+
+
+def test_calibrate_after_marking_asks_the_view_and_starts_without_points(tmp_path, monkeypatch, capsys):
+    from pitchspeed.calib import ui as calib_ui
+    video, gt = _fresh(tmp_path)
+    monkeypatch.setattr(ui, "run_review_ui", _marking_window(gt, {}))
+    _inputs(monkeypatch, [])
+    assert cli.main(["mark", video, "--level", "hs", "--render", "none"]) == 0
+    seen = {}
+
+    def fake_calib(source, info, view, initial=None, settings=None, **kw):
+        seen.update(view=view, initial=initial, settings=settings)
+        return None                                               # cancelled: nothing saved
+    monkeypatch.setattr(calib_ui, "run_calibration_ui", fake_calib)
+    _inputs(monkeypatch, ["1"])                                   # side
+    cli.main(["calibrate", video])
+    assert seen["view"] == "side" and seen["initial"] is None and seen["settings"].distance_ft == 60.5
+    assert "Where was the camera?" in capsys.readouterr().out
+
+
+def test_a_changed_tape_file_does_not_stop_a_hand_marked_setup(tmp_path, monkeypatch, capsys):
+    video, gt = _fresh(tmp_path)
+    monkeypatch.setattr(ui, "run_review_ui", _marking_window(gt, {}))
+    _inputs(monkeypatch, [])
+    assert cli.main(["mark", video, "--level", "hs", "--render", "none"]) == 0
+    generate_clip(small(duration_s=5.0, pitches={"count": 1}), video)      # re-captured: other length
+    gt2 = load_gt(gt_path_for(video))
+    monkeypatch.setattr(ui, "run_review_ui", _marking_window(gt2, {}))
+    _inputs(monkeypatch, [])                                      # no "use anyway?" question
+    assert cli.main(["mark", video, "--render", "none"]) == 0
+    txt = capsys.readouterr().out
+    assert "Use this calibration anyway" not in txt and "starting a new session" in txt
+    cf = CalibrationFile.load(P.out_paths(P.default_out_dir(video))["calibration"])
+    r = load_json(P.out_paths(P.default_out_dir(video))["results_json"])
+    assert cf.video["n_frames"] == r.video.n_frames
+    assert not any("does not fit this video" in w for w in r.warnings)
+
+
+def test_field_order_advice_for_a_hand_marked_session_points_to_k(tmp_path, monkeypatch):
+    video, gt = _fresh(tmp_path)
+    monkeypatch.setattr(ui, "run_review_ui", _marking_window(gt, {}))
+    _inputs(monkeypatch, [])
+    assert cli.main(["mark", video, "--level", "hs", "--render", "none"]) == 0
+    r = load_json(P.out_paths(P.default_out_dir(video))["results_json"])
+    stored = r.scan.field_order
+    other = "bff" if stored == "tff" else "tff"
+    for w in r.warnings:
+        if w.startswith("interlace/field-order detection is uncertain"):
+            assert "press K" in w and "--field-order" not in w
+    with pytest.raises(SystemExit, match="press K"):
+        cli.main(["mark", video, "--field-order", other, "--render", "none"])

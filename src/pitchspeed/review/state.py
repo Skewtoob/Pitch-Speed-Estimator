@@ -96,8 +96,8 @@ SPEED_LABELS = ("1/8x", "1/4x", "1/2x", "1x")
 MARK_SPEEDS = (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 MARK_SPEED_LABELS = ("1/8x", "1/4x", "1/2x", "1x", "2x", "4x", "8x")
 MODES = ("review", "mark")
-MARK_START = ("MARK PITCHES: Space plays (+ faster, - slower), J/L = 1 second, click the bar to jump. "
-              "At each pitch: N at the release, then C at the glove (B if the batter hit it)")
+MARK_START = ("MARK PITCHES: Space plays/pauses (+ faster, - slower), J/L = 1 second, click the bar to jump. "
+              "At each pitch: pause, step with A/D, N at the release, then C at the glove (B if hit)")
 PITCH_MARGIN = 60          # fields shown before the release / after the catch (io_ux.md 4)
 WINDOW_MARGIN = 30         # fields around a possible-missed window or rejected track
 POINT_TOLERANCE = 3        # ball points may be added this many fields outside R..C
@@ -421,7 +421,8 @@ class ReviewState:
             sc = getattr(result, "scan", None)
             if getattr(timeline, "interlaced", False) and sc is not None and sc.confidence == "low":
                 self._say("FIELD ORDER UNCERTAIN: step through some motion with D; if it jumps back and forth, "
-                          "press K to switch it. Then: Space plays, N at a release, C at the catch", "warn")
+                          "press K to switch it. Then: Space plays/pauses; paused, N at a release, C at the catch",
+                          "warn")
             else:
                 self._say(MARK_START, "ok")
         elif items:
@@ -518,19 +519,22 @@ class ReviewState:
         return self.mode == "mark"
 
     def _pitch_key_near(self, items: list[Item]) -> Optional[ItemKey]:
-        """Mark mode: the pitch within PITCH_MARGIN fields of the shown field (nearest), else None."""
+        """Mark mode: the item within PITCH_MARGIN fields of the shown field (the nearest; a pitch
+        wins a tie), else None.  Possible-missed windows and listed rejected tracks count too, so
+        X / Y work on them where they are shown."""
+        rank = {"pitch": 0, "missed": 1, "rtrack": 2}
         best = None
         for it in items:
-            if it.key.kind != "pitch":
-                continue
+            if it.key.kind == "missed" and not self._navigable(it):
+                continue                      # already handled: nothing to do with it here
             d = 0 if it.s0 <= self.s <= it.s1 else min(abs(self.s - it.s0), abs(self.s - it.s1))
-            if d <= PITCH_MARGIN and (best is None or d < best[0]):
-                best = (d, it.key)
+            if d <= PITCH_MARGIN and (best is None or (d, rank[it.key.kind]) < best[0]):
+                best = ((d, rank[it.key.kind]), it.key)
         return best[1] if best is not None else None
 
     def _sync_cur(self, items: Optional[list[Item]] = None) -> None:
-        """Mark mode: the current pitch always follows the shown field (see module doc)."""
-        if self.marking and self.draft is None:
+        """Mark mode: the current item always follows the shown field (see module doc)."""
+        if self.marking:
             self.cur = self._pitch_key_near(self.items() if items is None else items)
 
     def current_item(self) -> Optional[Item]:
@@ -653,6 +657,16 @@ class ReviewState:
         """Samples per Left/Right press: 2 (one frame) in the full-frame view, else 1."""
         return 2 if self.woven() else 1
 
+    def _paused_for_mark(self, key: str) -> bool:
+        """A mark made while the video plays lands on whatever field is on screen (at 2x-8x
+        several fields are skipped), so its +/- would be too small: pause instead and ask the
+        user to step to the exact field.  True = paused, nothing marked."""
+        if not self.playing:
+            return False
+        self.playing = False
+        self._say(f"paused - step with A/D (one field) to the exact field, then press {key} again", "warn")
+        return True
+
     def _single_field_needed(self, what: str = "mark") -> bool:
         """Refuse a mark in the full-frame view (True = refused, message shown).
 
@@ -708,6 +722,16 @@ class ReviewState:
             self._say("no pitches marked yet: press N at a release to add one" if self.marking else
                       "nothing to review: press N at a release to add a pitch")
             return
+        if self.marking:
+            # relative to the shown field: PgDn = the next item starting after it, PgUp = the
+            # last one starting before it (from inside a pitch: back to its release)
+            cands = [it for it in items if (it.s0 > self.s if step > 0 else it.s0 < self.s)
+                     and self._navigable(it)]
+            if not cands:
+                self._say_end(step)
+                return
+            self._goto_item((cands[0] if step > 0 else cands[-1]).key)
+            return
         i = self.item_index()
         if i is None:
             # not on an item: go to the first one after / before the current field
@@ -734,6 +758,10 @@ class ReviewState:
         self._say(f"{done} | {now}" if done and now and now != done else (done or now), level)
 
     def _say_end(self, step: int) -> None:
+        if self.marking:
+            self._say("no marked pitch after this point - Space plays on to find more; Q saves and quits"
+                      if step > 0 else "no marked pitch before this point")
+            return
         if step > 0:
             self._say("that was the last one - everything is checked. Press Q to save and quit "
                       "(PgUp goes back)", "ok")
@@ -928,7 +956,7 @@ class ReviewState:
         self._say(f"{kind} set to field {s}: {speed_text(p.speed if p else None)}", "ok")
 
     def _do_set_release(self) -> None:
-        if self._single_field_needed("mark the release"):
+        if self._paused_for_mark("R") or self._single_field_needed("mark the release"):
             return
         if self.draft is not None:
             before = copy.deepcopy(self.draft)
@@ -943,7 +971,7 @@ class ReviewState:
 
     def _do_set_contact(self) -> None:
         """B: the flight ended at the bat (a hit ball has no catch)."""
-        if self._single_field_needed("mark the bat contact"):
+        if self._paused_for_mark("B") or self._single_field_needed("mark the bat contact"):
             return
         if self.draft is not None:
             self._finish_draft(point="contact")
@@ -954,7 +982,7 @@ class ReviewState:
         self._set_event("catch", self.s, point="contact")
 
     def _do_set_catch(self) -> None:
-        if self._single_field_needed("mark the catch"):
+        if self._paused_for_mark("C") or self._single_field_needed("mark the catch"):
             return
         if self.draft is not None:
             self._finish_draft()
@@ -997,7 +1025,17 @@ class ReviewState:
     def _do_nudge_fwd(self) -> None:
         self._nudge(1)
 
+    def _drafting(self) -> bool:
+        """Mark mode: while a new pitch is half made, keys that act on other items are refused."""
+        if self.marking and self.draft is not None:
+            self._say("a new pitch is half made: press C at the glove (B at the bat), or Esc to cancel it",
+                      "warn")
+            return True
+        return False
+
     def _do_accept(self) -> None:
+        if self._drafting():
+            return
         it = self.current_item()
         if it is None:
             self._say("nothing selected to accept")
@@ -1024,6 +1062,8 @@ class ReviewState:
         self._move_then_say(f"{msg}: pitch {p.number}")
 
     def _do_reject(self) -> None:
+        if self._drafting():
+            return
         it = self.current_item()
         if it is None:
             self._say("nothing selected to reject")
@@ -1073,7 +1113,7 @@ class ReviewState:
 
     # manual pitches
     def _do_new_manual(self) -> None:
-        if self._single_field_needed("mark the release of a new pitch"):
+        if self._paused_for_mark("N") or self._single_field_needed("mark the release of a new pitch"):
             return
         self._start_draft()
 
@@ -1246,6 +1286,8 @@ class ReviewState:
 
     # re-tracking
     def _do_retrack(self) -> None:
+        if self._drafting():
+            return
         e = self._need_pitch()
         if e is None:
             return
@@ -1293,8 +1335,11 @@ class ReviewState:
             self._say("the field order of analyzed results comes from the analysis: analyze again with "
                       "--field-order tff or bff to change it", "warn")
             return
-        auto = [e.pitch.number for e in self.entries if e.pitch.status != "manual"
-                or any(not pt.manual for pt in (e.pitch.track.points if e.pitch.track else []))]
+        def by_hand(p: Pitch) -> bool:
+            status = _status_before_reject(p) if p.status == "rejected" else p.status
+            return status == "manual" and all(pt.manual for pt in (p.track.points if p.track else []))
+        auto = [e.pitch.number for e in self.entries if not by_hand(e.pitch)]
+        auto += [i for i, tr in enumerate(self.result.rejected_tracks or []) if tr is not None]
         if auto:
             self._say("these results contain automatically found pitches: change the field order by analyzing "
                       "again with --field-order tff or bff", "warn")

@@ -125,7 +125,7 @@ def test_pgup_pgdn_step_through_marked_pitches():
     keys(st, "pgdn")
     assert st.s == 1600
     keys(st, "pgdn")
-    assert "last one" in st.message.text
+    assert "no marked pitch after this point" in st.message.text and "everything is checked" not in st.message.text
     st2, _, _, _ = make_mark()
     keys(st2, "pgdn")
     assert "no pitches marked yet" in st2.message.text
@@ -241,3 +241,96 @@ def test_real_sample_source_switches_in_place():
     assert np.array_equal(a.image, b.image) and ss.sample_time(7) == a.t
     with pytest.raises(ValueError):
         ss.set_field_order("xyz")
+
+
+
+# ------------------------------------------------------- review fixes
+def test_marking_keys_pause_playback_instead_of_marking_a_moving_picture():
+    st, src, res, _ = make_mark()
+    st.goto(993)
+    for _ in range(4):
+        keys(st, "+")                                                 # 8x
+    keys(st, "space")
+    st.tick()
+    assert st.playing and st.s == 1001
+    keys(st, "n")                                                     # pressed while it plays
+    assert not st.playing and st.draft is None and "paused" in st.message.text and "N again" in st.message.text
+    st.goto(1000)
+    keys(st, "n")
+    st.goto(1029)
+    keys(st, "space")
+    keys(st, "c")                                                     # also C while playing
+    assert not st.playing and st.draft is not None and res.pitches == []
+    keys(st, "c")
+    assert len(res.pitches) == 1 and res.pitches[0].catch.s == 1029
+    st.goto(1010)
+    keys(st, "space", "r")
+    assert res.pitches[0].release.s == 1000 and not st.playing        # R on an existing pitch: same
+
+
+def test_a_half_made_pitch_blocks_keys_that_act_on_other_pitches():
+    st, src, res, _ = make_mark()
+    st.goto(1000)
+    keys(st, "n")
+    st.goto(1029)
+    keys(st, "c")
+    st.goto(1060)
+    keys(st, "n")                                                     # by mistake
+    for _ in range(5):
+        keys(st, "l")
+    for k in ("x", "y", "enter", "e"):
+        keys(st, k)
+        assert res.pitches[0].status == "manual" and "half made" in st.message.text
+    assert st.draft is not None
+    keys(st, "esc")
+    st.goto(1015)
+    keys(st, "x")
+    assert res.pitches[0].status == "rejected"                        # near it, without a draft: works
+
+
+def test_pgup_pgdn_move_from_the_shown_field():
+    st, src, res, _ = make_mark(windows=((1000, 1029), (5000, 5029)))
+    st.goto(950)                                                      # just before pitch 1
+    keys(st, "pgdn")
+    assert st.s == 1000
+    st.goto(1029)                                                     # at its catch
+    keys(st, "pgup")
+    assert st.s == 1000                                               # back to its release
+    keys(st, "pgup")
+    assert st.s == 1000 and "no marked pitch before" in st.message.text
+    st.goto(4950)
+    keys(st, "pgdn")
+    assert st.s == 5000
+    keys(st, "pgdn")
+    assert st.s == 5000 and "Space plays on" in st.message.text
+
+
+def test_missed_windows_of_analyzed_results_work_in_mark_mode():
+    src = FakeSource(n_frames=3000)
+    res = make_result(src, windows=((100, 125), (300, 328)), missed=((360, 380), (2000, 2010)))
+    rec = Recorder()
+    st = ReviewState(res, src, _manual_recompute(src), rec.save, mode="mark")
+    keys(st, "pgdn", "pgdn", "pgdn")
+    assert st.s == 360 and st.current_item().key.kind == "missed"
+    keys(st, "x")                                                     # dismisses the window ...
+    assert res.possible_missed[0]["review"] == "no_pitch"
+    assert [p.status for p in res.pitches] == ["auto", "auto"]         # ... and rejects no pitch
+    st.goto(2005)
+    keys(st, "x")
+    assert res.possible_missed[1]["review"] == "no_pitch"
+
+
+def test_k_still_works_after_rejecting_a_hand_marked_pitch():
+    st, src, res, _ = make_mark()
+    for a, b in ((1000, 1029), (2000, 2029)):
+        st.goto(a)
+        keys(st, "n")
+        st.goto(b)
+        keys(st, "c")
+    st.goto(2010)
+    keys(st, "x")
+    assert sorted(p.status for p in res.pitches) == ["manual", "rejected"]
+    keys(st, "k")
+    assert st.pending == ("flip_order", None)
+    st.run_pending()
+    assert sorted(p.release.s for p in res.pitches) == [1001, 2001]   # the rejected one is converted too

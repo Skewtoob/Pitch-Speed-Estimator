@@ -219,10 +219,12 @@ distance, so the camera angle, zoom and camera movement don't matter.
      **A** / **D** (or the arrow keys) one field;
    - **click the bar at the bottom** to jump anywhere in the tape: it covers
      the whole video and shows each pitch you've marked.
-3. At each pitch: step to the **first field with the ball out of the hand**
-   and press **N**, then step to the **first field with the ball in the
-   glove** and press **C** (or **B** at the bat if the batter hit it). The
-   speed appears right away. Space plays on to the next pitch.
+3. At each pitch: pause (**Space**), step with **A**/**D** to the **first
+   field with the ball out of the hand** and press **N**, then step to the
+   **first field with the ball in the glove** and press **C** (or **B** at the
+   bat if the batter hit it). The speed appears right away. Space plays on to
+   the next pitch. (Pressing N, C or B while the video plays just pauses it:
+   a mark has to be on the exact field, or the speed would be off.)
 4. **PgUp** / **PgDn** go back through the pitches you've marked. Near a
    pitch, R/C/B move its marks, X rejects it and U undoes. Keys never change
    a pitch you're not near.
@@ -259,12 +261,16 @@ computer-made videos, not real tapes yet.
   could not be measured `P05_no_speed.mp4`.
 - `originals\P03.avi` (or `.mpg`, ...): the same moment of your original
   video, copied **without re-encoding**: same quality and same fields, ready
-  for your own editing. It starts about 1-1.5 s earlier than the clip, because
-  a copy without re-encoding can only start at certain frames.
+  for your own editing. It starts a little earlier than the clip (usually
+  about a second, for some files several seconds), because a copy without
+  re-encoding can only start at certain frames. Each copy is checked; if one
+  cannot cover the whole pitch, the console says so instead of keeping it.
 
 Making the clips again (after review edits) replaces the clips it made
 before, including ones whose name changed; other files you put in the
-folder are left alone. `--no-originals` skips the untouched copies.
+folder are left alone. If a new clip cannot be made, the old one is kept; a
+clip that is open in a video player is removed the next time.
+`--no-originals` makes no new untouched copies (the existing ones are kept).
 
 ## Output files
 
