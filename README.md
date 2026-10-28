@@ -80,7 +80,8 @@ Tips:
   point and press **G** to start a new calibration segment. Click the
   points again there.
 - **Enter** checks your clicks and shows warnings; press **Enter** again to save.
-  **H** shows all keys.
+  **H** shows all keys. If you close the window with its **X** after
+  clicking, the console asks whether to save the points.
 
 The calibration is saved in `<video name>_pitchspeed\calibration.json`
 next to the video. You only do this once per video, or per camera setup.
@@ -136,10 +137,19 @@ Steps through every pitch and every "possible missed pitch". The main keys:
 
 Every edit re-computes that pitch's speed immediately and saves the results.
 
+**Running again.** Dragging the same video onto `pitchspeed.bat` again asks
+whether to keep the saved results and go straight to review (the default)
+or analyze again. Analyzing again never silently throws away your review
+work: a backup (`results.backup-<date-time>.json`) is written first, and your
+hand-marked, edited and rejected pitches are carried over (as long as the
+video and the calibration clicks are unchanged; otherwise the console says
+so and the backup keeps them).
+
 ### 4. Annotated video (`pitchspeed render VIDEO`)
 
-Writes `<video name>_pitchspeed\annotated.mp4` (standard H.264 + AAC. It
-should play in the Windows Films & TV app and in VLC; not yet tested on Windows). While a pitch is in flight it shows the pitch
+Writes `<video name>_pitchspeed\annotated.mp4`, standard H.264 video with
+the original sound. It should play in the Windows Films & TV app and in VLC
+(not yet tested on a Windows PC). While a pitch is in flight it shows the pitch
 number and the ball's path. At the catch it shows a card with the speed and
 its ± range. A running list of the pitches so far stays in the corner.
 `--mode highlights` writes only the pitches.

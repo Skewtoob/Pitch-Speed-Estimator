@@ -74,7 +74,11 @@ Where this file and a note disagree, **this file wins**.
   Square-pixel coords are (x * sar, y).
 * Stabilized coordinates: candidates and track points are mapped into the
   coordinate system of the calibration reference frame, using per-sample
-  2x3 transforms (sample frame coords -> reference frame coords).
+  transforms (sample frame coords -> reference frame coords).  The finder
+  uses similarities or homographies; `transforms.npz` stores both the exact
+  3x3 matrices (`transforms_3x3`) and a 2x3 local-affine approximation.
+  `pipeline.load_transforms` returns the 3x3 set when present and every
+  consumer (overlay, review) accepts (n,3,3) or (n,2,3).
 * Time: seconds from the first video frame; field time =
   frame time + k * frame_dt / 2.
 
@@ -143,7 +147,7 @@ class FinderResult:
     tracks: list[PitchTrack]                           # status == 'pitch', with release/catch EventTimes
     rejected: list[PitchTrack]                         # status == 'rejected', reject_code set
     possible_missed: list[dict]                        # {s_start, s_end, t_start, t_end, reason}
-    transforms: np.ndarray                             # (n_samples_processed, 2, 3) sample -> reference
+    transforms: np.ndarray                             # (n, 2, 3) local affine; exact 3x3 in diagnostics['transforms_3x3']
     transform_quality: np.ndarray                      # (n,) 0..1
     sample_index: np.ndarray                           # (n,) the sample index s of each row above
     diagnostics: dict
@@ -239,3 +243,62 @@ Output folder `<video stem>_pitchspeed/`: `calibration.json`,
 * Prototype synthetic clips with ground truth (prototype format) exist in
   the session scratchpad `gen/` directory (`ll_side_bff.mkv`,
   `ll_behind_tff.mkv`, ... + `.gt.json`).
+
+
+## 5. Decisions made during integration, evaluation and review
+
+These came out of end-to-end runs on held-out synthetic suites and an
+adversarial code review (findings verified independently before fixing).
+
+**Field order / scan.**  Content tests can be unsure on real footage.  After
+tracking, `pipeline.resolve_field_order` re-times every well-tracked ball
+under three hypotheses (detected order, flipped order, progressive) and
+refits a smooth curve; a decisive winner confirms the scan (confidence
+'high'), or triggers one automatic re-run with the corrected order /
+progressive mode.  Tracks seen in only one field parity cannot vote (the
+hypotheses differ by a constant shift); the finder's pair check covers the
+"one track per parity" symptom of a wrong order.  Above 40 frames/s video
+is never split into fields.
+
+**What becomes a numbered pitch.**  A track becomes a pitch only if its
+confidence is >= `DOUBTFUL_CONFIDENCE` (0.3); weaker tracks, likely catcher
+throw-backs (no speed, starts <= 4 s after the previous catch, stays near
+the pitcher's end of the path) and pre-pitch junk (no speed, <= 1.5 s before
+a stronger pitch) go to the review list ("possible missed pitch") with the
+reason.  Duplicates are only same-flight fragments; the fragment that saw
+most of the flight wins and any loser outside the winner's flight is listed
+for review.  Nothing is dropped silently.
+
+**Honest event times (behind view).**  The release is the first clean
+free-flight detection minus a latency prior.  It is widened (never narrowed)
+when: earlier faint detections run into it; the delivery-motion cue comes
+clearly earlier; early detections are separated from the continuous flight
+by a gap (`release_gap`: the early group may be the ball still in the hand);
+or the data starts too close before it.  A hidden catch is the crossing of
+the fitted trajectory with the clicked glove point, with a sigma calibrated
+on ground truth, and "not observed" when more than ~10 fields are hidden.
+
+**Manual marks.**  R = first field with the ball out of the hand, C = first
+field with the ball in the glove.  The event is placed half a field earlier
+with quantization sigma dt/sqrt(12), plus an assumed human-judgement term
+(one-field slip with p = 0.25), about 0.58 field in total.  A manual C
+always ends the flight at the glove (never an automatic 'contact').  Stale
+flags of the automatic event are removed after a manual mark.
+
+**Capture glitches.**  Duplicated, dropped or undecodable frames inside a
+pitch's frame range set `duplicate_frame_suspected` / `dropped_frame_suspected`
+on that pitch, which widens its timing uncertainty.
+
+**Detection noise normalization.**  Each matched kernel's gain is measured
+only on pixels where the residual is non-zero (static blocks of compressed
+or lossless video are exactly zero and would otherwise collapse the
+estimate), and clipped to [1, 8] x its white-noise gain.
+
+**User data safety.**  Re-running `run` on a video with results asks first
+(default: keep them and go to review).  `analyze` over results with review
+work writes `results.backup-<timestamp>.json` first and carries manual /
+edited / rejected pitches over when the sample timeline is unchanged.
+results.json is always written before results.csv; a CSV locked by Excel
+is a warning, never a lost result.  The calibration's video fingerprint is
+checked; files with the same stem but different extensions get separate
+output folders.
