@@ -205,7 +205,7 @@ def test_side_view_clicked_release_point_is_mapped_to_world_y():
 def test_manual_event_semantics():
     ev = manual_event(10.0, DT, "release", s=600)
     assert ev.t == pytest.approx(10.0 - DT / 2)
-    assert ev.sigma == pytest.approx(DT / math.sqrt(12))
+    assert ev.sigma == pytest.approx(DT / math.sqrt(12))   # the estimator adds the identification term
     assert ev.method == "manual" and ev.s == 600
     with pytest.raises(ValueError):
         manual_event(1.0, DT, "glove")

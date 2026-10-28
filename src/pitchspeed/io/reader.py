@@ -453,28 +453,58 @@ def _cache_key(path: str) -> dict:
 
 
 def _load_cached_index(cache_path: str, path: str) -> Optional[_Index]:
+    """The cached index if it matches the video's current size/mtime, else None.
+
+    A cache is only an optimisation: anything wrong with it (missing, stale,
+    truncated or empty after a crash -> BadZipFile/EOFError, wrong arrays)
+    means "rebuild".  An unreadable cache file is deleted so it is rewritten.
+    """
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        key = _cache_key(path)
+    except OSError:
+        return None
     try:
         with np.load(cache_path, allow_pickle=False) as z:
-            key = _cache_key(path)
             if (int(z["size"]) != key["size"] or int(z["mtime_ns"]) != key["mtime_ns"]
                     or int(z["version"]) != key["version"]):
-                return None
-            return _Index(z["pts"].astype(np.int64), str(z["method"]) + "+cache",
-                          bool(z["synthesized"]))
-    except (OSError, KeyError, ValueError):
+                return None                    # stale: overwritten after the rebuild
+            pts = np.asarray(z["pts"])
+            if pts.ndim != 1 or len(pts) == 0 or not np.issubdtype(pts.dtype, np.integer):
+                raise ValueError(f"bad pts array (shape {pts.shape}, dtype {pts.dtype})")
+            return _Index(pts.astype(np.int64), str(z["method"]) + "+cache", bool(z["synthesized"]))
+    except Exception as e:                     # noqa: BLE001 - any damaged cache is rebuilt
+        log.warning("index cache %s is unreadable (%s: %s); rebuilding it", cache_path,
+                    type(e).__name__, e)
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
         return None
 
 
-def _save_cached_index(cache_path: str, path: str, idx: _Index) -> None:
-    key = _cache_key(path)
-    tmp = cache_path + ".tmp.npz"
+def _save_cached_index(cache_path: str, idx: _Index, key: dict) -> None:
+    """Write the index under `key` (taken BEFORE the index was built) atomically.
+
+    The data is flushed and fsynced before the rename, so a crash or power
+    loss leaves either the old cache or the complete new one (never an empty
+    file under the final name)."""
+    tmp = f"{cache_path}.{os.getpid()}.tmp"
     try:
-        np.savez(tmp, pts=idx.pts, method=np.array(idx.method), synthesized=np.array(idx.synthesized),
-                 size=np.array(key["size"]), mtime_ns=np.array(key["mtime_ns"]),
-                 version=np.array(key["version"]))
+        with open(tmp, "wb") as f:
+            np.savez(f, pts=idx.pts, method=np.array(idx.method), synthesized=np.array(idx.synthesized),
+                     size=np.array(key["size"]), mtime_ns=np.array(key["mtime_ns"]),
+                     version=np.array(key["version"]))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, cache_path)
-    except OSError as e:
+    except Exception as e:                     # noqa: BLE001 - the cache is optional
         log.warning("could not write index cache %s: %s", cache_path, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ------------------------------------------------------------------- probe --
@@ -677,9 +707,26 @@ class VideoReader:
             cached = _load_cached_index(cache_path, self.path)
             if cached is not None:
                 return cached
+        # The cache key (size, mtime) must describe the file the index was built
+        # from: take it before the build and compare after.
+        try:
+            key = _cache_key(self.path)
+        except OSError:
+            key = None
         idx = self._build_index(mode)
-        if cache_path:
-            _save_cached_index(cache_path, self.path, idx)
+        try:
+            changed = key is not None and _cache_key(self.path) != key
+        except OSError:
+            changed = True
+        if key is None:
+            pass                               # cannot stat the file: just do not cache
+        elif changed:
+            msg = ("the video file changed while it was being read (still being copied or recorded?): "
+                   "the analysis may cover only part of it; run again once the file is complete")
+            log.warning("%s: %s", self.path, msg)
+            self.notes.append(msg)
+        elif cache_path:
+            _save_cached_index(cache_path, idx, key)
         return idx
 
     def _build_index(self, mode: str) -> _Index:

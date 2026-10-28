@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from pitchspeed.calib.model import CalibrationFile, Segment, Settings
+from pitchspeed.estimate.speed import estimate_speed
 from pitchspeed.vision import geometry as G
 from pitchspeed.vision.detect import CAND_DTYPE, DetFrame
 from pitchspeed.vision.options import FinderOptions
@@ -86,9 +87,11 @@ def _calibration(cam, D=60.5, release=(-1.5, 55.0, 5.6), catch=(0.0, -1.5, 2.2))
 
 
 def _setup(hidden=5, latency=1, noise=0.4, seed=0, speed_mph=65.0, target=(0.3, 2.4), scale_clicks=True,
-           cue=None):
+           cue=None, pre=80, skipped=None):
     """cue: None (no motion data) or the time offset (s, vs the true release) of a burst of
-    delivery motion near the release point in DetFrame.e_rel."""
+    delivery motion near the release point in DetFrame.e_rel.  pre: samples of data before the
+    first detection (the processed range starts there); skipped: (s0, s1) samples marked
+    skipped ('no_registration')."""
     rng = np.random.default_rng(seed)
     cam = _camera()
     calib = _calibration(cam)
@@ -118,14 +121,16 @@ def _setup(hidden=5, latency=1, noise=0.4, seed=0, speed_mph=65.0, target=(0.3, 
     keep = sorted(tr.pts)[:max(0, len(tr.pts) - hidden)]
     tr.pts = {s: tr.pts[s] for s in keep}
     st = CandStore(2000)
-    for s in range(keep[0] - 80, keep[-1] + 60):
+    for s in range(keep[0] - pre, keep[-1] + 60):
         e = float("nan")
         if cue is not None:
             e = 0.03 + 0.002 * math.sin(1.7 * s) + 0.12 * math.exp(-0.5 * ((s * DT - t_rel - cue) / (1.5 * DT)) ** 2)
+        skip = "no_registration" if skipped is not None and skipped[0] <= s <= skipped[1] else ""
         st.add(DetFrame(s=s, t=s * DT, k=s & 1, parity=s & 1, A=np.eye(3), quality=1.0,
-                        cands=np.zeros(0, CAND_DTYPE), e_rel=e))
+                        cands=np.zeros(0, CAND_DTYPE), e_rel=float("nan") if skip else e, skipped=skip))
     fit_track(tr, geom, FinderOptions())
     seg = Segmenter(geom, FinderOptions(), DT, 2 * DT, True, st, quality_of=lambda a, b: 0.8, view="behind")
+    seg.s_range = (keep[0] - pre, keep[-1] + 59)
     return seg, tr, t_rel, t_cat
 
 
@@ -233,3 +238,69 @@ def test_late_first_detection_is_widened_by_the_delivery_cue():
     seg2, tr2, _, _ = _setup(hidden=4, latency=12)
     p2 = seg2.classify(tr2)
     assert abs(p2.release.t - t_rel) > 3 * p2.release.sigma
+
+
+# ---- release just after the start of the data (clip / --start / segment start, skipped stretch)
+def _late_start_case(**kw):
+    # the detector also missed the first 8 fields of the flight (common: the ball barely moves
+    # in the image early on), and there is no data from before the first detection
+    return _setup(hidden=4, latency=8, **kw)
+
+
+def test_release_at_the_data_start_is_not_observed():
+    seg, tr, t_rel, t_cat = _late_start_case(pre=3)
+    pt = seg.classify(tr)
+    assert "release_not_observed" in pt.flags
+    assert pt.diagnostics["release_not_observed_reason"] == "release_before_data"
+    assert pt.diagnostics["release_pre_data_coverage"] < 0.6
+    lo, hi = pt.diagnostics["release_interval"]
+    assert lo <= t_rel <= hi
+    # the speed is not given with a tight, wrong interval
+    sp = estimate_speed(seg_calib(), None, DT, pt.release, pt.catch, track=pt)
+    assert sp.v_release_mph is None or abs(sp.v_release_mph - 65.0) < 1.645 * sp.sigma_mph
+
+
+def test_release_after_a_skipped_stretch_is_not_observed():
+    seg, tr, t_rel, t_cat = _late_start_case()
+    s_clean = min(tr.pts)
+    seg2, tr2, _, _ = _late_start_case(skipped=(s_clean - 60, s_clean - 1))
+    pt = seg2.classify(tr2)
+    assert "release_not_observed" in pt.flags
+    assert pt.diagnostics["release_not_observed_reason"] == "release_before_data"
+
+
+def test_release_with_data_before_is_unchanged():
+    seg, tr, t_rel, t_cat = _late_start_case()
+    pt = seg.classify(tr)
+    assert pt.diagnostics["release_pre_data_coverage"] == pytest.approx(1.0)
+    assert pt.diagnostics.get("release_not_observed_reason") != "release_before_data"
+    # a few missing samples (registration hiccup) are not "no data"
+    s_clean = min(tr.pts)
+    seg2, tr2, _, _ = _late_start_case(skipped=(s_clean - 8, s_clean - 1))
+    p2 = seg2.classify(tr2)
+    assert p2.diagnostics.get("release_not_observed_reason") != "release_before_data"
+    assert p2.release.t == pytest.approx(pt.release.t) and p2.release.sigma == pytest.approx(pt.release.sigma)
+
+
+def test_fields_lost_in_alternation_are_not_missing_data():
+    # registration failing on every other field (eval2/s31337_002): half the fields still look
+    seg, tr, t_rel, t_cat = _late_start_case()
+    pt = seg.classify(tr)
+    s_clean = min(tr.pts)
+    seg2, tr2, _, _ = _late_start_case()
+    for s in range(s_clean - 60, s_clean):
+        if s % 2 == 0 or s % 7 == 0:
+            seg2.store.get(s).skipped = "no_registration"
+    p2 = seg2.classify(tr2)
+    assert p2.diagnostics["release_pre_data_coverage"] < 0.6 and p2.diagnostics["release_pre_data_gap"] < 8
+    assert p2.diagnostics.get("release_not_observed_reason") != "release_before_data"
+    assert p2.release.t == pytest.approx(pt.release.t)
+
+
+def test_finder_usable_mask_covers_unprocessed_samples():
+    from types import SimpleNamespace
+    from pitchspeed.vision.finder import PitchFinder
+    f = SimpleNamespace(_usable={s: (s % 4 != 0) for s in range(100, 200)})
+    m = PitchFinder._usable_mask(f, 96, 104)
+    assert m == [False, False, False, False, False, True, True, True, False]   # 96..99: never processed
+    assert PitchFinder._usable_mask(f, 10, 5) == []

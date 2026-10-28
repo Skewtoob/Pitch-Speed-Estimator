@@ -9,12 +9,14 @@ coordinates of the current sample; `review/ui.py` is the thin cv2 shell.
 ITEMS (PgUp/[ and PgDn/] step through them in time order):
   * every pitch, including rejected ones (shown as rejected; Y restores);
   * every ``possible_missed`` window (X marks it "checked: no pitch",
-    N/R at the release field starts a manual pitch there);
+    N/R at the release field starts a manual pitch there; adding that
+    pitch records ``review = 'pitch_added'`` on the window);
   * optionally (O toggles) the finder's rejected tracks with their reason
     code; Y promotes one that has release/catch times to a pitch.
 Nothing is ever deleted: rejecting keeps the pitch with status
 'rejected', dismissing a window records ``review = 'no_pitch'`` in its
-dict, and the undo stack can revert everything.
+dict, and the undo stack can revert everything.  The window's ``review``
+key is what results.csv and the annotated video use to show it as checked.
 
 EDITS AND STATUSES.  'auto' becomes 'edited' on the first edit (R/C
 change, ball point added/removed, re-track); 'manual' pitches stay
@@ -30,7 +32,16 @@ MANUAL MARKS (DESIGN.md / estimate/events.py semantics, shown in the HUD):
   C = the FIRST field in which the ball is in the glove.
 A mark becomes an EventTime through ``make_event(s, kind)``, by default
 `pitchspeed.estimate.events.manual_event` (t = field time - dt/2,
-sigma = dt/sqrt(12), method 'manual', s = the marked field).
+sigma = dt/sqrt(12), method 'manual', s = the marked field).  A C mark is
+always the glove: the speed estimate then ends the flight at the catch
+point even if the automatic track ended at a possible bat contact
+(end_kind 'contact'; the info line says where the flight ends and C on such
+a pitch warns, U undoes).  A ball the batter hit has no catch to mark.
+
+FULL-FRAME VIEW (F, interlaced video): one picture shows two fields, so
+Left/Right step one frame (2 fields) and marks (R, C, N, nudges, ball-point
+clicks) are refused with "press F": a mark in the woven picture would get
+whichever of the two fields happens to be current, a hidden 16.7 ms error.
 
 NEW MANUAL PITCH: N (or R where no pitch is selected) marks the release
 at the current field; step to the catch and press C.  Esc cancels the
@@ -48,10 +59,12 @@ BALL POINTS.  Left-click adds a manual ball point at the current field
 ``inlier=False``); right-click near a point at the current field deletes a
 manual point or toggles an automatic one in/out.  Points are stored in
 stabilized coordinates (the calibration reference frame) using the
-per-sample transforms, like the automatic track.
+per-sample transforms the finder used (`StabilizeMap`: 3x3 homographies,
+or 2x3 affine transforms from older files), like the automatic track.
 
 KEYS: see BINDINGS / HELP_TEXT.  Navigation follows the calibration
-window: Left/A Right/D one field, Up/W Down/S ten fields back/forward,
+window: Left/A Right/D one field (one frame in the full-frame view),
+Up/W Down/S ten fields back/forward,
 PgUp/[ PgDn/] previous/next item, Home/End release/catch.
 """
 from __future__ import annotations
@@ -108,8 +121,8 @@ BINDINGS: dict[str, list[str]] = {
 }
 
 HELP_TEXT: dict[str, str] = {
-    "prev_field": "back 1 field",
-    "next_field": "forward 1 field",
+    "prev_field": "back 1 field (1 frame in the full-frame view)",
+    "next_field": "forward 1 field (1 frame in the full-frame view)",
     "back_10": "back 10 fields",
     "fwd_10": "forward 10 fields",
     "prev_item": "previous pitch / window to check",
@@ -117,7 +130,7 @@ HELP_TEXT: dict[str, str] = {
     "goto_release": "go to the release (R)",
     "goto_catch": "go to the catch (C)",
     "set_release": "release = this field (FIRST field with the ball out of the hand)",
-    "set_catch": "catch = this field (FIRST field with the ball in the glove)",
+    "set_catch": "catch = this field (FIRST field with the ball in the glove; a ball the batter hit has no catch)",
     "toggle_marker": "select the R or the C marker for nudging",
     "nudge_back": "move the selected marker 1 field earlier",
     "nudge_fwd": "move the selected marker 1 field later",
@@ -130,7 +143,7 @@ HELP_TEXT: dict[str, str] = {
     "slower": "slower playback (down to 1/8x)",
     "track": "show / hide the ball track",
     "loupe": "8x loupe at the mouse",
-    "toggle_view": "bobbed field / full frame view",
+    "toggle_view": "bobbed field / full frame view (marks only in the field view)",
     "others": "also list the tracks the finder rejected",
     "help": "this help",
     "undo": "undo (unlimited)",
@@ -199,15 +212,39 @@ def default_make_event(timeline) -> Callable[[int, str], EventTime]:
     return make
 
 
+def _as_3x3(transforms) -> np.ndarray:
+    """(n, 3, 3) float array from (n, 3, 3) homographies or (n, 2, 3) affine transforms."""
+    T = np.asarray(transforms, dtype=np.float64)
+    shape = T.shape[-2:] if T.ndim >= 2 else ()
+    if T.ndim in (2, 3) and shape == (3, 3):
+        return T.reshape(-1, 3, 3).copy()
+    if (T.ndim in (2, 3) and shape == (2, 3)) or (T.ndim == 2 and T.shape[1] == 6) or T.size == 0:
+        A = T.reshape(-1, 2, 3)
+        H = np.zeros((len(A), 3, 3))
+        H[:, :2, :] = A
+        H[:, 2, 2] = 1.0
+        return H
+    raise ValueError(f"transforms must have shape (n, 2, 3) or (n, 3, 3), not {T.shape}")
+
+
 class StabilizeMap:
-    """Per-sample 2x3 transforms (sample frame coords -> reference frame coords).
+    """Per-sample transforms (sample frame coords -> reference frame coords).
+
+    Accepts the (n, 3, 3) homographies that `pipeline.load_transforms`
+    returns when transforms.npz has 'transforms_3x3' (the transforms the
+    finder mapped its track points with) or the (n, 2, 3) affine set of
+    older files.  Points are mapped projectively, v = H [x, y, 1] ->
+    (v0 / v2, v1 / v2), so manual ball points are stored, and automatic
+    ones drawn, in exactly the finder's coordinates.
 
     Missing samples use the nearest transform within `max_gap` samples,
-    else the identity (no stabilization information).
+    else the identity (no stabilization information); so does a sample
+    whose matrix is degenerate (not invertible, or maps the point to
+    infinity).
     """
 
     def __init__(self, transforms=None, samples=None, max_gap: int = 3):
-        self.T = None if transforms is None else np.asarray(transforms, dtype=np.float64).reshape(-1, 2, 3)
+        self.T = None if transforms is None else _as_3x3(transforms)
         if self.T is not None and samples is None:
             samples = np.arange(len(self.T))
         self.S = None if samples is None else np.asarray(samples, dtype=np.int64).reshape(-1)
@@ -217,8 +254,9 @@ class StabilizeMap:
             order = np.argsort(self.S, kind="stable")
             self.S, self.T = self.S[order], self.T[order]
         self.max_gap = int(max_gap)
+        self._inv: dict[int, Optional[np.ndarray]] = {}
 
-    def matrix(self, s: int) -> Optional[np.ndarray]:
+    def _index(self, s: int) -> Optional[int]:
         if self.T is None or self.S is None or len(self.S) == 0:
             return None
         j = int(np.searchsorted(self.S, s))
@@ -228,22 +266,39 @@ class StabilizeMap:
                 d = abs(int(self.S[c]) - int(s))
                 if d <= self.max_gap and (best is None or d < best[0]):
                     best = (d, c)
-        return None if best is None else self.T[best[1]]
+        return None if best is None else best[1]
+
+    def matrix(self, s: int) -> Optional[np.ndarray]:
+        """The 3x3 matrix used for sample s (None: identity)."""
+        i = self._index(s)
+        return None if i is None else self.T[i]
+
+    def _inverse(self, i: int) -> Optional[np.ndarray]:
+        if i not in self._inv:
+            try:
+                Mi = np.linalg.inv(self.T[i])
+                self._inv[i] = Mi if np.all(np.isfinite(Mi)) else None
+            except np.linalg.LinAlgError:
+                self._inv[i] = None
+        return self._inv[i]
+
+    @staticmethod
+    def _apply(M: Optional[np.ndarray], x: float, y: float) -> tuple[float, float]:
+        if M is None:
+            return float(x), float(y)
+        v = M @ np.array([float(x), float(y), 1.0])
+        w = float(v[2])
+        if not (math.isfinite(w) and abs(w) > 1e-12):
+            return float(x), float(y)
+        return float(v[0] / w), float(v[1] / w)
 
     def to_ref(self, s: int, x: float, y: float) -> tuple[float, float]:
-        M = self.matrix(s)
-        if M is None:
-            return float(x), float(y)
-        v = M @ np.array([x, y, 1.0])
-        return float(v[0]), float(v[1])
+        i = self._index(s)
+        return self._apply(None if i is None else self.T[i], x, y)
 
     def from_ref(self, s: int, x: float, y: float) -> tuple[float, float]:
-        M = self.matrix(s)
-        if M is None:
-            return float(x), float(y)
-        Mi = np.linalg.inv(np.vstack([M, [0.0, 0.0, 1.0]]))
-        v = Mi @ np.array([x, y, 1.0])
-        return float(v[0]), float(v[1])
+        i = self._index(s)
+        return self._apply(None if i is None else self._inverse(i), x, y)
 
 
 @dataclass
@@ -501,11 +556,33 @@ class ReviewState:
         self.s = self._clamp(s)
         self.playing = False
 
+    def woven(self) -> bool:
+        """True in the full-frame view of interlaced video (one picture = two fields)."""
+        return self.view_mode == "frame" and bool(getattr(self.tl, "interlaced", False))
+
+    def _field_step(self) -> int:
+        """Samples per Left/Right press: 2 (one frame) in the full-frame view, else 1."""
+        return 2 if self.woven() else 1
+
+    def _single_field_needed(self, what: str = "mark") -> bool:
+        """Refuse a mark in the full-frame view (True = refused, message shown).
+
+        A woven frame shows two fields 1/60 s apart, so the user cannot see
+        which of them a mark or ball point would get: a hidden +-1 field
+        error (16.7 ms, ~3.7 % of a 90 mph flight) that the marks' sigma
+        (one field) does not cover.  Marks are only made in the field view.
+        """
+        if not self.woven():
+            return False
+        self._say(f"full-frame view shows two fields at once: press F for the single-field view to {what}",
+                  "warn")
+        return True
+
     def _do_prev_field(self) -> None:
-        self._step(-1)
+        self._step(-self._field_step())
 
     def _do_next_field(self) -> None:
-        self._step(1)
+        self._step(self._field_step())
 
     def _do_back_10(self) -> None:
         self._step(-10)
@@ -595,6 +672,11 @@ class ReviewState:
             self._say("progressive video: field and frame view are the same")
             return
         self.view_mode = "frame" if self.view_mode == "field" else "field"
+        if self.view_mode == "frame":
+            self._say("full frame (two fields woven): Left/Right step one frame; marks need the field view "
+                      "(F again)")
+        else:
+            self._say("single field: Left/Right step one field")
 
     def _do_others(self) -> None:
         n = len(self.result.rejected_tracks or [])
@@ -686,9 +768,17 @@ class ReviewState:
         self._edit(e, "set_" + kind, mutate, from_s=old, to_s=s)
         self.marker = "R" if kind == "release" else "C"
         p = self.current_pitch()
+        if kind == "catch" and p is not None and _track_end(p) == "contact":
+            # A C mark is the glove (estimate.events): the speed now uses the glove distance,
+            # about 6 % more than the bat-contact distance the automatic track ended at.
+            self._say(f"catch set to field {s} = ball IN THE GLOVE: {speed_text(p.speed)}. The automatic "
+                      f"track ended at a possible bat contact; if the batter hit the ball, press U", "warn")
+            return
         self._say(f"{kind} set to field {s}: {speed_text(p.speed if p else None)}", "ok")
 
     def _do_set_release(self) -> None:
+        if self._single_field_needed("mark the release"):
+            return
         if self.draft is not None:
             before = copy.deepcopy(self.draft)
             self._push([], "draft_release", draft_before=before)
@@ -701,6 +791,8 @@ class ReviewState:
         self._set_event("release", self.s)
 
     def _do_set_catch(self) -> None:
+        if self._single_field_needed("mark the catch"):
+            return
         if self.draft is not None:
             self._finish_draft()
             return
@@ -714,6 +806,8 @@ class ReviewState:
         self._say(f"{self.marker} marker selected (, and . move it)")
 
     def _nudge(self, step: int) -> None:
+        if self._single_field_needed("move a mark"):
+            return
         if self.draft is not None:
             before = copy.deepcopy(self.draft)
             self._push([], "draft_nudge", draft_before=before)
@@ -774,6 +868,10 @@ class ReviewState:
             return
         if it.key.kind == "missed":
             m = self.result.possible_missed[it.key.ref]
+            if m.get("review") == "pitch_added":
+                self._say("a pitch was added here by hand: to remove it, select that pitch (PgUp/PgDn) and "
+                          "press X", "warn")
+                return
             before = copy.deepcopy(m)
             if m.get("review") == "no_pitch":
                 m.pop("review", None)
@@ -813,6 +911,8 @@ class ReviewState:
 
     # manual pitches
     def _do_new_manual(self) -> None:
+        if self._single_field_needed("mark the release of a new pitch"):
+            return
         self._start_draft()
 
     def _start_draft(self) -> None:
@@ -844,6 +944,7 @@ class ReviewState:
                   track=track, confidence=0.0,
                   edit_history=[{"action": "create_manual", "at": now_text(), "s_release": sr, "s_catch": sc,
                                  "from": origin.kind if origin is not None else "free"}])
+        ops += self._mark_windows_resolved(sr, sc, origin)
         e = self._add_entry(p)
         ops.append(("add", e.uid))
         self._push(ops, "add_manual", draft_before=d)
@@ -853,6 +954,28 @@ class ReviewState:
         self.cur = ItemKey("pitch", e.uid)
         self.marker = "C"
         self._say(f"manual pitch {e.pitch.number} added: {speed_text(e.pitch.speed)}", "ok")
+
+    def _mark_windows_resolved(self, sr: int, sc: int, origin: Optional[ItemKey]) -> list:
+        """Record review = 'pitch_added' on the possible-missed windows a new pitch accounts for.
+
+        The window the manual pitch was started from (if the pitch lies
+        within WINDOW_MARGIN of it) and every other window that overlaps the
+        flight sr..sc - also one marked 'no_pitch' before (the new pitch is
+        the newer decision).  Returns the undo ops.  results.csv and the
+        annotated video read this key (a checked window is not shown as
+        'check in review' any more).
+        """
+        ops = []
+        for i, m in enumerate(self.result.possible_missed or []):
+            if not isinstance(m, dict) or m.get("review") == "pitch_added":
+                continue
+            a, b = self._window_of(m)
+            from_here = origin is not None and origin.kind == "missed" and origin.ref == i
+            pad = WINDOW_MARGIN if from_here else 0
+            if a - pad <= sc and sr <= b + pad:
+                ops.append(("missed", i, copy.deepcopy(m)))
+                m["review"] = "pitch_added"
+        return ops
 
     def _promote(self, idx: int) -> None:
         tr = self.result.rejected_tracks[idx]
@@ -866,6 +989,7 @@ class ReviewState:
             return
         ops = [("rtrack", idx, copy.deepcopy(tr.diagnostics))]
         tr.diagnostics["review"] = "promoted_to_pitch"
+        ops += self._mark_windows_resolved(r, c, None)
         p = Pitch(number=0, status="edited", release=copy.deepcopy(tr.release), catch=copy.deepcopy(tr.catch),
                   speed=SpeedEstimate(v_release_mph=None, reason="not computed yet"),
                   frame_release=int(self.tl.locate(r)[0]), frame_catch=int(self.tl.locate(c)[0]),
@@ -885,6 +1009,8 @@ class ReviewState:
     def on_click(self, x: float, y: float) -> None:
         """Left click at frame pixel (x, y) of the current sample: manual ball point."""
         self._error_said = False
+        if self._single_field_needed("click ball points"):
+            return
         e = self._need_pitch()
         if e is None:
             return
@@ -918,6 +1044,8 @@ class ReviewState:
     def on_right_click(self, x: float, y: float) -> None:
         """Right click near a ball point of the current field: delete (manual) / toggle (automatic)."""
         self._error_said = False
+        if self._single_field_needed("change ball points"):
+            return
         e = self._need_pitch()
         if e is None:
             return
@@ -1071,7 +1199,8 @@ class ReviewState:
             m = self.result.possible_missed[it.key.ref]
             missed = [x for x in self.items() if x.key.kind == "missed"]
             i = [x.key for x in missed].index(it.key) + 1
-            state = "checked: no pitch" if m.get("review") == "no_pitch" else "not checked"
+            state = {"no_pitch": "checked: no pitch", "pitch_added": "checked: pitch added"}.get(
+                m.get("review"), "not checked")
             return (f"Possible missed pitch {i}/{len(missed)} | {format_time(self.tl.sample_time(it.s0))} | "
                     f"fields {it.s0}-{it.s1} | {m.get('reason', '')} | {state} | N at release adds it, X = no pitch")
         if it.key.kind == "rtrack":
@@ -1092,6 +1221,9 @@ class ReviewState:
         parts = [head, format_time(p.release.t if p.release else None), f"fields {it.s0}-{it.s1}",
                  speed_text(sp), METHOD_NAMES.get(getattr(sp, "method", "none"), str(getattr(sp, "method", "")))]
         parts.append(getattr(sp, "label", "none") or "none")
+        end = end_text(p)
+        if end:
+            parts.append(end)
         if flags:
             parts.append(",".join(flags))
         if _reviewed(p):
@@ -1133,10 +1265,24 @@ class ReviewState:
             out["span"] = (it.s0, it.s1)
         return out
 
+    def shows(self, s: Optional[int]) -> bool:
+        """True if sample s is in the current picture (its field, or its frame in the full-frame view)."""
+        if s is None:
+            return False
+        if s == self.s:
+            return True
+        if not self.woven():
+            return False
+        try:
+            return int(self.tl.locate(int(s))[0]) == int(self.tl.locate(self.s)[0])
+        except (IndexError, ValueError):
+            return False
+
     def overlay_points(self) -> list[tuple[float, float, bool, bool, bool]]:
         """Track points of the current pitch in frame px of the CURRENT sample.
 
-        (x, y, manual, inlier, at_current_field) for each point.
+        (x, y, manual, inlier, in_current_picture) for each point (the
+        current field; both fields of the frame in the full-frame view).
         """
         p = self.current_pitch()
         if p is None and self.cur is not None and self.cur.kind == "rtrack":
@@ -1148,7 +1294,7 @@ class ReviewState:
         out = []
         for pt in tr.points:
             x, y = self.stab.from_ref(self.s, pt.x, pt.y)
-            out.append((x, y, bool(pt.manual), bool(pt.inlier), pt.s == self.s))
+            out.append((x, y, bool(pt.manual), bool(pt.inlier), self.shows(pt.s)))
         return out
 
     def hint_text(self) -> str:
@@ -1164,6 +1310,33 @@ class ReviewState:
                  ("R-click", "remove a manual point / exclude-include an automatic one"),
                  ("", "Every edit recomputes the speed and autosaves results.json.")]
         return rows
+
+
+# ------------------------------------------------------------ end point
+def _track_end(p: Pitch) -> str:
+    """How the pitch's ball track ended according to the finder ('catch' if unknown)."""
+    return (getattr(p.track, "end_kind", None) if p.track is not None else None) or "catch"
+
+
+def effective_end(p: Pitch) -> str:
+    """Where the speed estimate ends the flight: 'contact' or 'catch' (the glove).
+
+    Same rule as estimate.speed: a hand-marked catch (C) is always the
+    glove; otherwise the finder's end kind decides ('contact' = a possible
+    bat contact; 'lost' / 'occluded' tracks still end at the glove).
+    """
+    if p.catch is not None and p.catch.method == "manual":
+        return "catch"
+    return "contact" if _track_end(p) == "contact" else "catch"
+
+
+def end_text(p: Pitch) -> str:
+    """Info-line note on the end point, '' for the usual automatic glove catch."""
+    if effective_end(p) == "contact":
+        return "ends at a possible BAT CONTACT (C at the glove if it was caught)"
+    if _track_end(p) == "contact":
+        return "ends at the glove (C marked)"
+    return ""
 
 
 # ---------------------------------------------------------- history helpers

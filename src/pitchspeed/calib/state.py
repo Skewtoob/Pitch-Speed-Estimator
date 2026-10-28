@@ -40,6 +40,9 @@ right-click inside a mask deletes it.
 ENTER validates (CalibrationFile.validate + the frame checks above).  A
 fatal problem (missing required point) is shown and editing continues;
 warnings are listed and a second Enter saves anyway.  Esc twice cancels.
+Closing the window with its X button does not discard the clicks: the
+shell (calib/ui.py) asks in the console whether to save them
+(`unsaved_changes`, `check`, `save_now`).
 
 NAVIGATION (same convention as the review window): Left/A and Right/D
 step one field (one frame in full-frame view), Up/W and Down/S one second
@@ -116,7 +119,7 @@ HELP_TEXT: dict[str, str] = {
     "loupe": "8x loupe with crosshair",
     "help": "this help",
     "save": "check and save (shows warnings; Enter again saves)",
-    "cancel": "Esc twice: quit WITHOUT saving",
+    "cancel": "Esc twice: quit WITHOUT saving (closing the window asks in the console)",
 }
 
 #: How to find the right frame for points that depend on the moment.
@@ -201,6 +204,7 @@ class CalibState:
         self.target: Optional[str] = None
         self.selected: Optional[str] = None
         self._shift_cache: dict[tuple[int, int], Optional[tuple]] = {}
+        self._start_key = self._content_key()
         self._reset_target()
         if self.load_messages:
             self.message = Message("; ".join(self.load_messages), "warn")
@@ -623,6 +627,39 @@ class CalibState:
             self._say("Enter = save anyway | any other key = keep editing", "warn")
             return
         self._finish()
+
+    def _content_key(self) -> list:
+        """What a save would write from the clicks (segments, points, their frames, masks)."""
+        return [(int(g.start_frame), sorted((n, tuple(p)) for n, p in g.points.items()),
+                 sorted(g.point_frames.items()), [tuple(m) for m in g.masks]) for g in self.segments]
+
+    def unsaved_changes(self) -> bool:
+        """True when the points / masks / segments differ from what the window started with."""
+        return self._content_key() != self._start_key
+
+    def check(self) -> list[str]:
+        """Warnings a save would show (validation + frame checks); raises ValueError if it cannot save."""
+        cf = self.build()
+        return cf.validate() + self.frame_warnings()
+
+    def save_now(self) -> CalibrationFile:
+        """Save without the on-screen confirmation (window closed, user agreed in the console).
+
+        Raises ValueError (e.g. a required point is missing) like Enter's
+        check; warnings are recorded in the notes exactly as on Enter.
+        """
+        self.check()
+        self._finish()
+        return self.result
+
+    def placed_summary(self) -> str:
+        """'rubber, plate, release' per segment, for messages outside the window."""
+        parts = []
+        for i, g in enumerate(self.segments):
+            names = [n for n in self.order if n in g.points]
+            txt = ", ".join(names) if names else "no points"
+            parts.append(txt if len(self.segments) == 1 else f"segment {i + 1}: {txt}")
+        return "; ".join(parts)
 
     def _finish(self) -> None:
         cf = self.build()

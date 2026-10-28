@@ -19,6 +19,12 @@ Every edit calls ``recompute(pitch)`` and then ``save(result)``; Q/Esc
 saves once more and returns the (same, edited) AnalysisResult.  Closing
 the window with its X button also saves and returns.
 
+``transforms`` may be the (n, 3, 3) homographies or the (n, 2, 3) affine
+transforms of `pipeline.load_transforms` (sample -> reference frame
+coords); ball points are mapped with the full homography.  In the
+full-frame view (F) the picture holds two fields: R/C marks and the
+badges of both fields are shown, but marking is refused (review/state.py).
+
 Extra keyword arguments (not in DESIGN.md's contract, all optional):
 ``retrack(pitch) -> PitchTrack`` for the E key (default: built from
 ``pitchspeed.vision.finder.track_between`` with the calibration's
@@ -138,11 +144,11 @@ def _draw_track(img: np.ndarray, state: ReviewState, canvas: cv.Canvas) -> None:
 def _draw_event_badge(img: np.ndarray, state: ReviewState, vw: int) -> None:
     mk = state.markers()
     tags = []
-    if mk.get("draft") is not None and state.s == mk["draft"]:
+    if state.shows(mk.get("draft")):
         tags.append(("R (new pitch)", cv.YELLOW))
-    if mk.get("R") is not None and state.s == mk["R"]:
+    if state.shows(mk.get("R")):
         tags.append(("R = release", cv.GREEN))
-    if mk.get("C") is not None and state.s == mk["C"]:
+    if state.shows(mk.get("C")):
         tags.append(("C = catch", cv.RED))
     x = vw - 10
     for text, color in tags:

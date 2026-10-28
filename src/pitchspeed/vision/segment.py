@@ -46,6 +46,13 @@ release
     [burst - CUE_LEAD_S, first clean - latency].  The cue only ever widens.
     The rest (no clear burst) still read high; 'release_unconfirmed'
     (estimate) asks the user to check the release.
+  No data before the first clean detection (behind view: less than
+    PRE_DATA_MIN_COVERAGE of the CUE_WINDOW_S before it was processed with
+    usable samples, with a stretch of >= PRE_DATA_MAX_GAP unusable samples
+    -- start of the processed range or a long skipped stretch, not fields
+    lost in alternation) and no delivery cue: 'release_not_observed'
+    (diagnostics['release_not_observed_reason'] = 'release_before_data'),
+    widened as above.  Missing data is never read as "nothing happened".
 catch  (t_c = time the fitted track crosses the catch point, progress 1)
   side view:
   'last_moving_field': t_c <= t_last + dt (the catch point is reached in the
@@ -127,6 +134,15 @@ CUE_K = 2.0                   # burst: >= median + CUE_K robust sigmas ...
 CUE_FRAC = 0.6                # ... and >= this fraction of the window maximum
 CUE_LATE_GAP_S = 5 * 1001 / 60000   # first clean detection > 5 fields after the burst -> late
 CUE_LEAD_S = 3 * 1001 / 60000       # the burst may lag the release by this much
+PRE_DATA_MIN_COVERAGE = 0.6   # behind release: share of the CUE_WINDOW_S before the first clean
+#                               detection that must have usable samples (see Segmenter._release) ...
+PRE_DATA_MAX_GAP = 8          # ... unless no stretch of unusable samples there is this long (fields
+#                               lost in alternation, e.g. one parity failing registration, still look)
+
+# Track flags shared with the estimator (estimate.common): the estimator widens the flight time
+# for F_FIELD_ORDER; vision also keeps its own, more specific 'field_order_conflict'.
+F_FIELD_ORDER = "field_order_ambiguous"
+F_FIELD_ORDER_CONFLICT = "field_order_conflict"
 
 
 
@@ -199,7 +215,7 @@ class Segmenter:
     """Classify finalized tracks.  Needs the candidate store for contact / stop-point checks."""
 
     def __init__(self, geom: ViewGeometry, opts: FinderOptions, sample_dt: float, frame_dt: float,
-                 interlaced: bool, store: CandStore, quality_of=None, view: str = "side"):
+                 interlaced: bool, store: CandStore, quality_of=None, view: str = "side", usable_of=None):
         self.geom = geom
         self.opts = opts
         self.dt = sample_dt
@@ -208,7 +224,18 @@ class Segmenter:
         self.rs = 2 if interlaced else 1
         self.store = store
         self.quality_of = quality_of or (lambda s0, s1: 1.0)
+        # usable_of(s0, s1): per sample s0..s1, was it processed with usable detection data?
+        # (the finder knows every sample; default: what the store still holds)
+        self.usable_of = usable_of or self._store_usable
         self.s_range = (None, None)          # (first, last) processed sample, set by the finder
+
+    def _store_usable(self, s0: int, s1: int) -> list:
+        lo = self.s_range[0]
+        out = []
+        for s in range(s0, s1 + 1):
+            df = self.store.get(s)
+            out.append(bool(df is not None and not df.skipped and (lo is None or s >= lo)))
+        return out
 
     # -------------------------------------------------------------- main
     def classify(self, tr: Track, manual: bool = False) -> PitchTrack:
@@ -251,7 +278,9 @@ class Segmenter:
             fo = field_order_check(Ai["t"], Ai["x"], Ai["y"], Ai["k"], self.frame_dt)
             diag["field_order"] = fo
             if fo.get("conflict"):
-                pt.flags.append("field_order_conflict")
+                # the track is smoother under the other field order: tell the estimator too
+                # (F_FIELD_ORDER widens the flight time), not only the review
+                pt.flags += [F_FIELD_ORDER_CONFLICT, F_FIELD_ORDER]
         # direction / speed
         if slope < 0:
             return self._reject(pt, "THROWBACK")
@@ -490,6 +519,29 @@ class Segmenter:
         # anywhere in [cue - CUE_LEAD_S, first clean detection - latency].
         t_cue = self._delivery_cue_time(P[i_clean].s, t_clean)
         diag["release_cue_t"] = t_cue
+        # Missing data before the first clean detection (start of the processed range:
+        # clip / --start / calibration segment start, or a long stretch of skipped
+        # samples: no registration / background).  The latency prior, the merged-with-
+        # the-hand evidence and the delivery cue all assume those samples were looked
+        # at; "nothing seen" there is not "nothing happened" (the ball barely moves in
+        # the image early in the flight and is often missed for 5-30 fields).  Without
+        # that data and without a cue the release can lie anywhere before the first
+        # clean detection: 'release_not_observed' (classify() widens it to
+        # [catch - slowest plausible flight, first clean detection]).  Only widens.
+        n_w = int(round(CUE_WINDOW_S / dt))
+        ok = [bool(v) for v in self.usable_of(P[i_clean].s - n_w, P[i_clean].s - 1)]
+        cov = sum(ok) / max(1, len(ok))
+        gap = run = 0
+        for v in ok:
+            run = 0 if v else run + 1
+            gap = max(gap, run)
+        diag["release_pre_data_coverage"] = cov
+        diag["release_pre_data_gap"] = gap
+        if (t_cue is None and cov < float(o.extra.get("pre_data_min_coverage", PRE_DATA_MIN_COVERAGE))
+                and gap >= int(o.extra.get("pre_data_max_gap", PRE_DATA_MAX_GAP))):
+            if "release_not_observed" not in flags:
+                flags.append("release_not_observed")
+            diag["release_not_observed_reason"] = "release_before_data"
         # Early detections cut off from the main flight by a gap: a released ball does
         # not vanish for many fields right after release, so the early group may be the
         # ball still in the hand (wind-up) or something else near the release point.

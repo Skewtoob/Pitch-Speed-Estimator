@@ -12,16 +12,26 @@
   plate, a 1-sigma and a 90 % interval, a label (good/fair/poor/none), the
   flags and the assumptions.  Label 'none' never carries a number; the
   components keep the raw values for diagnosis.
+* Hand-marked events (EventTime.method == 'manual', estimate.events): a
+  manual catch always ends the flight at the glove (end point 'catch', never
+  the finder's 'contact'); track flags about how an automatic event was
+  found are dropped for the event the user marked; method 'manual_tof' only
+  when both events were marked.
+* Never raises for bad inputs: impossible settings
+  (`calib.model.settings_errors`, e.g. an extension typed in inches), a bad
+  sample interval or a failure inside an estimator give label 'none' (or
+  the other estimator's number) with the reason.
 
 The pieces (`tof_estimate`, `side_fit_estimate`, `combine`, `manual_event`)
 are re-exported here for the review UI and the tests.
 """
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional
 
-from pitchspeed.calib.model import Calibration
+from pitchspeed.calib.model import Calibration, settings_errors
 from pitchspeed.physics import time_to_travel
 from pitchspeed.types import EventTime, PitchTrack, ScanInfo, SpeedComponent, SpeedEstimate
 
@@ -33,6 +43,8 @@ from pitchspeed.estimate.tof import tof_estimate
 
 __all__ = ["estimate_speed", "tof_estimate", "side_fit_estimate", "combine", "Combined",
            "manual_event", "NotMeasurable", "label_for"]
+
+log = logging.getLogger(__name__)
 
 NotMeasurable = K.NotMeasurable
 label_for = K.label_for
@@ -79,18 +91,80 @@ def _is_manual(manual: bool, release: Optional[EventTime], catch: Optional[Event
     return bool(manual) or any(e is not None and e.method == "manual" for e in (release, catch))
 
 
+def _safe_assumptions(calib, sample_dt, end_kind: str = "catch") -> dict:
+    try:
+        a = K.assumptions(calib, K.drag_for(calib), end_kind)
+    except Exception:                     # assumptions are informative only
+        a = {}
+    a["sample_dt_s"] = float(sample_dt) if K.finite(sample_dt) else None
+    return a
+
+
+def _input_problems(calib, sample_dt) -> tuple[list[str], bool]:
+    """(problems that rule out any estimate, whether they are settings errors)."""
+    if calib is None:
+        return ["no calibration for this part of the video"], False
+    errs = settings_errors(calib.settings)
+    if errs:
+        return errs, True
+    if not (K.finite(sample_dt) and sample_dt > 0):
+        return [f"sample interval {sample_dt!r} is not a positive number of seconds"], False
+    return [], False
+
+
 def estimate_speed(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
                    release: Optional[EventTime], catch: Optional[EventTime],
                    track: Optional[PitchTrack] = None, manual: bool = False) -> SpeedEstimate:
-    """Full speed estimate for one pitch (DESIGN.md §3.3)."""
-    if not (K.finite(sample_dt) and sample_dt > 0):
-        raise ValueError(f"sample_dt must be a positive number of seconds, not {sample_dt!r}")
+    """Full speed estimate for one pitch (DESIGN.md §3.3).
+
+    Never raises for bad inputs: impossible settings (e.g. an extension
+    typed in inches), missing or non-numeric event times, or a failure
+    inside one estimator give label 'none' (or the other estimator's
+    result) with the reason.
+    """
+    try:
+        bad, settings_bad = _input_problems(calib, sample_dt)
+        if bad:
+            return SpeedEstimate(v_release_mph=None, method="none", label="none",
+                                 flags=[K.F_INVALID_SETTINGS] if settings_bad else [],
+                                 assumptions=_safe_assumptions(calib, sample_dt) if calib is not None else {},
+                                 reason="cannot estimate the speed: " + "; ".join(bad))
+        return _estimate(calib, scan, sample_dt, release, catch, track, manual)
+    except Exception as e:                # last resort: one pitch must never abort a run
+        log.exception("speed estimate failed")
+        return SpeedEstimate(v_release_mph=None, method="none", label="none",
+                             assumptions=_safe_assumptions(calib, sample_dt) if calib is not None else {},
+                             reason=f"speed estimate failed ({type(e).__name__}: {e}); no number reported")
+
+
+def _estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
+              release: Optional[EventTime], catch: Optional[EventTime],
+              track: Optional[PitchTrack], manual: bool) -> SpeedEstimate:
+    rel_manual = release is not None and release.method == "manual"
+    cat_manual = catch is not None and catch.method == "manual"
     is_manual = _is_manual(manual, release, catch)
-    end_kind = track.end_kind if track is not None else "catch"
-    track_flags = [f for f in (track.flags if track is not None else []) if f in K.SPEED_RELEVANT_TRACK_FLAGS]
+    auto_end = (track.end_kind if track is not None else None) or "catch"
+    # A hand-marked catch is "the first field with the ball in the glove"
+    # (estimate.events): the flight ends at the glove, whatever the finder
+    # thought the end of its track was (e.g. a 'contact' from a swing).
+    end_kind = "catch" if cat_manual else auto_end
+    # Track flags about how an automatic event was found are stale once the
+    # user has marked that event.
+    stale = (K.RELEASE_EVENT_TRACK_FLAGS if rel_manual else frozenset()) | \
+            (K.CATCH_EVENT_TRACK_FLAGS if cat_manual else frozenset())
+    track_flags = [f for f in (track.flags if track is not None else [])
+                   if f in K.SPEED_RELEVANT_TRACK_FLAGS and f not in stale]
     drag = K.drag_for(calib)
     problems: list[str] = []
     comps: list[SpeedComponent] = []
+    own_notes: list[str] = []
+    if cat_manual and auto_end == "contact":
+        own_notes.append("catch marked by hand: the flight ends at the glove (the automatic track had "
+                         "ended at a possible bat contact)")
+    if rel_manual != cat_manual and release is not None and catch is not None:
+        done, other, auto_ev = ("catch", "release", release) if cat_manual else ("release", "catch", catch)
+        own_notes.append(f"only the {done} was marked by hand; the {other} is still the automatic "
+                         f"estimate ({auto_ev.method}): check it in review")
 
     side = None
     if calib.view == "side":
@@ -101,6 +175,9 @@ def estimate_speed(calib: Calibration, scan: Optional[ScanInfo], sample_dt: floa
                 side = side_fit_estimate(calib, scan, sample_dt, track, release=release, catch=catch)
             except K.NotMeasurable as e:
                 problems.append(f"side-view fit: {e}")
+            except Exception as e:          # bad numbers in the track / clicks: E1 may still work
+                log.warning("side-view fit failed", exc_info=True)
+                problems.append(f"side-view fit failed ({type(e).__name__}: {e})")
     tof_flags = list(track_flags)
     if side is not None and K.F_FIELD_ORDER in side.details.get("flags", []):
         tof_flags.append(K.F_FIELD_ORDER)          # the fit saw a field-order problem: E1 timing too
@@ -112,6 +189,9 @@ def estimate_speed(calib: Calibration, scan: Optional[ScanInfo], sample_dt: floa
                                       side=side.details if side is not None else None))
         except K.NotMeasurable as e:
             problems.append(f"time of flight: {e}")
+        except Exception as e:
+            log.warning("time-of-flight estimate failed", exc_info=True)
+            problems.append(f"time of flight failed ({type(e).__name__}: {e})")
     else:
         problems.append("time of flight: release and/or catch time missing")
     if side is not None:
@@ -143,7 +223,7 @@ def estimate_speed(calib: Calibration, scan: Optional[ScanInfo], sample_dt: floa
         "model_sigma_tof": K.SIGMA_MODEL_TOF,
         "model_sigma_side_fit": K.SIGMA_MODEL_SIDE,
     })
-    notes = []
+    notes = list(own_notes)
     for c in comps:
         notes += [n for n in c.details.get("notes", []) if n not in notes]
     notes += [n for n in comb.notes if n not in notes]
@@ -162,7 +242,7 @@ def estimate_speed(calib: Calibration, scan: Optional[ScanInfo], sample_dt: floa
         v_avg, v_plate = e1.v_avg_mph, e1.details["v_plate_mph"]
     else:
         v_avg, v_plate = _derived_speeds(calib, v, drag.k, end_kind)
-    if method == "tof" and is_manual:
+    if method == "tof" and rel_manual and cat_manual:   # both events marked by hand
         method = "manual_tof"
 
     if label == "none":

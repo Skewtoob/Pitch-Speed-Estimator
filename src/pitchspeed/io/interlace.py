@@ -33,9 +33,25 @@ the file (at most `max_frames` decoded frames in total):
    between both (progressive).  Score q = d_tff / (d_tff + d_bff): TFF ~0,
    BFF ~1, progressive ~0.5.
 3. Optional cross-check with ffmpeg's ``idet`` filter (bundled ffmpeg,
-   bounded in time).  Disagreement lowers the confidence one level; idet
-   alone never overrides the content tests (it is wrong on the
-   "static camera, lone ball" case), it only breaks a complete tie.
+   bounded in time).  Disagreement lowers the confidence one level.  idet
+   never overrides decisive content evidence and its 'progressive' is
+   never trusted against an interlaced format (it says so on the "static
+   camera, lone ball" case).  It breaks a complete tie, and a *decisive*
+   idet field order (>= 10 frames, >= 10x the runner-up) decides when the
+   content evidence is weak (low confidence, or 'progressive' resting only
+   on a weak blob vote).
+
+Asymmetric costs (rate <= 40): calling interlaced video progressive cannot
+be undone downstream (frame mode, half the timing resolution), while an
+interlaced verdict is still checked against the ball tracks
+(`pipeline.resolve_field_order`, which can switch to frame mode).  So weak
+'progressive' evidence never beats a field-order verdict: a non-strong blob
+'progressive' vote is ignored when the comb test decided TFF/BFF or sees
+combing, and is reported at low confidence on a normally interlaced format.
+
+Rate rule: above 40 frames/s a frame cannot hold two fields of one
+interlaced frame pair, so content / idet TFF/BFF verdicts are reported but
+the scan is progressive (only an explicit override gives interlaced there).
 
 Confidence: 'high' = a strong, consistent verdict; 'medium' = decisive but
 weaker, or tests disagree mildly, or idet disagrees with a strong verdict;
@@ -286,16 +302,28 @@ def _vote_strength(res: dict) -> float:
     return float(res.get("votes", {}).get(res.get("verdict"), 0.0))
 
 
+def weak_blob_progressive(comb: dict, blob: dict) -> bool:
+    """True if a 'progressive' verdict rests only on a non-strong blob vote.
+
+    Slow or noisy blobs give q ~ 0.5 by construction, so such a vote is weak
+    evidence; on interlaced behind-view clips it is common (measured pv
+    0.60-0.67, median q 0.50)."""
+    return (blob.get("verdict") == "progressive" and not blob.get("strong")
+            and comb.get("verdict") != "progressive")
+
+
 def combine_tests(comb: dict, blob: dict) -> tuple[str, str, list[str]]:
     """(verdict, confidence, notes) from the two content tests."""
     vc, vb = comb.get("verdict"), blob.get("verdict")
     sc, sb = bool(comb.get("strong")), bool(blob.get("strong"))
     notes: list[str] = []
     c_ok, b_ok = vc in _DECIDED, vb in _DECIDED
-    if b_ok and vb == "progressive" and not sb and comb.get("combing"):
-        # The comb test sees the two fields differ in time: a weak "progressive"
-        # vote from the blob test (slow blobs give q ~ 0.5) must not overrule it.
-        notes.append("blob test weakly says progressive but the fields are combed; ignoring it")
+    if b_ok and vb == "progressive" and not sb and (vc in ("tff", "bff") or comb.get("combing")):
+        # The comb test sees the two fields differ in time (it decided a field
+        # order, or a/min(b,c) is high): a weak "progressive" vote from the blob
+        # test (slow or noise blobs give q ~ 0.5) must not overrule or tie it.
+        why = f"the comb test says {vc}" if vc in ("tff", "bff") else "the fields are combed"
+        notes.append(f"blob test weakly says progressive but {why}; ignoring it")
         b_ok = False
     if c_ok and b_ok:
         # Field-shifted progressive looks like weak BFF to the blob test (q ~ 0.75).
@@ -392,6 +420,20 @@ def run_idet(path: str, start_s: float = 0.0, n_frames: int = 300, timeout_s: fl
     else:
         out["verdict"] = "uncertain"
     return out
+
+
+IDET_DECISIVE_MIN = 10        # frames
+IDET_DECISIVE_RATIO = 10.0    # top count vs the runner-up (undetermined frames excluded)
+
+
+def idet_decisive(idet: Optional[dict]) -> Optional[str]:
+    """idet's verdict if it is decisive (>= 10 frames, >= 10x the runner-up), else None."""
+    if not idet or idet.get("verdict") not in ("tff", "bff", "progressive"):
+        return None
+    counts = sorted((int(idet.get(k, 0) or 0) for k in ("tff", "bff", "progressive")), reverse=True)
+    if counts[0] >= IDET_DECISIVE_MIN and counts[0] >= IDET_DECISIVE_RATIO * counts[1]:
+        return idet["verdict"]
+    return None
 
 
 # ================================================================ detect_scan
@@ -514,6 +556,17 @@ def detect_scan(reader, override: Optional[str] = None, max_frames: int = 900, *
             if dissent >= 0.25 * len(decided):
                 conf = _lower(conf)
 
+    hint: Optional[dict] = None
+    if (rate <= 40 and verdict == "progressive" and conf != "low" and weak_blob_progressive(comb, blob)):
+        hint = _metadata_hint(reader.path)
+        if _prior(info, hint, comb)[0] != "progressive":
+            # Only a weak blob vote says progressive on footage that is normally
+            # interlaced: say so (and let a decisive idet verdict decide below).
+            notes.append("only weak blob-test evidence for progressive on a normally interlaced "
+                         "frame rate/size")
+            conf = "low"
+    weak = conf == "low" or (verdict == "progressive" and weak_blob_progressive(comb, blob))
+
     if rate > 40:
         dbl = classify_doubling(all_changes)
         evidence["doubling"] = dbl
@@ -522,6 +575,12 @@ def detect_scan(reader, override: Optional[str] = None, max_frames: int = 900, *
             evidence.update(frame_step=2, frame_phase=int(dbl["phase"]))
             notes.append(f"every frame is repeated (fake {rate:.2f}p): using one frame per pair, "
                          f"{rate / 2:.3f} samples/s")
+        elif verdict in ("tff", "bff"):
+            # Rate rule: 50/59.94 frames/s are not woven field pairs (fields would
+            # be 1/120 s apart).  Only an explicit override gives interlaced here.
+            notes.append(f"the content tests say {verdict.upper()}, but {rate:.2f} frames/s cannot be "
+                         f"field-interlaced frames: treated as progressive (use --field-order to force)")
+            verdict, conf, source = "progressive", "low", "default"
     if evidence.get("frame_step") == 2:
         # The second frame of each pair is an expected copy, not a capture glitch.
         dups = [i for i in dups if (i - evidence["frame_phase"]) % 2 == 0]
@@ -540,23 +599,49 @@ def detect_scan(reader, override: Optional[str] = None, max_frames: int = 900, *
                         - reader.container_start_s, n_idet, idet_timeout_s)
         evidence["idet"] = idet
         iv = (idet or {}).get("verdict")
-        if iv in ("tff", "bff", "progressive"):
+        dv = idet_decisive(idet)
+        if iv in ("tff", "bff") and rate > 40:
+            notes.append(f"ffmpeg idet says {iv}; ignored ({rate:.2f} frames/s cannot be field-interlaced frames)")
+        elif iv in ("tff", "bff", "progressive"):
             mine = "progressive" if verdict == "shifted" else verdict
             if verdict in _DECIDED and iv != mine:
-                notes.append(f"ffmpeg idet says {iv}")
-                conf = _lower(conf)
+                if weak and dv in ("tff", "bff") and verdict != "shifted":
+                    # Weak or conflicting content evidence vs a decisive idet field
+                    # order (idet is never trusted for 'progressive': it says so on
+                    # interlaced static-camera footage).  Calling interlaced video
+                    # progressive cannot be undone downstream; the ball tracks still
+                    # check field timing on an interlaced verdict.
+                    notes.append(f"content evidence is weak ({verdict}); ffmpeg idet decisively says "
+                                 f"{dv} (TFF {idet['tff']}, BFF {idet['bff']}, progressive "
+                                 f"{idet['progressive']} frames): using it")
+                    verdict, conf = dv, "low"
+                else:
+                    notes.append(f"ffmpeg idet says {iv}")
+                    conf = _lower(conf)
             elif verdict not in _DECIDED:
-                verdict, conf = iv, "low"
-                notes.append("content tests inconclusive; using ffmpeg idet's verdict")
+                if iv == "progressive" and rate <= 40:
+                    hint = hint if hint is not None else _metadata_hint(reader.path)
+                    prior = _prior(info, hint, comb)[0]
+                else:
+                    prior = None
+                if prior in ("tff", "bff"):
+                    # idet says 'progressive' on interlaced footage with a static
+                    # camera; on a normally interlaced format the prior decides.
+                    notes.append("content tests inconclusive and ffmpeg idet says progressive, which it "
+                                 "also does for interlaced static-camera footage; not used")
+                else:
+                    verdict, conf = iv, "low"
+                    notes.append("content tests inconclusive; using ffmpeg idet's verdict")
 
     if verdict not in _DECIDED:
-        hint = _metadata_hint(reader.path)
-        evidence["metadata"] = hint
+        hint = hint if hint is not None else _metadata_hint(reader.path)
         verdict, why = _prior(info, hint, comb)
         conf, source = "low", "default"
         notes.append(f"no decisive motion evidence; {why}")
     if verdict == "shifted":
         verdict = "progressive"
+    if hint is not None:
+        evidence["metadata"] = hint
     evidence["notes"] = notes
     scan = _build_scan(verdict, conf, source, rate, evidence)
     log.info("scan: %s %s (confidence %s, %s)%s", scan.mode, scan.field_order or "", conf, source,

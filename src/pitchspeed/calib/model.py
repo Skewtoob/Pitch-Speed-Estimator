@@ -52,6 +52,73 @@ POINT_HELP = {
 }
 
 
+# ------------------------------------------------------- settings sanity
+# Longest plausible release extension: MLB's longest are ~8 ft (Statcast);
+# amateurs and youth are shorter.  Never more than a quarter of the pitching
+# distance (youth / softball).  Values beyond this are typing mistakes
+# (inches typed as feet, the distance typed as the extension, ...).
+EXTENSION_MAX_FT = 10.0
+EXTENSION_MAX_FRACTION = 0.25
+DISTANCE_RANGE_FT = (20.0, 100.0)     # leagues use 35-60.5 ft
+
+
+def _finite(x) -> bool:
+    try:
+        return x is not None and math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
+def extension_limit_ft(distance_ft: float) -> float:
+    """Largest extension accepted for this pitching distance (ft)."""
+    return min(EXTENSION_MAX_FT, EXTENSION_MAX_FRACTION * float(distance_ft))
+
+
+def settings_errors(st: "Settings") -> list[str]:
+    """Settings values that make a speed estimate impossible, in plain words.
+
+    The speed estimator reports no number while any of these is present
+    (estimate.speed), and `Calibration.validate` lists them as warnings that
+    start with 'IMPOSSIBLE SETTING' (they are not raised: the calibration
+    window cannot edit these values and must still be able to save the
+    user's clicks).  Empty list = fine.
+    """
+    errs: list[str] = []
+
+    def bad(name, v, lo=None, hi=None, unit="ft", hint=""):
+        if not _finite(v):
+            errs.append(f"{name} is not a number ({v!r})")
+            return True
+        v = float(v)
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            rng = (f"{lo:g} to {hi:g} {unit}" if lo is not None and hi is not None
+                   else (f"at least {lo:g} {unit}" if lo is not None else f"at most {hi:g} {unit}"))
+            errs.append(f"{name} {v:g} {unit} is impossible (must be {rng}){hint}")
+            return True
+        return False
+
+    d_ok = not bad("rubber-to-plate distance", st.distance_ft, *DISTANCE_RANGE_FT,
+                   hint="; give --distance in FEET (e.g. 60.5, 46)")
+    if st.extension_ft is not None:
+        lim = extension_limit_ft(st.distance_ft) if d_ok else EXTENSION_MAX_FT
+        e = st.extension_ft
+        hint = "; the extension is in FEET (typical 4-7 ft, youth 3-5 ft)"
+        if _finite(e) and float(e) >= 12.0:
+            hint += f" - did you enter inches? {float(e):g} in = {float(e) / 12.0:.1f} ft"
+        hint += "; re-run 'pitchspeed calibrate' with --extension in feet"
+        bad("pitcher extension", e, 0.0, lim, hint=hint)
+    bad("extension uncertainty", st.extension_sigma_ft, 0.0, None)
+    bad("catch point behind the plate", st.catch_behind_ft, -3.0, 8.0)
+    bad("catch point uncertainty", st.catch_sigma_ft, 0.0, None)
+    bad("catch height", st.catch_height_ft, 0.0, 8.0)
+    if st.release_height_ft is not None:
+        bad("release height", st.release_height_ft, 0.5, 9.0)
+    bad("altitude", st.altitude_ft, -1500.0, 15000.0)
+    if st.temp_f is not None:
+        bad("air temperature", st.temp_f, -40.0, 130.0, unit="F")
+    return errs
+
+
 @dataclass
 class Settings:
     """Shared, per-video settings (user-editable)."""
@@ -246,9 +313,19 @@ class Calibration:
             d = np.linalg.norm(self.to_sq(self.point("release")) - self.to_sq(self.point("catch")))
             if d < 30:
                 warns.append(f"release and catch points are only {d:.0f} px apart")
-        if self.extension_is_assumed:
+        # Impossible settings are listed, not raised (see settings_errors): no
+        # speed is reported while they are present.
+        errs = settings_errors(self.settings)
+        for e in errs:
+            warns.append(f"IMPOSSIBLE SETTING: {e}. No speeds will be reported until this is fixed.")
+        if self.extension_is_assumed and not errs:
             warns.append(f"pitcher extension not given; assuming {self.extension_ft:.1f} +/- "
                          f"{self.settings.extension_sigma_ft:.1f} ft")
+        elif not self.extension_is_assumed and not errs:
+            e = float(self.settings.extension_ft)
+            if e < 2.0 or e > 8.0:
+                warns.append(f"pitcher extension {e:g} ft is unusual (typical 4-7 ft, youth 3-5 ft); "
+                             f"check it is in feet")
         return warns
 
     # ---- side-view geometry ------------------------------------------------

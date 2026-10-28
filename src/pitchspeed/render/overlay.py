@@ -27,14 +27,22 @@ with a dark outline / panel so it stays legible on bright video):
   sign -, 'none' as "n/a" in grey; only the most recent that fit);
 * rejected pitches are not drawn (they stay in results.csv / .json);
   'possible missed pitch' windows get an orange hint under the HUD (full
-  mode; highlights only cover accepted pitches).
+  mode; highlights only cover accepted pitches) unless the user already
+  checked the window in review.
 
 TRACK COORDINATES.  Track points are in calibration-reference-frame
 coordinates.  For the displayed sample s they are mapped to that sample's
-own frame coordinates with the inverse of transforms[s] (2x3, sample ->
-reference; the nearest available sample's transform if s itself has none;
-identity when no transforms are given), then to display pixels with the
-display affine A from `sample_to_display`.
+own frame coordinates with the inverse of transforms[s] (sample ->
+reference, either (n, 2, 3) affine or (n, 3, 3) homographies - the latter
+are what the finder mapped the ball with, applied projectively; the
+nearest available sample's transform if s itself has none; identity when
+no transforms are given), then to display pixels with the display affine
+A from `sample_to_display`.
+
+LOCKED OUTPUT.  If the target (annotated.mp4) cannot be written because
+another program has it open (a video player on Windows), the video is
+written as annotated-1.mp4 (next free number) instead and `info['note']`
+says so; nothing is lost after a long render.
 
 MODES.
 * 'full': the whole video, audio passed through by VideoWriter
@@ -69,9 +77,9 @@ from pitchspeed.types import AnalysisResult, EventTime, Pitch, SpeedEstimate
 log = logging.getLogger(__name__)
 
 __all__ = ["render_annotated", "PitchMark", "FrameState", "Timeline", "TransformLookup",
-           "build_marks", "highlight_windows", "reference_to_display", "card_lines",
+           "build_marks", "highlight_windows", "reference_to_display", "apply_affine", "card_lines",
            "running_items", "audio_filter_graph", "output_fps", "missed_windows",
-           "mux_segment_audio"]
+           "mux_segment_audio", "can_write", "alternative_path", "move_into_place"]
 
 HOLD_S = 3.0                 # card hold after the catch
 PRE_S = 2.0                  # highlights: seconds before release
@@ -216,9 +224,12 @@ def highlight_windows(marks: Sequence[PitchMark], n_samples: int, pre_samples: i
 
 
 def missed_windows(result: AnalysisResult) -> list[tuple[int, int]]:
-    """[s_start, s_end] (inclusive) of the 'possible missed pitch' windows that carry sample indices."""
+    """[s_start, s_end] (inclusive) of the unchecked 'possible missed pitch' windows that carry
+    sample indices (a window the user checked in review - 'review' key set - gets no hint)."""
     out = []
     for d in result.possible_missed or []:
+        if not isinstance(d, dict) or d.get("review"):
+            continue
         try:
             out.append((int(d["s_start"]), int(d["s_end"])))
         except (KeyError, TypeError, ValueError):
@@ -228,17 +239,19 @@ def missed_windows(result: AnalysisResult) -> list[tuple[int, int]]:
 
 # ============================================================= transforms
 class TransformLookup:
-    """transforms[i] (2x3, sample -> reference) of sample transform_samples[i];
-    `get(s)` returns the transform of s or of the nearest sample that has one."""
+    """transforms[i] (sample -> reference; (n, 2, 3) affine or (n, 3, 3) homographies) of sample
+    transform_samples[i]; `get(s)` returns the transform of s or of the nearest sample that has one
+    (2x3 or 3x3 like the input; the identity of that shape for a broken entry)."""
 
     def __init__(self, transforms: Optional[np.ndarray], transform_samples: Optional[np.ndarray]):
         self.T = None
         self.s = None
+        self.identity = _IDENTITY
         if transforms is None:
             return
         T = np.asarray(transforms, dtype=np.float64)
-        if T.ndim != 3 or T.shape[1:] != (2, 3) or len(T) == 0:
-            log.warning("ignoring transforms with shape %s (expected (n, 2, 3))", T.shape)
+        if T.ndim != 3 or T.shape[1:] not in ((2, 3), (3, 3)) or len(T) == 0:
+            log.warning("ignoring transforms with shape %s (expected (n, 2, 3) or (n, 3, 3))", T.shape)
             return
         s = np.arange(len(T)) if transform_samples is None else np.asarray(transform_samples, dtype=np.int64)
         if len(s) != len(T):
@@ -247,6 +260,11 @@ class TransformLookup:
             return
         order = np.argsort(s, kind="stable")
         self.T, self.s = T[order], s[order]
+        self.identity = np.eye(3) if T.shape[1] == 3 else _IDENTITY
+
+    @property
+    def projective(self) -> bool:
+        return self.T is not None and self.T.shape[1] == 3
 
     def get(self, s: int) -> np.ndarray:
         if self.T is None:
@@ -255,8 +273,11 @@ class TransformLookup:
         if j >= len(self.s) or (j > 0 and abs(self.s[j - 1] - s) <= abs(self.s[j] - s)):
             j -= 1
         M = self.T[max(0, j)]
-        if not np.all(np.isfinite(M)) or abs(np.linalg.det(M[:, :2])) < 1e-9:
-            return _IDENTITY.copy()
+        if not np.all(np.isfinite(M)):
+            return self.identity.copy()
+        det = np.linalg.det(M) if M.shape == (3, 3) else np.linalg.det(M[:, :2])
+        if not math.isfinite(det) or abs(det) < 1e-9:
+            return self.identity.copy()
         return M
 
 
@@ -264,17 +285,33 @@ _IDENTITY = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
 
 def _to3(M: np.ndarray) -> np.ndarray:
-    return np.vstack([np.asarray(M, dtype=np.float64), [0.0, 0.0, 1.0]])
+    M = np.asarray(M, dtype=np.float64)
+    if M.shape == (3, 3):
+        return M
+    return np.vstack([M, [0.0, 0.0, 1.0]])
 
 
 def reference_to_display(T_sample_to_ref: np.ndarray, A: np.ndarray) -> np.ndarray:
-    """2x3 map reference-frame coords -> display coords: A o inverse(T)."""
-    return (_to3(A) @ np.linalg.inv(_to3(T_sample_to_ref)))[:2]
+    """Map reference-frame coords -> display coords: A o inverse(T).
+
+    T 2x3 (affine) -> 2x3 result; T 3x3 (homography) -> 3x3 result (apply with
+    `apply_affine`, which divides by w)."""
+    M = _to3(A) @ np.linalg.inv(_to3(T_sample_to_ref))
+    return M if np.asarray(T_sample_to_ref).shape == (3, 3) else M[:2]
 
 
 def apply_affine(M: np.ndarray, pts) -> np.ndarray:
+    """Apply a 2x3 affine or a 3x3 homography (with the divide by w) to (n, 2) points.
+    Points that map to infinity (w <= 0) come back as NaN."""
     p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
-    return p @ np.asarray(M)[:, :2].T + np.asarray(M)[:, 2]
+    M = np.asarray(M, dtype=np.float64)
+    if M.shape == (3, 3):
+        q = p @ M[:, :2].T + M[:, 2]
+        w = q[:, 2:3]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.where(w > 1e-12, q[:, :2] / np.where(w > 1e-12, w, 1.0), np.nan)
+        return out
+    return p @ M[:, :2].T + M[:, 2]
 
 
 # ================================================================== texts
@@ -463,8 +500,11 @@ class _FrameDrawer:
                 if M is None:
                     M = reference_to_display(self.lookup.get(s), A)
                 disp = apply_affine(M, pts[:, 1:3])
-                self.p.trail(img, disp, pts[:, 0], pts[:, 3] > 0, s, m.color, all_faded=i not in st.in_flight)
-                head = (float(disp[-1, 0]), float(disp[-1, 1]))
+                ok = np.all(np.isfinite(disp), axis=1)
+                if np.any(ok):
+                    self.p.trail(img, disp[ok], pts[ok, 0], pts[ok, 3] > 0, s, m.color,
+                                 all_faded=i not in st.in_flight)
+                    head = (float(disp[ok][-1, 0]), float(disp[ok][-1, 1]))
             if i in st.in_flight:
                 self.p.tag(img, f"P{m.number}", head, m.color, slot)
         if st.card is not None:
@@ -672,22 +712,30 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     """Write the annotated video; returns the path actually written.
 
     mode: 'full' (whole video) or 'highlights' (around each pitch).
-    transforms / transform_samples: per-sample 2x3 (sample -> reference)
-        stabilization transforms and their sample indices (FinderResult /
-        transforms.npz); None = static camera.
+    transforms / transform_samples: per-sample (n, 2, 3) or (n, 3, 3)
+        (sample -> reference) stabilization transforms and their sample
+        indices (pipeline.load_transforms); None = static camera.
     size: (width, height) of the output, square pixels.
     audio: pass the source audio through (see module doc for highlights).
     progress: callable(done, total) or an object with .update(done)
         (e.g. pipeline.Progress), called with samples processed.
     writer_factory: test hook, called like io.writer.VideoWriter.
     info: optional dict, filled with what happened (backend, audio_status,
-        frames_written, filler_frames, segments, fps, out_path).
-    The path may end in '.avi' if only the MJPG fallback writer worked.
+        frames_written, filler_frames, segments, fps, out_path, and 'note'
+        when the video had to be written under another name).
+    The path may end in '.avi' if only the MJPG fallback writer worked, or
+    be '<name>-1.mp4' when out_path is locked by another program.
     Raises ValueError for a bad mode or when highlights mode has no pitch.
     """
     if mode not in ("full", "highlights"):
         raise ValueError(f"mode must be 'full' or 'highlights', got {mode!r}")
     out_path = os.fspath(out_path)
+    notes: list[str] = []
+    if not can_write(out_path):
+        requested, out_path = out_path, alternative_path(out_path)
+        notes.append(f"{os.path.basename(requested)} is open in another program (a video player?) or "
+                     f"read-only, so the new video was written as {os.path.basename(out_path)}")
+        log.warning("%s", notes[-1])
     w, h = int(size[0]), int(size[1])
     n = int(source.n_samples)
     sample_dt = float(source.sample_dt)
@@ -719,6 +767,7 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     total = sum(b - a for a, b in windows)
     ctx = _WindowContext(source, drawer, painter, writer, sar, (w, h), out_dt,
                          bool(getattr(source, "interlaced", False)), progress, total)
+    salvaged = None
     try:
         for s0, s1 in windows:
             seg = ctx.render(s0, s1)
@@ -726,27 +775,44 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
             stats["frames_written"] += seg["frames"]
             stats["filler_frames"] += seg["fillers"]
         stats["samples_rendered"] = ctx.done
-        backend = writer.close()
+        try:
+            backend = writer.close()
+        except OSError as e:          # e.g. the target got locked while rendering: keep the frames
+            salvaged = _salvage_written_video(writer, video_target, out_path)
+            if salvaged is None:
+                raise
+            backend = getattr(writer, "backend", None) or "unknown"
+            notes.append(f"could not write {os.path.basename(out_path)} ({e}); the new video (without audio) "
+                         f"was kept as {os.path.basename(salvaged)}")
+            log.warning("%s", notes[-1])
     except BaseException:
         if hasattr(writer, "abort"):
             writer.abort()
-        if highlights_audio and os.path.exists(video_target):
-            try:
-                os.remove(video_target)
-            except OSError:
-                pass
+        for tmp in {video_target if highlights_audio else None, _writer_temp(writer, out_path)}:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         raise
     _report_progress(progress, total, total)
-    written_path = getattr(writer, "out_path", video_target) or video_target
+    written_path = salvaged or getattr(writer, "out_path", video_target) or video_target
     stats["backend"] = backend
-    if highlights_audio:
+    if salvaged is not None:
+        final, audio_status = salvaged, "skipped: the output file could not be written"
+    elif highlights_audio:
         final, audio_status = _finish_highlights(written_path, out_path, audio_src, stats["segments"], out_dt)
+        if os.path.abspath(final) != os.path.abspath(out_path) and not final.endswith(".avi"):
+            notes.append(f"{os.path.basename(out_path)} could not be replaced (open in another program?); "
+                         f"the new video was kept as {os.path.basename(final)}")
     else:
         final = written_path
         audio_status = ("off (audio=False)" if not audio else
                         "skipped: source video file not found" if audio_src is None else
                         getattr(writer, "audio_status", "unknown"))
     stats["audio_status"], stats["out_path"] = audio_status, final
+    if notes:
+        stats["note"] = "; ".join(notes)
     if audio and audio_status != "muxed":
         log.info("annotated video has no audio (%s)", audio_status)
     if info is not None:
@@ -758,16 +824,80 @@ def _finish_highlights(video_path: str, out_path: str, audio_src: str, segments:
                        out_dt: float) -> tuple[str, str]:
     """Add per-segment audio to the highlights video; keep it silent on failure."""
     if os.path.splitext(video_path)[1].lower() == ".avi":     # MJPG fallback: no audio support
-        final = os.path.splitext(out_path)[0] + ".avi"
-        os.replace(video_path, final)
+        final = move_into_place(video_path, os.path.splitext(out_path)[0] + ".avi")
         return final, "skipped: no audio in the MJPG/AVI fallback"
     segs = [(d["t_start"], d["frames"] * out_dt) for d in segments if d["frames"] > 0]
-    status = mux_segment_audio(video_path, audio_src, segs, out_path)
+    try:
+        status = mux_segment_audio(video_path, audio_src, segs, out_path)
+    except OSError as e:                     # e.g. out_path locked: keep the silent video under another name
+        status = f"skipped: {e}"
     if status == "muxed":
         try:
             os.remove(video_path)
         except OSError:
             pass
         return out_path, status
-    os.replace(video_path, out_path)
-    return out_path, status
+    return move_into_place(video_path, out_path), status
+
+
+# ============================================================ locked files
+def can_write(path: str) -> bool:
+    """False when `path` exists but cannot be opened for writing (open in a
+    video player on Windows, or read-only).  Nothing is written to it."""
+    if not os.path.exists(path):
+        return True
+    try:
+        with open(path, "ab"):
+            pass
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return True
+
+
+def alternative_path(path: str) -> str:
+    """'<root>-1<ext>', '<root>-2<ext>', ... - the first that does not exist yet."""
+    root, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{root}-{i}{ext}") or os.path.exists(f"{root}-{i}.avi"):
+        i += 1
+    return f"{root}-{i}{ext}"
+
+
+def move_into_place(src: str, dst: str) -> str:
+    """os.replace(src, dst); if dst cannot be replaced (locked), keep src as
+    alternative_path(dst) instead.  Returns the path the file ended up at."""
+    try:
+        os.replace(src, dst)
+        return dst
+    except OSError as e:
+        if not os.path.exists(src):
+            raise
+        alt = alternative_path(dst)
+        os.replace(src, alt)
+        log.warning("cannot replace %s (%s); kept the new file as %s", dst, e, alt)
+        return alt
+
+
+def _writer_temp(writer, out_path: str) -> Optional[str]:
+    """The writer's intermediate video file when it is not the final one (None otherwise)."""
+    p = getattr(getattr(writer, "_b", None), "path", None)
+    if p and os.path.abspath(p) != os.path.abspath(out_path):
+        return p
+    return None
+
+
+def _salvage_written_video(writer, video_target: str, out_path: str) -> Optional[str]:
+    """After writer.close() failed while finishing: move the complete intermediate
+    video (if any) to a free name and return that name."""
+    for cand in (_writer_temp(writer, out_path), video_target):
+        if (cand and os.path.abspath(cand) != os.path.abspath(out_path) and os.path.isfile(cand)
+                and os.path.getsize(cand) > 0):
+            try:            # keep the container's extension (.avi from the MJPG fallback)
+                alt = alternative_path(os.path.splitext(out_path)[0] + (os.path.splitext(cand)[1] or ".mp4"))
+                os.replace(cand, alt)
+                return alt
+            except OSError:
+                return None
+    return None

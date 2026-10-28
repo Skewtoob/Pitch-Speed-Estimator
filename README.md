@@ -50,6 +50,14 @@ macOS/Linux: `python3 -m venv .venv && .venv/bin/pip install -e .`, then
 
 `pitchspeed run VIDEO` does four steps. You can also run each one on its own.
 
+Running it again on the same video (e.g. dragging it onto `pitchspeed.bat`
+a second time) asks whether to **keep the saved results** and go straight
+to the review (the default: just press Enter) or to **analyze the video
+again**. Your review work is never thrown away: before results with review
+edits are replaced, they are copied to `results.backup-<date-time>.json`,
+and your manual, edited and rejected pitches are carried over into the new
+results whenever the new analysis still lines up with the old one.
+
 ### 1. Calibrate (`pitchspeed calibrate VIDEO`)
 
 The console asks where the camera was (**side** or **behind** the plate),
@@ -76,6 +84,8 @@ Tips:
 
 The calibration is saved in `<video name>_pitchspeed\calibration.json`
 next to the video. You only do this once per video, or per camera setup.
+If the saved calibration looks like it belongs to another file (different
+name, length or picture size), the tool says so before using it.
 
 ### 2. Analyze (`pitchspeed analyze VIDEO`)
 
@@ -144,6 +154,12 @@ All in `<video name>_pitchspeed\` next to the video:
 | `results.json` | everything, including ball tracks and the uncertainty breakdown |
 | `annotated.mp4` | the video with speeds overlaid |
 | `calibration.json` | your clicks and settings |
+| `results.backup-<date-time>.json` | your earlier results, kept whenever results with review edits were replaced |
+
+Two files with the same name but a different extension (`game1.avi` and an
+exported `game1.mpg`) get separate folders (`game1_pitchspeed` and
+`game1_mpg_pitchspeed`), so they never share clicks or overwrite each
+other's results.
 
 ## Accuracy
 
@@ -180,6 +196,7 @@ on real tapes; that needs real footage, ideally with radar readings.
 | Option | Use |
 |---|---|
 | `--level hs / 54 / 50 / ll / 40 / sb43 / sb40 / sb35` or `--distance FT` | pitching distance (rubber to the back point of the plate). Check your league. |
+| `--sport baseball/softball` | with `--distance`: which ball (a `--level` already implies it) |
 | `--extension FT` | the pitcher's release point in front of the rubber, if you know it |
 | `--throws R/L` | the pitcher's throwing hand (improves side views slightly) |
 | `--field-order tff/bff/progressive` | override interlace detection (rarely needed) |
@@ -187,6 +204,13 @@ on real tapes; that needs real footage, ideally with radar readings.
 | `--ui-scale 1.5` | bigger click/review windows on high-resolution screens |
 | `--debug` | write diagnostic images to `<out>\debug\` |
 | `pitchspeed probe VIDEO` | show format, interlacing and field order |
+
+Settings given to `run` or `analyze` (`--level`, `--distance`, `--sport`,
+`--extension`, `--throws`, `--altitude`, `--temp`) are saved in
+`calibration.json` and the change is printed; if you keep the saved
+results, their speeds are recomputed with the new settings (your review
+edits stay). Changing the camera view needs new clicks
+(`pitchspeed calibrate VIDEO --view ...`).
 
 ## Troubleshooting
 
@@ -199,6 +223,11 @@ on real tapes; that needs real footage, ideally with radar readings.
   Mark pitches by hand in review (**N**, then **C**).
 - **Speeds look systematically off**: check the pitching distance, and on
   side views make sure you clicked the *middle* of the rubber and of the plate.
+- **"results.csv is open in another program"**: Excel locks the file. Your
+  results are safe in `results.json`; close Excel and press Enter to write
+  the CSV again (or quit `pitchspeed review` later, which rewrites it).
+- **annotated.mp4 is open in a video player**: close the player and press
+  Enter, or let the tool write `annotated-1.mp4` instead.
 
 ## For developers
 

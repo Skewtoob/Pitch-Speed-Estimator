@@ -3,6 +3,7 @@ highlight windows, and rendering through fakes (no video I/O)."""
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import pytest
@@ -139,7 +140,9 @@ def test_transform_lookup():
     bad[1] = np.nan
     np.testing.assert_array_equal(O.TransformLookup(bad, np.array([10, 20, 30])).get(20), np.eye(2, 3))
     np.testing.assert_array_equal(O.TransformLookup(Ts, np.array([1, 2])).get(1), np.eye(2, 3))
-    np.testing.assert_array_equal(O.TransformLookup(np.zeros((3, 3, 3)), None).get(1), np.eye(2, 3))
+    np.testing.assert_array_equal(O.TransformLookup(np.zeros((3, 4, 4)), None).get(1), np.eye(2, 3))
+    # a degenerate homography -> the 3x3 identity
+    np.testing.assert_array_equal(O.TransformLookup(np.zeros((3, 3, 3)), None).get(1), np.eye(3))
 
 
 def test_audio_filter_graph():
@@ -319,3 +322,89 @@ def test_possible_missed_hint():
         band = img[40:80, 0:700].astype(int)
         return int((np.abs(band - np.array(O.ORANGE)).sum(axis=2) < 60).sum())
     assert orange(w.frames[155]) > 50 and orange(w.frames[140]) == 0
+
+
+# ----------------------------------------------------- homographies (3x3)
+def test_homography_transforms_are_applied_projectively():
+    import cv2
+    A = display_transform(720, 480, 8 / 9, (960, 720))
+    H3 = np.array([[1.02, 0.03, 12.0], [-0.01, 0.99, -6.0], [2e-5, -1e-5, 1.0]])     # sample -> reference
+    frame_pts = np.array([[100.0, 200.0], [600.0, 50.0], [360.0, 479.0]])
+    ref_pts = cv2.perspectiveTransform(frame_pts.reshape(-1, 1, 2), H3).reshape(-1, 2)
+    M = O.reference_to_display(H3, A)
+    assert M.shape == (3, 3)
+    np.testing.assert_allclose(O.apply_affine(M, ref_pts), map_points(A, frame_pts), atol=1e-6)
+    lk = O.TransformLookup(np.stack([H3, H3]), np.array([5, 9]))
+    assert lk.projective and lk.get(7).shape == (3, 3)
+    assert np.all(np.isnan(O.apply_affine(np.array([[1.0, 0, 0], [0, 1.0, 0], [0, 0, -1.0]]), [[1.0, 2.0]])))
+
+
+def test_trail_follows_homographies():
+    """Same check as the affine trail test, with (n, 3, 3) transforms (pipeline.load_transforms)."""
+    r = _small_result(1)
+    for p in r.pitches[0].track.points:
+        p.x, p.y, p.inlier = 400.0, 300.0, True
+    src = H.FakeSource(300)
+    A = display_transform(720, 480, 8 / 9, (960, 720))
+    u, v = map_points(A, [(400.0, 300.0)])[0]
+    u2, _ = map_points(A, [(380.0, 300.0)])[0]
+    Hs = np.stack([np.array([[1.0, 0.0, 20.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])] * 300)
+    _, w, _ = _render(r, src, transforms=Hs, transform_samples=np.arange(300))
+    assert _green_near(w.frames[70], u2, v) > 15 and _green_near(w.frames[70], u, v) == 0
+
+
+def test_checked_missed_windows_get_no_hint():
+    r = _small_result(1)
+    r.possible_missed = [{"s_start": 150, "s_end": 160, "t_start": 2.5, "t_end": 2.67, "reason": "x",
+                          "review": "no_pitch"},
+                         {"s_start": 170, "s_end": 180, "t_start": 2.8, "t_end": 3.0, "reason": "y"}]
+    assert O.missed_windows(r) == [(170, 180)]
+
+
+# ---------------------------------------------------------- locked output
+def test_locked_output_is_written_under_another_name(tmp_path, monkeypatch):
+    target = tmp_path / "annotated.mp4"
+    target.write_bytes(b"old video, open in a player")
+    (tmp_path / "annotated-1.mp4").write_bytes(b"older copy")
+    monkeypatch.setattr(O, "can_write", lambda p: os.path.abspath(p) != os.path.abspath(str(target)))
+    H.FakeWriter.instances.clear()
+    info = {}
+    out = O.render_annotated(_small_result(1), H.FakeSource(120), str(target), writer_factory=H.FakeWriter,
+                             info=info, audio=False)
+    assert out == str(tmp_path / "annotated-2.mp4") and H.FakeWriter.instances[-1].path == out
+    assert "annotated.mp4 is open" in info["note"]
+    assert target.read_bytes() == b"old video, open in a player"
+
+
+def test_move_into_place_keeps_the_file_when_the_target_is_locked(tmp_path, monkeypatch):
+    src, dst = tmp_path / "x.highlights-tmp.mp4", tmp_path / "annotated.mp4"
+    src.write_bytes(b"new")
+    dst.write_bytes(b"old")
+    real = os.replace
+
+    def locked(a, b):
+        if os.path.abspath(b) == os.path.abspath(str(dst)):
+            raise PermissionError(13, "in use", str(b))
+        return real(a, b)
+    monkeypatch.setattr(O.os, "replace", locked)
+    got = O.move_into_place(str(src), str(dst))
+    assert got == str(tmp_path / "annotated-1.mp4") and open(got, "rb").read() == b"new"
+    assert dst.read_bytes() == b"old" and not src.exists()
+
+
+def test_close_failure_keeps_the_rendered_video(tmp_path):
+    """writer.close() fails at the very end (target locked during the render): keep the frames."""
+    class LateLock(H.FakeWriter):
+        def __init__(self, path, *a, **kw):
+            super().__init__(path, *a, **kw)
+            self._b = type("B", (), {"path": str(tmp_path / "annotated.video-tmp.mp4")})()
+            with open(self._b.path, "wb") as f:
+                f.write(b"complete video")
+
+        def close(self):
+            raise PermissionError(13, "in use", self.path)
+    info = {}
+    out = O.render_annotated(_small_result(1), H.FakeSource(120), str(tmp_path / "annotated.mp4"),
+                             writer_factory=LateLock, info=info)
+    assert out == str(tmp_path / "annotated-1.mp4") and open(out, "rb").read() == b"complete video"
+    assert "kept as annotated-1.mp4" in info["note"]

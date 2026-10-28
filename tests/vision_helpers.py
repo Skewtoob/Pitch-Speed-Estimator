@@ -364,3 +364,26 @@ class ListSource:
         s1 = self.n_samples if s1 is None else min(s1, self.n_samples)
         for s in range(max(0, s0), s1):
             yield self.samples[s]
+
+
+# ------------------------------------------------------- behind-view helpers ----
+def behind_calibration(back: float = 30.0, height: float = 7.0, f: float = 1500.0, D: float = 60.5,
+                       sar: float = 10 / 11, w: int = 720, h: int = 480):
+    """Calibration (segment) of a pinhole camera `back` ft behind the plate (clicks projected exactly)."""
+    C = np.array([0.0, -back, height])
+    z = np.array([0.0, 25.0, 3.0]) - C
+    z /= np.linalg.norm(z)
+    x = np.cross(z, [0.0, 0.0, 1.0])
+    x /= np.linalg.norm(x)
+    R = np.stack([x, np.cross(z, x), z])
+
+    def proj(X):
+        Xc = (np.asarray(X, float) - C) @ R.T
+        return [float(f * Xc[0] / Xc[2] / sar + (w - 1) / 2), float(f * Xc[1] / Xc[2] + (h - 1) / 2)]
+
+    pts = {"release": proj([-1.5, 55.0, 5.6]), "catch": proj([0.0, -1.5, 2.2]),
+           "rubber_left": proj([-1.0, D + 0.25, 0.83]), "rubber_right": proj([1.0, D + 0.25, 0.83]),
+           "plate_left": proj([-17 / 24, 17 / 12, 0.0]), "plate_right": proj([17 / 24, 17 / 12, 0.0])}
+    st = Settings(distance_ft=D, level="hs", sar=sar)
+    seg = Segment(start_frame=0, ref_frame=0, view="behind", points=pts)
+    return CalibrationFile(settings=st, segments=[seg], image_size=(w, h)).segment_calibs()[0]

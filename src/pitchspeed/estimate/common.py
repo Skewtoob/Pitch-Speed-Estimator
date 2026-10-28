@@ -60,6 +60,11 @@ SPEED_RELEVANT_TRACK_FLAGS = frozenset({
     F_RELEASE_UNCONFIRMED, F_CATCH_EXTRAPOLATED, F_PARTIAL_TRACK, F_FRAMES_ONLY, F_FIELD_ORDER,
     F_DROPPED_FRAME, "duplicate_frame_suspected", F_OBLIQUE,
 })
+# Track flags that describe how the AUTOMATIC release / catch time was found:
+# stale (and dropped) once the user has marked that event by hand.
+RELEASE_EVENT_TRACK_FLAGS = frozenset({F_RELEASE_UNCONFIRMED})
+CATCH_EVENT_TRACK_FLAGS = frozenset({F_CATCH_EXTRAPOLATED})
+F_INVALID_SETTINGS = "invalid_settings"
 
 # Variance (in sample_dt**2 units) added to the flight time when the field
 # order is uncertain: with probability p the order is wrong and each event
@@ -136,11 +141,22 @@ def event_sigma(ev: EventTime, sample_dt: float) -> tuple[float, bool]:
 
     Events located to a whole sample cannot be better than the
     quantization sigma dt/sqrt(12); extrapolated (sub-field) events get a
-    1 ms floor.  A missing / invalid sigma becomes dt/2.
+    1 ms floor.  A hand-marked event (method 'manual') gets the human
+    identification term added in quadrature (estimate.events; whoever built
+    the EventTime), without the 'floored' flag.  A missing / invalid sigma
+    becomes dt/2; an infinite one stays infinite (no number).
     """
+    from pitchspeed.estimate.events import manual_id_sigma   # local import: keeps common.py import-light
     quant = sample_dt / math.sqrt(12.0)
-    floor = 0.001 if ev.method in ("extrapolated", "side_fit") else quant
+    try:
+        if float(ev.sigma) == math.inf:
+            return math.inf, False
+    except (TypeError, ValueError):
+        pass
     s = float(ev.sigma) if finite(ev.sigma) and ev.sigma > 0 else 0.5 * sample_dt
+    if ev.method == "manual":
+        return math.hypot(max(s, quant), manual_id_sigma(sample_dt)), False
+    floor = 0.001 if ev.method in ("extrapolated", "side_fit") else quant
     if s < floor:
         return floor, True
     return s, False

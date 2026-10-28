@@ -104,11 +104,17 @@ def tof_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
     `drag` overrides the default drag model (tests / sensitivity studies);
     `track_flags` are the vision flags of the pitch's track, if any; `side`
     is E2's details dict (side view: rho and obliquity for the release point).
+    A hand-marked catch always ends at the glove (`end_kind` 'catch'): the
+    mark means "first field with the ball in the glove" (estimate.events).
     """
     if release is None or catch is None:
         raise K.NotMeasurable("time of flight needs both a release and a catch time")
+    if not (K.finite(sample_dt) and sample_dt > 0):
+        raise K.NotMeasurable(f"sample interval {sample_dt!r} is not a positive number")
     if not (K.finite(release.t) and K.finite(catch.t)):
         raise K.NotMeasurable("release or catch time is not a number")
+    if catch.method == "manual":
+        end_kind = "catch"
     T = float(catch.t) - float(release.t)
     if T <= 0:
         raise K.NotMeasurable(f"catch ({catch.t:.3f} s) is not after release ({release.t:.3f} s)")
@@ -122,11 +128,15 @@ def tof_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
         y_r, s_rel_pos, rel_src = calib.release_y_ft, float(calib.settings.extension_sigma_ft), "assumed_extension"
     y_end, sig_end, end_name = K.end_point(calib, end_kind)
     L = y_r - y_end
+    if not (K.finite(L) and K.finite(s_rel_pos) and K.finite(sig_end)):
+        raise K.NotMeasurable("release/catch distance is not a number; check distance/extension settings")
     if L <= 5.0:
         raise K.NotMeasurable(f"release->{end_name} distance {L:.1f} ft is not plausible; check distance/extension")
 
     d0 = drag or K.drag_for(calib)
     k = d0.k
+    if not (K.finite(k) and k >= 0 and K.finite(d0.rel_sigma)):
+        raise K.NotMeasurable("drag constant is not a number; check altitude/temperature settings")
     v_h = v0_from_tof(L, T, k)
     sf = K.slope_factor(calib, L, T)
     v0 = v_h * sf
@@ -154,7 +164,7 @@ def tof_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
         flags.append(K.F_FRAMES_ONLY)
     if fl_r or fl_c:
         flags.append(K.F_EVENT_SIGMA_FLOORED)
-    if not manual and release.method == "first_free_field":
+    if release.method == "first_free_field":      # automatic release, whoever marked the catch
         flags.append(K.F_RELEASE_UNCONFIRMED)
     if end_kind == "contact":
         flags.append(K.F_CONTACT)
@@ -199,7 +209,10 @@ def tof_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
     phi_min = (side or {}).get("phi_min_deg")
     too_oblique = ((K.finite(phi) and phi > MAX_OBLIQUITY_FOR_IMAGE_RELEASE_DEG)
                    or (K.finite(phi_min) and phi_min > MAX_OBLIQUITY_MIN_DEG))
-    if at_point and too_oblique:
+    if not (K.finite(v0) and K.finite(rel_ind) and K.finite(dv_k)):
+        details["usable"] = False
+        details["reason"] = "time-of-flight uncertainty could not be computed (release/catch time sigma unknown)"
+    elif at_point and too_oblique:
         details["usable"] = False
         details["reason"] = (f"camera too oblique (phi ~ {phi:.0f} deg) for a release time extrapolated in "
                              f"the image; mark the release by hand or calibrate as a behind-plate view")

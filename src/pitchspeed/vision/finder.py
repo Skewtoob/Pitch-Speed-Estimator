@@ -35,7 +35,13 @@ that never looked like a ball flight (seed score < 40) are only counted
 tracks.jsonl.  "Possible missed pitch" windows come from a delivery-energy
 cue (activity near the release point followed by activity near the catch
 point 0.3-1.3 s later) without an accepted track, from rejected tracks that
-look like partial pitches, and from stretches where stabilization failed.
+look like partial pitches, from DUPLICATE tracks seen mostly outside the
+flight of the pitch they lost to, and from stretches where stabilization
+failed.
+
+Duplicates: only candidates whose observations overlap (or nearly meet) in
+time are one flight; the one that observed most of it wins (see
+`PitchFinder._resolve_duplicates`).
 """
 from __future__ import annotations
 
@@ -52,7 +58,8 @@ from pitchspeed.types import EventTime, PitchTrack, Sample, ScanInfo, TrackPoint
 from pitchspeed.vision import geometry as G
 from pitchspeed.vision.detect import DetFrame, Detector
 from pitchspeed.vision.options import FinderOptions
-from pitchspeed.vision.segment import Segmenter
+from pitchspeed.vision.model import model_from_dict
+from pitchspeed.vision.segment import F_FIELD_ORDER, F_FIELD_ORDER_CONFLICT, Segmenter
 from pitchspeed.vision.stabilize import Stabilizer, StabilizerOptions
 from pitchspeed.vision.track import (CandStore, Pt, Track, build_track, continue_track, find_seeds, fit_track,
                                      pass2, regrow, trim_sparse_ends, try_merge)
@@ -80,6 +87,78 @@ class _Record:
     track: Track
     pt: PitchTrack
     strobe: Optional[np.ndarray] = None
+
+
+def _add_flags(pt, *flags) -> None:
+    for f in flags:
+        if f not in pt.flags:
+            pt.flags.append(f)
+
+
+def _inliers(pt) -> list:
+    return [p for p in pt.points if p.inlier]
+
+
+def flight_score(pt) -> float:
+    """How much of a pitch flight a candidate observed (duplicate arbitration).
+
+    inliers x image progress covered (first -> last inlier, at least 0.02)
+    x log(1 + median detection score).  Junk near the release point (wind-up,
+    glove) covers little progress; fragments cover part of the flight; the
+    ball's weaker echoes (parallel low-contrast tracks next to it, common on
+    the synthetic behind views) lose on contrast.  Not the confidence: it
+    rewards late fragments (see _resolve_duplicates).
+    """
+    P = _inliers(pt)
+    if not P:
+        return 0.0
+    d = pt.diagnostics or {}
+    span = float(d.get("progress_last", 0.0)) - float(d.get("progress_first", 0.0))
+    z = float(np.median([max(0.0, float(p.score)) for p in P]))
+    return float(len(P) * max(span, 0.02) * math.log1p(z))
+
+
+def same_flight(a, b, merge_gap: int) -> bool:
+    """Inlier observation spans overlap or are at most merge_gap samples apart."""
+    A, B = _inliers(a), _inliers(b)
+    if not A or not B:
+        return False
+    gap = max(A[0].s, B[0].s) - min(A[-1].s, B[-1].s)
+    return gap <= merge_gap
+
+
+SAME_PATH_MIN_PX = 4.0     # same_path tolerance: max(this, expected ball diameter)
+
+
+def _path_mismatch(a, b, geom, dt: float) -> Optional[float]:
+    """Median over b's inliers inside a's span (+-2 samples) of |a's model - b| / tolerance."""
+    A, B = _inliers(a), _inliers(b)
+    if not A or not a.model:
+        return None
+    t0, t1 = A[0].t - 2 * dt, A[-1].t + 2 * dt
+    Q = [p for p in B if t0 <= p.t <= t1]
+    if len(Q) < 3:
+        return None
+    try:
+        xy = model_from_dict(a.model).eval([p.t for p in Q])
+    except Exception:                      # malformed model dict: no evidence
+        return None
+    obs = np.array([[p.x, p.y] for p in Q], float)
+    d = np.hypot((xy[:, 0] - obs[:, 0]) * geom.sar, xy[:, 1] - obs[:, 1])
+    tol = np.maximum(SAME_PATH_MIN_PX, geom.ball_diameter(geom.progress(obs)))
+    return float(np.median(d / tol))
+
+
+def same_path(a, b, geom, dt: float) -> bool:
+    """Do two time-overlapping candidates follow the same image path (the same object)?
+
+    Each model must predict the other's inlier points where both have data
+    (>= 3 points) to within max(SAME_PATH_MIN_PX, ball diameter), median.
+    Fragments built from the same ball detections give ~0.1, the ball's
+    parallel echoes / other objects >= 2 (synthetic behind suites).
+    """
+    m = [v for v in (_path_mismatch(a, b, geom, dt), _path_mismatch(b, a, geom, dt)) if v is not None]
+    return bool(m) and max(m) <= 1.0
 
 
 class PitchFinder:
@@ -116,9 +195,10 @@ class PitchFinder:
                             keep_rmap=self.debug)
         self.store = CandStore(max_len=o.track_window + 3 * o.finalize_lag + 60)
         self.seg = Segmenter(self.geom, o, self.dt, self.frame_dt, self.interlaced, self.store,
-                             quality_of=self._min_quality, view=self.geom.view)
+                             quality_of=self._min_quality, view=self.geom.view, usable_of=self._usable_mask)
         # per-sample records
         self._s: list = []
+        self._tt: list = []             # sample time of each processed sample (aligned with _s)
         self._A: list = []              # 2x3 local affine (FinderResult.transforms)
         self._H: list = []              # 3x3 transforms actually used
         self._n_h = 0
@@ -126,6 +206,7 @@ class PitchFinder:
         self._qd: dict = {}
         self._method: list = []
         self._tl = {"s": [], "t": [], "n": [], "sigma": [], "e_rel": [], "e_catch": [], "skipped": []}
+        self._usable: dict = {}         # s -> detection data usable (DetFrame not skipped)
         self._open: list = []
         self._records: list = []
         self._next_tid = 1
@@ -136,6 +217,10 @@ class PitchFinder:
         self._diag = {"n_discarded_short": 0, "n_seeds": 0, "n_tracks_built": 0, "n_merged": 0}
         # sample ranges to seed again once (after a track there was rejected / trimmed)
         self._reseed: list[tuple[int, int]] = []
+        # s -> uids of the detections of rejected tracks: released for other tracks to extend
+        # into, but never seed points again (the re-seed would just rebuild the same junk)
+        self._blocked_seeds: dict = {}
+        self._dup_windows: list = []    # (t0, t1) of DUPLICATE losers to list for review
         self._time = {"stabilize": 0.0, "detect": 0.0, "track": 0.0}
         self._t_first: Optional[float] = None
         self._s_first: Optional[int] = None
@@ -170,6 +255,11 @@ class PitchFinder:
             return 0.0
         return float(np.median(qs[ok]) * math.sqrt(ok.mean()))
 
+    def _usable_mask(self, s0: int, s1: int) -> list:
+        """Per sample s0..s1: processed with usable detection data (not skipped)?"""
+        u = self._usable
+        return [u.get(s, False) for s in range(s0, s1 + 1)]
+
     # ----------------------------------------------------------- stream
     def process(self, sample: Sample) -> None:
         """Feed the next sample (time order).  Gaps in `s` are allowed."""
@@ -188,6 +278,7 @@ class PitchFinder:
             self._s_first, self._t_first = sample.s, sample.t
         self._s_last = sample.s
         self._s.append(sample.s)
+        self._tt.append(float(sample.t))
         c_ref = np.array([0.5 * (self.geom.bbox[0] + self.geom.bbox[2]), 0.5 * (self.geom.bbox[1] + self.geom.bbox[3])])
         c_s = G.apply(G.invert(r.A), c_ref[None])[0]
         self._A.append(G.local_affine(r.A, c_s))
@@ -236,6 +327,7 @@ class PitchFinder:
 
     def _on_detection(self, df: DetFrame) -> None:
         self.store.add(df)
+        self._usable[df.s] = not df.skipped
         tl = self._tl
         tl["s"].append(df.s)
         tl["t"].append(df.t)
@@ -263,6 +355,8 @@ class PitchFinder:
             return
         o = self.opts
         s_lo, s_hi = st.s_min, st.s_max
+        for s_old in [k for k in self._blocked_seeds if k < s_lo]:
+            del self._blocked_seeds[s_old]          # bounded memory: only the cached window
         for tr in list(self._open):
             if tr.open_fwd:
                 continue_track(tr, st, self.geom, o, self.dt, s_lo, s_hi)
@@ -304,9 +398,11 @@ class PitchFinder:
             seeds = find_seeds(st, seed_lo, seed_hi, self.geom, o)
             self._diag["n_seeds"] += len(seeds)
             n_built = 0
+            blocked = self._blocked_seeds
             for seed in seeds:
                 _, a, b, c = seed
-                if any(st.is_used(int(n["s"]), int(n["uid"])) for n in (a, b, c)):
+                key = tuple((int(n["s"]), int(n["uid"])) for n in (a, b, c))
+                if any(st.is_used(sk, uk) or uk in blocked.get(sk, ()) for sk, uk in key):
                     continue
                 if n_built >= o.max_builds_per_run:
                     # bounded work in heavy clutter; seeds are processed strongest first
@@ -382,9 +478,24 @@ class PitchFinder:
         pt = self.seg.classify(tr)
         pt.diagnostics["delivery_cue"] = tr.info["delivery_cue"]
         self._behind_past_release_check(tr, pt)
+        discard = (pt.status == "rejected" and pt.reject_code == "TOO_SHORT" and len(pt.points) < 6
+                   and tr.seed_score < 40)
+        if pt.status == "rejected" and not discard and o.reseed_release_claims:
+            # A rejected track gives its detections back: some of them may be the ball's
+            # (a junk track built first can take part of the flight) and the window is
+            # re-seeded below, so the ball's own track can extend through them.  They
+            # are not used as seed points again (that just rebuilds the same junk).
+            # Only with FinderOptions.reseed_release_claims (see there: off by default,
+            # it did more harm than good on the held-out suite).
+            st.claim(tr, False)
+            for other in self._open:          # detections shared with live tracks stay theirs
+                st.claim(other)
+            for p in tr.pts.values():
+                if p.uid >= 0:
+                    self._blocked_seeds.setdefault(int(p.s), set()).add(int(p.uid))
         if (pt.status == "rejected" or tr.info.get("n_trimmed")) and not tr.info.get("from_reseed"):
             self._reseed.append((tr.s_first - 3, tr.s_last + 3))
-        if pt.status == "rejected" and pt.reject_code == "TOO_SHORT" and len(pt.points) < 6 and tr.seed_score < 40:
+        if discard:
             st.claim(tr, False)
             self._discard(tr)
             return
@@ -498,6 +609,7 @@ class PitchFinder:
         self._time["detect"] += time.perf_counter() - t0
         for df in flushed:
             self.store.add(df)
+            self._usable[df.s] = not df.skipped
             tl = self._tl
             for k, v in (("s", df.s), ("t", df.t), ("n", len(df.cands)), ("sigma", df.sigma),
                          ("e_rel", df.e_rel), ("e_catch", df.e_catch), ("skipped", df.skipped)):
@@ -534,7 +646,9 @@ class PitchFinder:
         field of motion, so the tracker builds one track per parity.  Two
         overlapping tracks that are each (almost) single-parity and of
         opposite parity are tested jointly: if their union is much smoother
-        under the flipped field timing, both get 'field_order_conflict'.
+        under the flipped field timing, both get 'field_order_conflict' and the
+        estimator's 'field_order_ambiguous' (wider flight time), and
+        diagnostics['field_order_pair'] (pipeline: a 'flipped' vote).
         """
         if not self.interlaced:
             return
@@ -559,31 +673,116 @@ class PitchFinder:
                                        [p.k for p in P], self.frame_dt)
                 if fo.get("conflict"):
                     for r, other in ((a, b), (b, a)):
-                        if "field_order_conflict" not in r.pt.flags:
-                            r.pt.flags.append("field_order_conflict")
+                        _add_flags(r.pt, F_FIELD_ORDER_CONFLICT, F_FIELD_ORDER)
                         r.pt.diagnostics["field_order_pair"] = {"other_track": other.pt.track_id, **fo}
 
     def _resolve_duplicates(self):
+        """One pitch per flight: overlapping candidates are fragments / echoes of one flight.
+
+        Two 'pitch' candidates are the same flight when their inlier
+        observation spans overlap or are at most `merge_gap` samples apart (a
+        second ball cannot be in flight then).  Candidates further apart are
+        never duplicates, however close their release times (the old rule
+        dropped real pitches for junk 1 s away); the pipeline sorts out
+        throw-backs and doubtful tracks.  Within a flight the candidate that
+        observed most of it wins (`flight_score`: inliers x image progress
+        covered x contrast): not the confidence, which favours late fragments
+        (their own late 'first free field' release makes them look complete).
+        The losers become DUPLICATE (diagnostics 'duplicate_of'); the winner:
+          * confidence = max over the flight (each fragment is evidence of the
+            pitch; diagnostics 'confidence_own');
+          * behind view: a fragment on the same image path (same_path) that
+            saw the ball clearly free *before* the winner's release estimate
+            proves that estimate late: the release is widened to cover both
+            ('release_uncertain', diagnostics 'release_widened_by_track');
+          * a field-order conflict found on any fragment is kept.
+        A loser that was seen mostly outside the winner's flight is listed in
+        possible_missed ('rejected_track:DUPLICATE'), so nothing is hidden.
+        """
         o = self.opts
         recs = sorted(self._records, key=lambda r: r.pt.t_first)
         pitches = [r for r in recs if r.pt.status == "pitch"]
-        for r in sorted(pitches, key=lambda r: -r.pt.confidence):
-            if r.pt.status != "pitch":
+        order = sorted(pitches, key=lambda r: (-flight_score(r.pt), -r.pt.confidence, r.pt.t_first))
+        kept: list = []
+        group: dict = {}
+        for r in order:
+            r.pt.diagnostics["flight_score"] = flight_score(r.pt)
+            w = next((k for k in kept if same_flight(k.pt, r.pt, o.merge_gap)), None)
+            if w is None:
+                kept.append(r)
+                group[id(r)] = []
                 continue
-            for q in pitches:
-                if q is r or q.pt.status != "pitch":
-                    continue
-                if q.pt.confidence > r.pt.confidence:
-                    continue
-                tr_, tq = r.pt.release.t if r.pt.release else r.pt.t_first, \
-                    q.pt.release.t if q.pt.release else q.pt.t_first
-                if abs(tr_ - tq) < o.duplicate_s:
-                    q.pt.status = "rejected"
-                    q.pt.reject_code = "DUPLICATE"
-                    q.pt.diagnostics["duplicate_of"] = r.pt.track_id
+            r.pt.status = "rejected"
+            r.pt.reject_code = "DUPLICATE"
+            r.pt.diagnostics["duplicate_of"] = w.pt.track_id
+            group[id(w)].append(r)
+        self._dup_windows = []
+        for w in kept:
+            self._absorb_duplicates(w, group[id(w)])
         tracks = [r.pt for r in recs if r.pt.status == "pitch"]
         rejected = [r.pt for r in recs if r.pt.status != "pitch"]
         return tracks, rejected
+
+    def _absorb_duplicates(self, w: "_Record", losers: list) -> None:
+        """Carry what the DUPLICATE losers of one flight know over to its winner (see above)."""
+        if not losers:
+            return
+        pt, dt = w.pt, self.dt
+        pt.diagnostics["duplicates"] = [q.pt.track_id for q in losers]
+        # confidence: the flight as a whole
+        best = max(losers, key=lambda q: q.pt.confidence)
+        if best.pt.confidence > pt.confidence:
+            pt.diagnostics["confidence_own"] = pt.confidence
+            pt.diagnostics["confidence_from_track"] = best.pt.track_id
+            pt.confidence = float(best.pt.confidence)
+            pt.flags = [f for f in pt.flags if f not in ("doubtful", "review")]
+            if pt.confidence < 0.3:
+                pt.flags.append("doubtful")
+            elif pt.confidence < 0.6:
+                pt.flags.append("review")
+        # field order: a conflict seen on any fragment of the flight
+        fo_from = [q for q in losers if F_FIELD_ORDER_CONFLICT in q.pt.flags]
+        if fo_from and F_FIELD_ORDER_CONFLICT not in pt.flags:
+            _add_flags(pt, F_FIELD_ORDER_CONFLICT, F_FIELD_ORDER)
+            pt.diagnostics["field_order_conflict_from_track"] = fo_from[0].pt.track_id
+        pair = next((q.pt.diagnostics["field_order_pair"] for q in losers
+                     if q.pt.diagnostics.get("field_order_pair")), None)
+        if pair is not None and not pt.diagnostics.get("field_order_pair"):
+            pt.diagnostics["field_order_pair"] = dict(pair)     # the pipeline's field-order vote reads it
+        # behind-view release: the ball seen free earlier on the same path
+        rel = pt.release
+        if self.geom.view == "behind" and rel is not None and rel.method == "first_free_field":
+            early = []
+            for q in losers:
+                tq = q.pt.diagnostics.get("t_first_clean")
+                if (tq is not None and q.pt.release is not None and tq < rel.t - 2.0 * rel.sigma
+                        and same_path(pt, q.pt, self.geom, dt)):
+                    early.append(q)
+            if early:
+                q = min(early, key=lambda q: q.pt.release.t)
+                lo = min(q.pt.release.t, rel.t)
+                iv = pt.diagnostics.get("release_interval")
+                if iv:
+                    lo = min(lo, float(iv[0]))
+                hi = rel.t if not iv else max(rel.t, float(iv[1]))
+                sig = math.sqrt(max(rel.sigma, q.pt.release.sigma) ** 2 + (hi - lo) ** 2 / 12.0)
+                t_mid = 0.5 * (lo + hi)
+                pt.diagnostics["release_before_widening"] = to_jsonable(rel)
+                pt.diagnostics["release_widened_by_track"] = q.pt.track_id
+                pt.diagnostics["release_interval"] = [lo, hi]
+                pt.release = EventTime(t=float(t_mid), sigma=float(sig), method="first_free_field",
+                                       s=self.seg._nearest_s(t_mid))
+                if "release_uncertain" not in pt.flags:
+                    pt.flags.append("release_uncertain")
+                if pt.catch is not None:
+                    pt.diagnostics["flight_time"] = pt.catch.t - pt.release.t
+        # never hide a loser that saw something outside the reported flight
+        if pt.release is not None and pt.catch is not None:
+            f0, f1 = pt.release.t - 2 * dt, pt.catch.t + 2 * dt
+            for q in losers:
+                ts = [p.t for p in q.pt.points if p.inlier]
+                if ts and sum(1 for t in ts if t < f0 or t > f1) >= 0.5 * len(ts):
+                    self._dup_windows.append((ts[0] - 0.25, ts[-1] + 0.25))
 
     def _sample_at(self, t: float) -> int:
         tl = self._tl
@@ -646,11 +845,17 @@ class PitchFinder:
                     and d.get("progress_rate", 0.0) > 0
                     and (d.get("progress_last", 0.0) - d.get("progress_first", 0.0)) >= 0.15):
                 add(p.t_first - 0.5, p.t_last + 0.5, f"rejected_track:{p.reject_code}")
-        # 3. stabilization failures
+        # 2b. DUPLICATE losers seen mostly outside the flight of the pitch they lost to
+        #     (_resolve_duplicates): listed even near a reported pitch
+        for (t0, t1) in getattr(self, "_dup_windows", []):
+            add(t0, t1, "rejected_track:DUPLICATE")
+        # 3. stabilization failures (recorded sample times and indices: the clock can
+        #    jump at dropped frames / VFR, so s and t are not linear in each other)
         q = np.asarray(self._q)
         if len(q):
             bad = q <= 0
             s = np.asarray(self._s)
+            tt = np.asarray(self._tt, float)
             i = 0
             while i < len(q):
                 if bad[i]:
@@ -658,9 +863,8 @@ class PitchFinder:
                     while j + 1 < len(q) and bad[j + 1]:
                         j += 1
                     if j - i + 1 >= 15:
-                        t0 = self._t_first + (s[i] - self._s_first) * self.dt
-                        t1 = self._t_first + (s[j] - self._s_first) * self.dt
-                        add(t0, t1, "stabilization_failed")
+                        out.append({"s_start": int(s[i]), "s_end": int(s[j]), "t_start": float(tt[i]),
+                                    "t_end": float(tt[j]), "reason": "stabilization_failed"})
                     i = j + 1
                 else:
                     i += 1
@@ -739,7 +943,9 @@ def track_between(source, calib: Calibration, scan: ScanInfo, s_release: int, s_
     that window (or a track made of `manual_points` only).  The returned
     track's release / catch are the user's marks (method 'manual',
     t = sample time, sigma = dt / 2); the automatic estimates inside the
-    window are kept in diagnostics['auto_release'] / ['auto_catch'].
+    window are kept in diagnostics['auto_release'] / ['auto_catch'] (and
+    the automatic end kind in ['auto_end_kind']: the returned end_kind is
+    always 'catch', a hand-marked catch being the ball in the glove).
     status is 'pitch' unless no point at all could be found
     (reject_code 'NO_TRACK', events still set).
     """
@@ -796,11 +1002,14 @@ def track_between(source, calib: Calibration, scan: ScanInfo, s_release: int, s_
         out.diagnostics["auto_status"] = auto.status
         out.diagnostics["auto_reject_code"] = auto.reject_code
         out.diagnostics["auto_flags"] = list(auto.flags)
-        out.end_kind = auto.end_kind
+        out.diagnostics["auto_end_kind"] = auto.end_kind
+        # The user's catch mark is "the first field with the ball in the glove": the flight
+        # ends at the glove (end_kind 'catch'), whatever the automatic track's end looked
+        # like (e.g. a 'contact' from a swing) -- never inherit the automatic end kind.
+        out.end_kind = "catch"
         out.confidence = auto.confidence
-        for f in auto.flags:
-            if f == "field_order_conflict":
-                out.flags.append(f)
+        if F_FIELD_ORDER_CONFLICT in auto.flags:
+            _add_flags(out, F_FIELD_ORDER_CONFLICT, F_FIELD_ORDER)
     if pts:
         out.diagnostics.update(t_first_obs=pts[0].t, t_last_obs=pts[-1].t, s_first_obs=pts[0].s,
                                s_last_obs=pts[-1].s)

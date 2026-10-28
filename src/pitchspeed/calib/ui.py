@@ -10,20 +10,38 @@ this module only draws, converts mouse clicks from display to frame pixel
 coordinates (`ui.canvas.Canvas.to_frame`) and feeds keys / mouse events.
 
 Returns the CalibrationFile (settings + segments, ``video`` fingerprint
-left for the caller to fill) or None if the user cancelled (Esc twice or
-closed the window).  Raises `pitchspeed.ui.gui.GuiUnavailable` with a
-fix-it message when no window can be opened (no DISPLAY on Linux,
-opencv-python-headless).
+left for the caller to fill) or None if the user cancelled (Esc twice, or
+closed the window and chose not to save).  Raises
+`pitchspeed.ui.gui.GuiUnavailable` with a fix-it message when no window
+can be opened (no DISPLAY on Linux, opencv-python-headless).
+
+CLOSING THE WINDOW (X button) never throws clicked points away silently.
+OpenCV cannot keep the window from closing, so the question is asked in
+the console the program runs in (where every other question is asked):
+
+* nothing changed since the window opened: nothing to save (None);
+* all required points placed: the check that Enter does runs, its
+  warnings are printed, then "Save these points? [Y/n/e]" - y saves
+  (warnings recorded in the notes, as with Enter), n discards, e re-opens
+  the window to keep editing.  The default is to save (closing is the
+  usual way to finish on Windows), except after a first Esc (the user
+  was quitting without saving): then the default is n;
+* required points missing (cannot be saved yet): "e" re-opens the window
+  (default), "n" quits without saving.
+* no console to ask (stdin closed): save if the points can be saved and
+  Esc was not pressed, else nothing is saved; either way it is printed.
 
 Extra keyword arguments (not in DESIGN.md's contract, all optional):
 ``ui_scale`` (window size factor; default $PITCHSPEED_UI_SCALE or 1),
-``window`` (an object with the `ui.gui.Window` interface, for tests) and
+``window`` (an object with the `ui.gui.Window` interface, for tests; it is
+re-opened through its ``reopen()`` method if it has one), ``ask``
+(``prompt -> answer or None``, the console question, for tests) and
 ``max_iterations`` (stop the event loop after so many polls, for tests).
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -154,9 +172,85 @@ def _resolve_sar(video: VideoInfo, settings: Optional[Settings]) -> float:
     return sar
 
 
+def console_ask(prompt: str) -> Optional[str]:
+    """One answer typed in the console, or None when there is no console to ask."""
+    try:
+        return input(prompt)
+    except (EOFError, OSError, RuntimeError):
+        return None
+
+
+def _answer(ask: Callable[[str], Optional[str]], prompt: str, choices: str, default: str) -> Optional[str]:
+    """First letter of a valid answer ('' = default); None if nobody can answer."""
+    for _ in range(5):
+        a = ask(prompt)
+        if a is None:
+            return None
+        a = a.strip().lower()[:1] or default
+        if a in choices:
+            return a
+        print(f"  please type one of: {', '.join(choices)}")
+    return default
+
+
+def after_close(state: CalibState, ask: Callable[[str], Optional[str]] = console_ask,
+                allow_edit: bool = True) -> str:
+    """What to do after the user closed the window: 'saved' | 'discard' | 'edit' (see module doc).
+
+    allow_edit=False (the window could not be re-opened): only save / discard."""
+    if not state.unsaved_changes():
+        print("Calibration window closed: nothing was changed, nothing to save.")
+        return "discard"
+    print("\nThe calibration window was closed before saving.")
+    print(f"  Points clicked: {state.placed_summary()}")
+    try:
+        warns = state.check()
+    except ValueError as e:
+        print(f"  These points cannot be saved yet: {e}")
+        if not allow_edit:
+            print("Nothing saved.")
+            return "discard"
+        a = _answer(ask, "  Type e (or just Enter) to go back to the window and finish, "
+                         "or n to quit WITHOUT saving: ", "en", "e")
+        if a == "e":
+            return "edit"
+        print("Nothing saved." if a == "n" else "No answer possible (no console): nothing saved.")
+        return "discard"
+    if warns:
+        print("  Please check before saving:")
+        for w in warns:
+            print(f"   - {w}")
+    default = "n" if state.cancel_armed else "y"
+    opts = ("[Y/n" if default == "y" else "[y/N") + ("/e]" if allow_edit else "]")
+    back = ", e = back to the window" if allow_edit else ""
+    a = _answer(ask, f"  Save these points? y = save, n = throw them away{back} {opts}: ",
+                "yne" if allow_edit else "yn", default)
+    if a is None:
+        if default == "n":
+            print("No answer possible (no console) and Esc had been pressed: nothing saved.")
+            return "discard"
+        print("No answer possible (no console): saving the points (all required points are placed).")
+        a = "y"
+    if a == "e":
+        return "edit"
+    if a == "n":
+        print("Nothing saved.")
+        return "discard"
+    state.save_now()
+    return "saved"
+
+
+def _reopen(window, factory):
+    if window is not None:
+        fn = getattr(window, "reopen", None)
+        return fn() if callable(fn) else None
+    return factory()
+
+
 def run_calibration_ui(source, video: VideoInfo, view: str, initial: Optional[CalibrationFile] = None,
                        settings: Optional[Settings] = None, start_frame: int = 0, *,
                        ui_scale: Optional[float] = None, window=None,
+                       ask: Optional[Callable[[str], Optional[str]]] = None,
                        max_iterations: Optional[int] = None) -> Optional[CalibrationFile]:
     """Interactive calibration (see module docstring).  Returns None if cancelled."""
     from pitchspeed.ui.gui import Window, require_gui
@@ -176,11 +270,38 @@ def run_calibration_ui(source, video: VideoInfo, view: str, initial: Optional[Ca
                        cv.video_size_for(cv.resolve_ui_scale(ui_scale)), strip_h=STRIP_H)
     state.pick_radius = PICK_RADIUS_DISPLAY_PX / canvas.px_per_row
     win = window if window is not None else Window(WINDOW_NAME)
+    ask = ask or console_ask
+    it = 0
+    while True:
+        closed, it = _event_loop(state, store, canvas, win, video, it, max_iterations)
+        if not closed:
+            break
+        what = after_close(state, ask)
+        if what != "edit":
+            break
+        try:
+            win = _reopen(window, lambda: Window(WINDOW_NAME))
+        except Exception as e:  # noqa: BLE001 - never lose the clicks because a window failed
+            print(f"  The window could not be re-opened ({e}).")
+            win = None
+        if win is None:
+            after_close(state, ask, allow_edit=False)
+            break
+        state.cancel_armed = False
+        state.confirm = None
+        state._say("window re-opened: Enter = check and save, Esc twice = quit without saving", "warn")
+    if state.cancelled or not state.done:
+        return None
+    return state.result
+
+
+def _event_loop(state: CalibState, store: FrameStore, canvas: cv.Canvas, win, video: VideoInfo, it: int,
+                max_iterations: Optional[int]) -> tuple[bool, int]:
+    """Poll the window until saved / cancelled / closed; returns (closed by the user, iterations)."""
     mouse_uv: Optional[tuple[int, int]] = None
     closed = False
     try:
         win.add_trackbar("frame", max(1, int(video.n_frames) - 1), state.frame)
-        it = 0
         while not state.done:
             win.show(render(state, store, canvas, mouse_uv))
             code = win.wait_key(POLL_MS)
@@ -202,12 +323,7 @@ def run_calibration_ui(source, video: VideoInfo, view: str, initial: Optional[Ca
                 break
     finally:
         win.close()
-    if closed:
-        print("Calibration window closed: nothing saved (press Enter in the window to save).")
-        return None
-    if state.cancelled or not state.done:
-        return None
-    return state.result
+    return closed, it
 
 
 def _feed_mouse(state: CalibState, canvas: cv.Canvas, kind: str, u: int, v: int) -> None:

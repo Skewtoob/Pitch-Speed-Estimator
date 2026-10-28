@@ -47,8 +47,9 @@ def test_calibration_cancel_and_close():
     src = FakeSource(n_frames=50)
     assert run_calibration_ui(src, src.info, "side", window=ScriptedWindow([key("esc"), key("esc")]),
                               max_iterations=20) is None
+    # closed with the plate missing and nobody to ask in the console: nothing can be saved
     assert run_calibration_ui(src, src.info, "side", window=ScriptedWindow(click(400, 201) + [("close",)]),
-                              max_iterations=20) is None
+                              ask=lambda prompt: None, max_iterations=20) is None
     # running out of iterations is not a save
     assert run_calibration_ui(src, src.info, "side", window=ScriptedWindow([]), max_iterations=3) is None
 

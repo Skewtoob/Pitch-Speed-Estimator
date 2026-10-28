@@ -267,6 +267,10 @@ def _build(d: str, name: str) -> dict:
             path = encode(frames, os.path.join(d, name + ".mkv"), "ffv1_mkv", vf=vf,
                           extra=["-fps_mode", "passthrough"])
         return {"path": path, "frames": frames, "scene": scene, "order": "bff"}
+    if name == "woven60_tff":                   # TFF-woven content labelled 59.94 frames/s
+        frames = weave_frames(scene, N_FRAMES, "tff")
+        path = encode(frames, os.path.join(d, name + ".mkv"), "ffv1_mkv", rate="60000/1001")
+        return {"path": path, "frames": frames, "scene": scene, "order": "tff"}
     prog = weave_frames(scene, N_FRAMES + 1, "prog")
     if name in ("fake60_p0", "fake60_p1"):
         dbl = [f for f in prog for _ in (0, 1)]

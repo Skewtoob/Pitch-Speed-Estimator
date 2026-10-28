@@ -26,6 +26,8 @@ CSV FORMAT (decided here, see docs/design-notes/io_ux.md section 6):
        is lost - filter on `status` before averaging);
     2. 'possible_missed' review rows (windows the finder thinks may hold a
        pitch it could not measure), chronological, speed columns empty;
+       a window the user already checked in review gets status
+       'checked_no_pitch' / 'checked_pitch_added' instead;
     3. only with write_csv(..., rejected_tracks=True): one 'rejected_track'
        row per moving object the finder did not accept (reject code in
        `notes`).  Off by default because real video produces a few per
@@ -55,7 +57,7 @@ from pitchspeed.render.text import (ci90_text, finite, format_time, has_number, 
                                     whole_mph)
 from pitchspeed.types import AnalysisResult, Pitch, PitchTrack, result_from_dict, to_jsonable
 
-__all__ = ["write_json", "load_json", "write_csv", "format_table", "format_time",
+__all__ = ["write_json", "load_json", "write_csv", "format_table", "format_time", "missed_review",
            "CSV_COLUMNS", "csv_rows", "SCHEMA",
            "result_to_dict", "view_for_frame", "frame_of_sample"]
 
@@ -72,8 +74,8 @@ CSV_COLUMNS = [
 
 
 # ================================================================ atomic I/O
-def _replace(tmp: str, path: str) -> None:
-    deadline = time.monotonic() + _REPLACE_RETRY_S
+def _replace(tmp: str, path: str, retry_s: Optional[float] = None) -> None:
+    deadline = time.monotonic() + (_REPLACE_RETRY_S if retry_s is None else max(0.0, float(retry_s)))
     while True:
         try:
             os.replace(tmp, path)
@@ -97,7 +99,7 @@ def _file_mode(path: str) -> int:
         return 0o666 & ~um
 
 
-def _atomic_write_bytes(path: str, data: bytes) -> None:
+def _atomic_write_bytes(path: str, data: bytes, retry_s: Optional[float] = None) -> None:
     path = os.fspath(path)
     folder = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=folder)
@@ -108,7 +110,7 @@ def _atomic_write_bytes(path: str, data: bytes) -> None:
             os.fsync(f.fileno())
         if os.name != "nt":
             os.chmod(tmp, _file_mode(path))
-        _replace(tmp, path)
+        _replace(tmp, path, retry_s)
     except BaseException:
         try:
             os.remove(tmp)
@@ -264,15 +266,32 @@ def frame_of_sample(result: AnalysisResult, s: Optional[int]) -> Optional[int]:
     return int(ev.get("frame_phase", 0) or 0) % step + s * step
 
 
+MISSED_REVIEW_STATUS = {"no_pitch": ("checked_no_pitch", "checked in review: no pitch"),
+                        "pitch_added": ("checked_pitch_added", "checked in review: a pitch was added by hand")}
+
+
+def missed_review(d: dict) -> Optional[tuple[str, str]]:
+    """(csv status, note) for a possible-missed window the user checked in review, else None."""
+    rv = d.get("review") if isinstance(d, dict) else None
+    if not rv:
+        return None
+    return MISSED_REVIEW_STATUS.get(str(rv), (f"checked_{rv}", f"checked in review: {rv}"))
+
+
 def _missed_row(d: dict, result: AnalysisResult) -> dict:
     f0, f1 = frame_of_sample(result, d.get("s_start")), frame_of_sample(result, d.get("s_end"))
-    return _empty_row(status="possible_missed",
+    checked = missed_review(d)
+    if checked is not None:
+        status, note = checked
+        notes = f"{note} (was: possible missed pitch: {d.get('reason', 'unknown')})"
+    else:
+        status, notes = "possible_missed", f"possible missed pitch: {d.get('reason', 'unknown')}; check in review"
+    return _empty_row(status=status,
                       time_release=format_time(d.get("t_start")) if finite(d.get("t_start")) else "",
                       t_release_s=_num(d.get("t_start"), 3), t_catch_s=_num(d.get("t_end"), 3),
                       frame_release=_int(f0), frame_catch=_int(f1),
                       field_release=_int(d.get("s_start")), field_catch=_int(d.get("s_end")),
-                      view=view_for_frame(result.calibration, f0),
-                      notes=f"possible missed pitch: {d.get('reason', 'unknown')}; check in review")
+                      view=view_for_frame(result.calibration, f0), notes=notes)
 
 
 def _track_row(tr: PitchTrack, result: AnalysisResult) -> dict:
@@ -309,14 +328,18 @@ def csv_rows(result: AnalysisResult, review_rows: bool = True, rejected_tracks: 
 
 
 def write_csv(result: AnalysisResult, path: str, *, review_rows: bool = True,
-              rejected_tracks: bool = False) -> None:
-    """Write results.csv atomically (UTF-8 with BOM, CRLF; see module doc)."""
+              rejected_tracks: bool = False, retry_s: Optional[float] = None) -> None:
+    """Write results.csv atomically (UTF-8 with BOM, CRLF; see module doc).
+
+    retry_s: how long to keep retrying a locked target (None = ~2 s; 0 = one
+    attempt, for autosaves that must not freeze a window).  A target that stays
+    locked raises PermissionError."""
     buf = io.StringIO(newline="")
     w = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, lineterminator="\r\n", extrasaction="ignore")
     w.writeheader()
     for row in csv_rows(result, review_rows=review_rows, rejected_tracks=rejected_tracks):
         w.writerow(row)
-    _atomic_write_bytes(path, buf.getvalue().encode("utf-8-sig"))
+    _atomic_write_bytes(path, buf.getvalue().encode("utf-8-sig"), retry_s)
 
 
 # ===================================================================== table
@@ -438,7 +461,11 @@ def _notes_lines(pitches: Iterable[Pitch]) -> list[str]:
 
 def _review_lines(result: AnalysisResult) -> list[str]:
     out = []
-    missed = sorted(result.possible_missed or [], key=lambda d: _sort_t(d.get("t_start")))
+    every = sorted(result.possible_missed or [], key=lambda d: _sort_t(d.get("t_start")))
+    missed = [d for d in every if missed_review(d) is None]
+    n_checked = len(every) - len(missed)
+    if n_checked:
+        out.append(f"Possible missed pitches already checked in review: {n_checked}")
     if missed:
         out.append(f"Possible missed pitches ({len(missed)}) - check them in review:")
         for d in missed[:20]:

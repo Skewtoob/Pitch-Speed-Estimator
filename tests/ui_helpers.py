@@ -216,6 +216,12 @@ class ScriptedWindow:
     def close(self):
         self.closed = True
 
+    def reopen(self):
+        """A new window after the user closed this one (the script continues)."""
+        self.closed = False
+        self.reopened = getattr(self, "reopened", 0) + 1
+        return self
+
 
 # Qt (Linux) codes measured under Xvfb, used to script key presses
 QT = {"left": 65361, "up": 65362, "right": 65363, "down": 65364, "home": 65360, "end": 65367,
@@ -372,6 +378,17 @@ class XInjector:
         self.d.sync()
         self._sleep()
 
+    def close_window(self) -> None:
+        """What the X button does: send WM_DELETE_WINDOW to the window."""
+        from Xlib import protocol
+        X = self.X
+        ev = protocol.event.ClientMessage(window=self.win, client_type=self.d.intern_atom("WM_PROTOCOLS"),
+                                          data=(32, [self.d.intern_atom("WM_DELETE_WINDOW"), X.CurrentTime,
+                                                     0, 0, 0]))
+        self.win.send_event(ev, event_mask=X.NoEventMask)
+        self.d.sync()
+        self._sleep()
+
     def click(self, u: float, v: float, button: int = 1) -> None:
         self.move(u, v)
         self.xtest.fake_input(self.d, self.X.ButtonPress, button)
@@ -384,7 +401,13 @@ def _inject(name: str, actions, errors: list) -> None:
     try:
         inj = XInjector(name)
         for a in actions:
-            if a[0] == "key":
+            if a[0] == "close":
+                inj.close_window()
+            elif a[0] == "refind":                 # the window was re-opened: a new X window
+                import time
+                time.sleep(1.0)
+                inj = XInjector(name)
+            elif a[0] == "key":
                 inj.key(*a[1:])
             elif a[0] == "click":
                 inj.click(*a[1:])
@@ -421,6 +444,23 @@ def gui_driver_main(kind: str) -> None:
         th.start()
         cf = run_calibration_ui(src, src.info, "side")
         out = {"result": None if cf is None else cf.to_dict()}
+    elif kind == "calib_close":
+        # X button with all points placed: the console question answers e (re-open the window),
+        # then the X button again and y (save).
+        from pitchspeed.calib.ui import WINDOW_NAME, run_calibration_ui
+        src = FakeSource(n_frames=60)
+        answers = ["e", "y"]
+        prompts: list = []
+
+        def ask(prompt):
+            prompts.append(prompt)
+            return answers.pop(0) if answers else None
+        actions = [("click", *disp(400, 201)), ("click", *disp(100, 300)), ("close",), ("refind",),
+                   ("key", "i"), ("close",)]
+        th = threading.Thread(target=_inject, args=(WINDOW_NAME, actions, errors), daemon=True)
+        th.start()
+        cf = run_calibration_ui(src, src.info, "side", ask=ask)
+        out = {"result": None if cf is None else cf.to_dict(), "prompts": len(prompts)}
     elif kind == "calib_cancel":
         from pitchspeed.calib.ui import WINDOW_NAME, run_calibration_ui
         src = FakeSource(n_frames=60)

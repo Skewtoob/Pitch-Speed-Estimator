@@ -352,3 +352,36 @@ def test_new_files_follow_umask(tmp_path):
     finally:
         os.umask(um)
     assert (os.stat(tmp_path / "r.json").st_mode & 0o777) == 0o644
+
+
+def test_csv_retry_zero_fails_fast(tmp_path, monkeypatch):
+    """Review autosave: one attempt only, so a CSV open in Excel never freezes the window."""
+    import time as _time
+    calls = []
+
+    def locked(src, dst):
+        calls.append(dst)
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(R.os, "replace", locked)
+    t0 = _time.monotonic()
+    with pytest.raises(PermissionError, match="open in Excel"):
+        R.write_csv(H.rich_result(), str(tmp_path / "results.csv"), retry_s=0.0)
+    assert _time.monotonic() - t0 < 0.5 and len(calls) == 1
+    assert os.listdir(tmp_path) == []
+
+
+def test_checked_windows_are_not_listed_as_open(tmp_path):
+    r = H.rich_result()
+    r.possible_missed = [dict(r.possible_missed[0], review="no_pitch"),
+                         {"s_start": 5600, "s_end": 5640, "t_start": 5600 * H.FIELD_DT,
+                          "t_end": 5640 * H.FIELD_DT, "reason": "stabilization_failed"},
+                         {"s_start": 5800, "s_end": 5840, "t_start": 5800 * H.FIELD_DT,
+                          "t_end": 5840 * H.FIELD_DT, "reason": "z", "review": "pitch_added"}]
+    p = str(tmp_path / "results.csv")
+    R.write_csv(r, p)
+    rows = [row for row in _read_csv(p) if row["status"] not in ("auto", "edited", "manual", "rejected")]
+    assert [row["status"] for row in rows] == ["checked_no_pitch", "possible_missed", "checked_pitch_added"]
+    assert "checked in review: no pitch" in rows[0]["notes"] and "check in review" in rows[1]["notes"]
+    table = R.format_table(r)
+    assert "Possible missed pitches (1) - check them in review:" in table
+    assert "already checked in review: 2" in table

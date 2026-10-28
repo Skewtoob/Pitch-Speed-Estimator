@@ -77,6 +77,7 @@ F_PRIOR_MEDIAN_W = 1.3
 F_PRIOR_LOG_SIGMA = 0.35
 F_MIN_W = 0.95                # widest plausible lens (HFOV ~55 deg): bounds phi from below
 MAX_OBLIQUITY_DEG = 45.0
+SIGMA_LN_RHO_CAP = math.log(RHO_BOUNDS[1])   # ~3.0: sigma(ln rho) this large = rho not determined at all
 POOR_FIT_RMS_PX = 4.0
 PARTIAL_COVERAGE = 0.6        # observed fraction of the release->catch path below this -> partial_track
 ALT_ORDER_RATIO = 0.6         # swapped-field-order rms below this fraction of the scan's -> swap
@@ -347,7 +348,15 @@ def lateral_budget(calib: Calibration, geom: AxisGeometry, rho: float, sigma_ln_
     """
     w_sq = float(calib.image_size[0]) * calib.sar
     centre = np.array([w_sq / 2.0, float(calib.image_size[1]) / 2.0])
-    s_ln = sigma_ln_rho if math.isfinite(sigma_ln_rho) else 0.5
+    s_ln = 0.5 if math.isnan(sigma_ln_rho) else abs(float(sigma_ln_rho))
+    if not s_ln < SIGMA_LN_RHO_CAP:
+        # rho not determined by the track (degenerate fit, e.g. an impossible
+        # extension): no obliquity, no budget -> E2 is not used.  (exp(s_ln)
+        # below would also overflow.)
+        t_min, _ = tan_phi_and_depth(geom, rho, F_MIN_W * w_sq, centre)
+        phi_min = math.degrees(math.atan(abs(t_min))) if math.isfinite(t_min) else 90.0
+        return LateralBudget(0.0, float("inf"), float("inf"), float("inf"), float("nan"), phi_min,
+                             "rho_undetermined")
     z = np.linspace(-3.0, 3.0, 25)
     wts = np.exp(-0.5 * z ** 2)
     fs = F_PRIOR_MEDIAN_W * w_sq * np.exp(F_PRIOR_LOG_SIGMA * z)
@@ -530,7 +539,13 @@ def side_fit_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: f
 
     d0 = drag or K.drag_for(calib)
     k = d0.k
+    if not (K.finite(k) and k >= 0):
+        raise K.NotMeasurable("drag constant is not a number; check altitude/temperature settings")
     y_r = calib.release_y_ft
+    y_end0, _, _ = K.end_point(calib, "catch")
+    if not (K.finite(y_r - y_end0) and y_r - y_end0 > 5.0):
+        raise K.NotMeasurable(f"release->catch distance {y_r - y_end0:.1f} ft is not plausible; "
+                              f"check distance/extension")
     t0 = float(pts.t[0])
     mu = geom.mu(pts.xy_sq)
     flags: list[str] = []
@@ -620,7 +635,12 @@ def side_fit_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: f
         notes.append(f"track covers only {100 * coverage:.0f}% of the release->catch path")
 
     usable, reason = True, None
-    if not math.isfinite(sigma_ind):
+    if lat.source == "rho_undetermined":
+        usable = False
+        flags.append(K.F_POOR_FIT)
+        reason = ("side-view fit could not determine the perspective from the track (check the distance / "
+                  "extension settings and the plate / rubber clicks); not used")
+    elif not math.isfinite(sigma_ind):
         usable = False
         flags.append(K.F_POOR_FIT)
         reason = "side-view fit uncertainty could not be computed; not used"

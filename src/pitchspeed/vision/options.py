@@ -63,6 +63,12 @@ class FinderOptions:
     merge_gap: int = 12
     ransac_iters: int = 200
     max_builds_per_run: int = 40          # track builds per tracker run (bounded work in clutter)
+    # A rejected track gives its detections back to other tracks (they may be the ball's) before
+    # its window is re-seeded; its detections are never seed points again.  Off by default: on
+    # the held-out behind suite (eval2b, 15 clips) it cost one pitch (recall 43 -> 42), put one
+    # speed outside its 90 % interval (0 -> 1 of 31) and ran ~15 % slower, while recovering no
+    # pitch; it changes which tracks get built rather than freeing fragmented flights.
+    reseed_release_claims: bool = False
     pass2: bool = True
     pass2_back: int = 14                  # samples to search before the first point
     pass2_fwd: int = 8
@@ -86,7 +92,8 @@ class FinderOptions:
     off_axis_catch: float = 0.30
     side_speed_range: tuple = (25.0, 110.0)
     max_rms_px: float = 2.0
-    duplicate_s: float = 1.5
+    duplicate_s: float = 1.5              # unused: duplicates are tracks whose observations overlap in
+    #                                       time (finder._resolve_duplicates); kept so saved options load
     min_confidence: float = 0.1           # below: rejected as LOW_CONFIDENCE (still reported)
     contact_gap: int = 3
 

@@ -64,6 +64,17 @@ def test_calibration_window_clicks_and_keys():
     assert "point_frames" in cf["notes"]
 
 
+def test_calibration_window_closed_asks_and_reopens():
+    """X button (WM_DELETE_WINDOW): the clicks are kept; 'e' re-opens the window, then 'y' saves."""
+    out = run_driver("calib_close")
+    assert out["prompts"] == 2
+    cf = out["result"]
+    assert cf is not None
+    pts = cf["segments"][0]["points"]
+    assert pts["rubber"] == pytest.approx([400, 201], abs=0.6)
+    assert pts["plate"][1] == pytest.approx(300 - 0.25, abs=0.6)          # nudged in the re-opened window
+
+
 def test_calibration_window_escape_twice_cancels():
     assert run_driver("calib_cancel")["result"] is None
 

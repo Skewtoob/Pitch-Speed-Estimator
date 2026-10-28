@@ -344,10 +344,22 @@ def catch_extrapolated(t_catch: float, rng, bias=0.001, sigma=0.003, reported=0.
     return EventTime(t=t_catch + bias + rng.normal(0, sigma), sigma=reported, method="extrapolated")
 
 
-def manual_pair(t_rel: float, t_catch: float, dt: float):
-    """User marks: first sample after release, first sample at/after the catch."""
-    s_r = math.floor(t_rel / dt) + 1
-    s_c = math.ceil(t_catch / dt)
+# Simulated non-expert marking: each mark is one field early or late with this
+# probability (the estimator's ASSUMED identification term, estimate.events).
+MANUAL_SLIP_PROB = 0.25
+
+
+def _slip(rng, p: float) -> int:
+    if rng is None or p <= 0 or rng.uniform() >= p:
+        return 0
+    return 1 if rng.uniform() < 0.5 else -1
+
+
+def manual_pair(t_rel: float, t_catch: float, dt: float, rng=None, slip_prob: float = 0.0):
+    """User marks: first sample after release, first sample at/after the catch,
+    each one field off with probability `slip_prob` (needs `rng`)."""
+    s_r = math.floor(t_rel / dt) + 1 + _slip(rng, slip_prob)
+    s_c = math.ceil(t_catch / dt) + _slip(rng, slip_prob)
     return (manual_event(s_r * dt, dt, "release", s=s_r), manual_event(s_c * dt, dt, "catch", s=s_c))
 
 
@@ -406,7 +418,8 @@ PROGRESSIVE = ScanInfo("progressive", None, "high", "content", 1 / FRAME_DT)
 
 def run_side(scene: str, kind: str, n: int, seed: int = 0, *, sar: float = 10 / 11, sigma_px=1.0,
              visible_frac=1.0, outlier_frac=0.0, manual=False, hand_known=False, rubber_ends=False,
-             parity_bias_px=0.0, swap_order=False, click_sigma=2.0, roll_deg=0.0) -> Stats:
+             parity_bias_px=0.0, swap_order=False, click_sigma=2.0, roll_deg=0.0,
+             slip_prob=MANUAL_SLIP_PROB) -> Stats:
     rng = np.random.default_rng(seed)
     hand = rng.choice(["R", "L"]) if hand_known else None
     flights = simulate_pitches(kind, n, rng, hand=hand)
@@ -421,7 +434,7 @@ def run_side(scene: str, kind: str, n: int, seed: int = 0, *, sar: float = 10 / 
                            outlier_frac=outlier_frac, parity_bias_px=parity_bias_px, swap_order=swap_order)
         t_c = t_rel + fl.T
         if manual:
-            rel, cat = manual_pair(t_rel, t_c, FIELD_DT)
+            rel, cat = manual_pair(t_rel, t_c, FIELD_DT, rng, slip_prob)
         else:
             rel = side_release_event(fl, cam, calib, t_rel, rng, sar)
             cat = catch_extrapolated(t_c, rng)
@@ -440,7 +453,7 @@ BEHIND_SCENARIOS = {
 }
 
 
-def run_behind(scenario: str, kind: str, n: int, seed: int = 0) -> Stats:
+def run_behind(scenario: str, kind: str, n: int, seed: int = 0, slip_prob: float = MANUAL_SLIP_PROB) -> Stats:
     rng = np.random.default_rng(seed)
     flights = simulate_pitches(kind, n, rng)
     D = flights[0].D
@@ -459,7 +472,7 @@ def run_behind(scenario: str, kind: str, n: int, seed: int = 0) -> Stats:
         t_rel = 1.0 + rng.uniform(0, dt)
         t_c = t_rel + fl.T
         if scenario == "manual":
-            rel, cat = manual_pair(t_rel, t_c, dt)
+            rel, cat = manual_pair(t_rel, t_c, dt, rng, slip_prob)
         else:
             rel = release_first_field(t_rel, dt, rng, lat)
             cat = catch_extrapolated(t_c, rng, sigma=0.005 if frames else 0.003,
