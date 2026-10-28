@@ -7,6 +7,9 @@ segment's reference frame).  Modules work with a resolved `Calibration`
 (one segment + the shared settings), obtained with
 `CalibrationFile.for_frame(i)` or `CalibrationFile.segment_calibs()`.
 
+A segment with view 'manual' has no points: its pitches are marked by hand
+(see REQUIRED_POINTS).
+
 Point names (all in frame pixel coords of `ref_frame`, stored pixels):
   rubber          middle of the pitching rubber (on the ground)      side: required
   plate           middle of home plate (front-to-back middle)        side: required
@@ -30,14 +33,21 @@ from pitchspeed import constants as C
 
 SCHEMA = "pitchspeed.calibration/1"
 
+# View 'manual': pitches are marked by hand (release and catch fields), so no
+# points are clicked; the speed then comes from the time of flight alone, which
+# needs only the settings (distance, extension, heights) - any camera angle,
+# even a moving or zooming camera.  The automatic finder cannot run on it.
 REQUIRED_POINTS = {
     "side": ["rubber", "plate"],
     "behind": ["release", "catch"],
+    "manual": [],
 }
 OPTIONAL_POINTS = {
     "side": ["release", "catch", "vertical_top", "vertical_bottom"],
     "behind": ["rubber_left", "rubber_right", "plate_left", "plate_right", "rubber", "plate"],
+    "manual": [],
 }
+AUTOMATIC_VIEWS = ("side", "behind")
 POINT_HELP = {
     "rubber": "MIDDLE of the pitching rubber (white slab on the mound)",
     "plate": "MIDDLE of home plate",
@@ -142,7 +152,7 @@ class Segment:
     start_frame: int = 0
     end_frame: Optional[int] = None          # exclusive; None = to end of video
     ref_frame: int = 0
-    view: str = "side"                       # 'side' | 'behind'
+    view: str = "side"                       # 'side' | 'behind' | 'manual' (marked by hand, no points)
     points: dict = field(default_factory=dict)       # name -> [x, y]
     masks: list = field(default_factory=list)        # [x0, y0, x1, y1] regions to ignore
 
@@ -301,7 +311,9 @@ class Calibration:
                 continue
             if not (-0.5 <= p[0] <= w - 0.5 and -0.5 <= p[1] <= h - 0.5):
                 warns.append(f"point {n} {p} is outside the image")
-        if self.view == "side":
+        if self.view == "manual":
+            pass                                 # nothing clicked: only the settings matter
+        elif self.view == "side":
             d = np.linalg.norm(self.to_sq(self.point("rubber")) - self.to_sq(self.point("plate")))
             if d < 60:
                 warns.append(f"rubber and plate are only {d:.0f} px apart; side-view accuracy will be poor")
@@ -385,7 +397,7 @@ class Calibration:
         if self.has("release"):
             return self.point("release")
         if self.view != "side":
-            raise ValueError("behind view needs a clicked release point")
+            raise ValueError(f"{self.view} view needs a clicked release point")
         g = self.to_sq(self.ground_point(self.release_y_ft))
         up = self.up_dir_sq()
         return self.from_sq(g + up * self.release_height_ft * self.px_per_ft_axis())
@@ -394,7 +406,7 @@ class Calibration:
         if self.has("catch"):
             return self.point("catch")
         if self.view != "side":
-            raise ValueError("behind view needs a clicked catch point")
+            raise ValueError(f"{self.view} view needs a clicked catch point")
         g = self.to_sq(self.ground_point(self.catch_y_ft))
         up = self.up_dir_sq()
         return self.from_sq(g + up * self.settings.catch_height_ft * self.px_per_ft_axis())
@@ -463,3 +475,14 @@ class Calibration:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 return True
         return False
+
+
+def manual_calibration(settings: Settings, image_size=(720, 480), video: Optional[dict] = None) -> CalibrationFile:
+    """A calibration for marking pitches by hand: the settings and one point-less 'manual' segment."""
+    return CalibrationFile(settings=settings, segments=[Segment(view="manual")], video=dict(video or {}),
+                           image_size=tuple(image_size))
+
+
+def is_manual(cf: Optional[CalibrationFile]) -> bool:
+    """True if every segment of `cf` is a 'manual' (marked by hand) segment."""
+    return cf is not None and bool(cf.segments) and all(seg.view == "manual" for seg in cf.segments)

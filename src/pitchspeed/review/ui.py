@@ -28,7 +28,11 @@ badges of both fields are shown, but marking is refused (review/state.py).
 Extra keyword arguments (not in DESIGN.md's contract, all optional):
 ``retrack(pitch) -> PitchTrack`` for the E key (default: built from
 ``pitchspeed.vision.finder.track_between`` with the calibration's
-reference frame), ``ui_scale``, ``window`` and ``max_iterations`` (tests).
+reference frame; none for a calibration marked by hand), ``mode``
+('review', or 'mark' for marking pitches by hand on a long tape: the bar
+covers the whole video and shows the marked pitches, playback runs forward
+up to 8x - see review/state.py), ``ui_scale``, ``window`` and
+``max_iterations`` (tests).
 """
 from __future__ import annotations
 
@@ -39,7 +43,7 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from pitchspeed.calib.model import CalibrationFile
+from pitchspeed.calib.model import CalibrationFile, is_manual
 from pitchspeed.review.state import ReviewState, StabilizeMap
 from pitchspeed.types import AnalysisResult, Pitch, PitchTrack
 from pitchspeed.ui import canvas as cv
@@ -50,6 +54,7 @@ from pitchspeed.ui.loupe import make_loupe, paste_loupe
 log = logging.getLogger("pitchspeed")
 
 WINDOW_NAME = "pitchspeed - review"
+MARK_WINDOW_NAME = "pitchspeed - mark pitches"
 STRIP_H = 100
 BAR_H = 16
 POLL_MS = 30
@@ -183,6 +188,12 @@ def _draw_strip(img: np.ndarray, state: ReviewState, canvas: cv.Canvas) -> None:
     def xs(s):
         return int(round(x0 + (s - w0) / max(1, (w1 - w0)) * (x1 - x0)))
 
+    for a, b, status in mk.get("pitches", []):        # every pitch on the bar (mark mode: whole tape)
+        if b < w0 or a > w1:
+            continue
+        color = cv.RED if status == "rejected" else STATUS_COLORS.get(status, cv.WHITE)
+        xa, xb = xs(max(a, w0)), xs(min(b, w1))
+        cv2.rectangle(img, (xa, y0 + 1), (max(xa + 1, xb), y1 - 1), color, -1)
     span = mk.get("span")
     if span is not None:
         cv2.rectangle(img, (xs(span[0]), y0 + 3), (xs(span[1]), y1 - 3), (0, 140, 255), -1)
@@ -218,7 +229,7 @@ def run_review_ui(result: AnalysisResult, source, calib_file: CalibrationFile,
                   transforms=None, transform_samples=None, *,
                   retrack: Optional[Callable[[Pitch], PitchTrack]] = None,
                   ui_scale: Optional[float] = None, window=None,
-                  max_iterations: Optional[int] = None) -> AnalysisResult:
+                  max_iterations: Optional[int] = None, mode: str = "review") -> AnalysisResult:
     """Interactive review (see module docstring).  Returns the edited result."""
     from pitchspeed.ui.gui import Window, require_gui
 
@@ -230,12 +241,12 @@ def run_review_ui(result: AnalysisResult, source, calib_file: CalibrationFile,
     sar = float(getattr(info, "sar", 1.0) or 1.0)
     store = FrameStore(source)
     stab = StabilizeMap(transforms, transform_samples)
-    if retrack is None and calib_file is not None and calib_file.segments:
+    if retrack is None and calib_file is not None and calib_file.segments and not is_manual(calib_file):
         retrack = make_default_retrack(source, calib_file, result.scan)
-    state = ReviewState(result, source, recompute, save, retrack=retrack, stab=stab)
+    state = ReviewState(result, source, recompute, save, retrack=retrack, stab=stab, mode=mode)
     canvas = cv.Canvas((width, height), sar, cv.video_size_for(cv.resolve_ui_scale(ui_scale)), strip_h=STRIP_H)
     state.pick_radius = PICK_RADIUS_DISPLAY_PX / canvas.px_per_row
-    win = window if window is not None else Window(WINDOW_NAME)
+    win = window if window is not None else Window(MARK_WINDOW_NAME if mode == "mark" else WINDOW_NAME)
     mouse_uv: Optional[tuple[int, int]] = None
     next_tick = time.monotonic()
     it = 0
@@ -248,6 +259,9 @@ def run_review_ui(result: AnalysisResult, source, calib_file: CalibrationFile,
                 win.show(render(state, store, canvas, mouse_uv, busy="working, please wait ..."))
                 win.wait_key(1)
                 state.run_pending()
+                if getattr(state, "frames_changed", False):     # K switched the field order
+                    store = FrameStore(source)
+                    state.frames_changed = False
                 continue
             win.show(render(state, store, canvas, mouse_uv))
             delay = 1 if more else POLL_MS
@@ -265,7 +279,7 @@ def run_review_ui(result: AnalysisResult, source, calib_file: CalibrationFile,
                 _feed_mouse(state, canvas, ev.kind, ev.x, ev.y)
             if state.playing and time.monotonic() >= next_tick:
                 state.tick()
-                next_tick = time.monotonic() + float(source.sample_dt) / state.play_speed
+                next_tick = time.monotonic() + float(source.sample_dt) * state.play_step / state.play_speed
             elif not state.playing:
                 next_tick = time.monotonic()
             it += 1

@@ -28,7 +28,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from pitchspeed import __version__
-from pitchspeed.calib.model import Calibration, CalibrationFile
+from pitchspeed.calib.model import Calibration, CalibrationFile, is_manual
 from pitchspeed.types import AnalysisResult, EventTime, Pitch, PitchTrack, ScanInfo, to_jsonable
 
 log = logging.getLogger("pitchspeed")
@@ -596,32 +596,12 @@ def resolve_field_order(scan: ScanInfo, tracks: list[PitchTrack], source=None, f
     return "unknown"
 
 
-def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str] = None,
-            opts: Optional[AnalyzeOptions] = None, show_progress: bool = True, _flipped: bool = False):
-    """Run the full analysis.  Returns (AnalysisResult, SampleSource).
-
-    Writes results.json / results.csv / transforms.npz in out_dir.  An
-    existing results.json with review work is backed up first and its
-    reviewed pitches are carried over when that is safe (see module doc)."""
-    from pitchspeed.io.reader import VideoReader
-    from pitchspeed.io.interlace import SampleSource, detect_scan
-    from pitchspeed.vision.finder import FinderOptions, PitchFinder
-
-    opts = opts or AnalyzeOptions()
-    out_dir = out_dir or default_out_dir(video_path)
-    os.makedirs(out_dir, exist_ok=True)
-    paths = out_paths(out_dir)
-    warnings: list[str] = []
-    # Before anything in out_dir is replaced: back up review work (results + transforms).
-    prev = None if _flipped else PreviousResults.load(paths)
-
-    reader = VideoReader(video_path, sar_override=opts.par, index_cache=paths["index"])
+def _video_warnings(video_path: str, reader, scan: ScanInfo, source, calib_file: CalibrationFile) -> list[str]:
+    """Warnings about the video and the calibration (shared by analyze and start_marking)."""
     info = reader.info
+    warnings: list[str] = []
     cal_errors, cal_warns = calibration_video_problems(calib_file, video_path, info)
     warnings += [f"calibration does not fit this video: {w}" for w in cal_errors + cal_warns]
-    fo = None if opts.field_order in (None, "auto") else opts.field_order
-    scan = detect_scan(reader, override=fo)
-    source = SampleSource(reader, scan)
     if scan.mode != "interlaced":
         step = 1.0 / scan.sample_rate if scan.sample_rate else source.sample_dt
         if step > 0.025:
@@ -643,9 +623,42 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
 
     warnings += calib_file.validate()
     # 8:9 vs 10:11 (the two SD conventions) differ by ~2%, which barely matters here.
-    if abs(calib_file.settings.sar - info.sar) > 0.05 * info.sar:
+    if not is_manual(calib_file) and abs(calib_file.settings.sar - info.sar) > 0.05 * info.sar:
         warnings.append(f"calibration pixel aspect {calib_file.settings.sar:.4f} differs from the video's "
                         f"{info.sar:.4f}; using the calibration's value for geometry")
+
+    return warnings
+
+
+def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str] = None,
+            opts: Optional[AnalyzeOptions] = None, show_progress: bool = True, _flipped: bool = False):
+    """Run the full analysis.  Returns (AnalysisResult, SampleSource).
+
+    Writes results.json / results.csv / transforms.npz in out_dir.  An
+    existing results.json with review work is backed up first and its
+    reviewed pitches are carried over when that is safe (see module doc)."""
+    from pitchspeed.io.reader import VideoReader
+    from pitchspeed.io.interlace import SampleSource, detect_scan
+    from pitchspeed.vision.finder import FinderOptions, PitchFinder
+
+    opts = opts or AnalyzeOptions()
+    if is_manual(calib_file):
+        raise ValueError("this video is set up for marking the pitches by hand (no clicks on the rubber and "
+                         "plate), so there is nothing to search automatically: use `pitchspeed mark`, or "
+                         "`pitchspeed calibrate` to click the points for the automatic search")
+    out_dir = out_dir or default_out_dir(video_path)
+    os.makedirs(out_dir, exist_ok=True)
+    paths = out_paths(out_dir)
+    warnings: list[str] = []
+    # Before anything in out_dir is replaced: back up review work (results + transforms).
+    prev = None if _flipped else PreviousResults.load(paths)
+
+    reader = VideoReader(video_path, sar_override=opts.par, index_cache=paths["index"])
+    info = reader.info
+    fo = None if opts.field_order in (None, "auto") else opts.field_order
+    scan = detect_scan(reader, override=fo)
+    source = SampleSource(reader, scan)
+    warnings += _video_warnings(video_path, reader, scan, source, calib_file)
 
     fopts = FinderOptions.from_dict(opts.finder)
     if opts.debug:
@@ -661,6 +674,8 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
     tf_s, tf_m, tf_q, tf_h = [], [], [], []
     for seg_i, calib in enumerate(calib_file.segment_calibs()):
         seg = calib.segment
+        if calib.view == "manual":                 # marked by hand: nothing to search here
+            continue
         s0 = max(s_lo, source.sample_of(seg.start_frame, 0))
         s1 = s_hi if seg.end_frame is None else min(s_hi, source.sample_of(seg.end_frame, 0))
         if s1 <= s0:
@@ -760,6 +775,58 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
     if not _flipped:
         _finish_analysis(result, calib_file, source, out_dir, prev, show_progress)
     return result, source
+
+
+def start_marking(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str] = None,
+                  opts: Optional[AnalyzeOptions] = None):
+    """Open a video for marking its pitches by hand (no automatic search).
+
+    Detects the interlacing and field order (the marks are field-exact, so
+    the field timing matters), and writes results.json / results.csv with no
+    pitches yet, plus the warnings about the video.  Returns
+    (AnalysisResult, SampleSource).  An existing results.json is backed up
+    first; a transforms.npz from an earlier automatic analysis is moved aside
+    (it describes camera motion the hand-marked session does not use)."""
+    from pitchspeed.io.reader import VideoReader
+    from pitchspeed.io.interlace import SampleSource, detect_scan
+
+    opts = opts or AnalyzeOptions()
+    out_dir = out_dir or default_out_dir(video_path)
+    os.makedirs(out_dir, exist_ok=True)
+    paths = out_paths(out_dir)
+    notes: list[str] = []
+    if os.path.exists(paths["results_json"]):
+        bak = backup_results(paths["results_json"])
+        notes.append(f"the previous results were backed up as {os.path.basename(bak)}")
+    if os.path.exists(paths["transforms"]):
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        aside = os.path.join(out_dir, f"transforms.backup-{stamp}.npz")
+        os.replace(paths["transforms"], aside)
+        notes.append(f"the camera-motion file of an earlier automatic analysis was moved to "
+                     f"{os.path.basename(aside)}")
+    reader = VideoReader(video_path, sar_override=opts.par, index_cache=paths["index"])
+    fo = None if opts.field_order in (None, "auto") else opts.field_order
+    scan = detect_scan(reader, override=fo)
+    source = SampleSource(reader, scan)
+    warnings = notes + _video_warnings(video_path, reader, scan, source, calib_file)
+    params = {
+        "mode": "marked_by_hand",
+        "field_order_option": opts.field_order or "auto",
+        "par_override": opts.par,
+        "start_s": None,
+        "end_s": None,
+        "sample_dt": source.sample_dt,
+        "undecodable_frames": undecodable_frames(reader),
+    }
+    result = AnalysisResult(video=reader.info, scan=scan, calibration=calib_file.to_dict(), params=params,
+                            pitches=[], warnings=warnings, version=__version__)
+    save_results(result, out_dir)
+    return result, source
+
+
+def is_marking_session(result: AnalysisResult) -> bool:
+    """True for results made by `start_marking` (pitches marked by hand, no automatic search)."""
+    return (result.params or {}).get("mode") == "marked_by_hand"
 
 
 THROWBACK_WINDOW_S = 4.0      # catcher's return throw arrives this soon after a catch

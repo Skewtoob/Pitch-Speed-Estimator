@@ -757,10 +757,11 @@ class _FrameDrawer:
 
     def __init__(self, marks: list[PitchMark], timeline: Timeline, lookup: TransformLookup,
                  painter: Painter, interlaced: bool, missed: Sequence[tuple[int, int]] = (),
-                 sample_dt: float = 1001 / 60000):
+                 sample_dt: float = 1001 / 60000, show_list: bool = True):
         self.marks, self.timeline, self.lookup = marks, timeline, lookup
         self.p, self.interlaced = painter, interlaced
         self.missed = list(missed)
+        self.show_list = show_list
         self.fade_in = max(1, round_half_up(FADE_IN_S / sample_dt))
         self.fade_out = max(1, round_half_up(FADE_OUT_S / sample_dt))
 
@@ -790,7 +791,8 @@ class _FrameDrawer:
                 card_path = disp
         if st.card is not None:
             self.p.speed_card(img, st.card, self.marks[st.card], self._card_opacity(st.card, s), card_path)
-        self.p.pitch_list(img, self.marks, st.done[-40:])                     # only the last ones fit
+        if self.show_list:
+            self.p.pitch_list(img, self.marks, st.done[-40:])                 # only the last ones fit
         self.p.hud(img, t, frame, s, self.interlaced)
         if any(a <= s <= b for a, b in self.missed):
             self.p.hint(img, "possible missed pitch here? (not measured - check in review)")
@@ -988,13 +990,17 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
                      transforms: Optional[np.ndarray] = None, transform_samples: Optional[np.ndarray] = None,
                      size=(960, 720), audio: bool = True, progress=None, *,
                      writer_factory: Optional[Callable[..., Any]] = None,
-                     info: Optional[dict] = None, style: str = "radar") -> str:
+                     info: Optional[dict] = None, style: str = "radar",
+                     windows: Optional[Sequence[tuple[int, int]]] = None, show_list: bool = True) -> str:
     """Write the annotated video; returns the path actually written.
 
     mode: 'full' (whole video) or 'highlights' (around each pitch).
     style: 'radar' (radar-gun card, fitted path with dots) or 'classic'
         (plain OpenCV look).  'radar' falls back to 'classic' when Pillow or
         the bundled font cannot be loaded (info['style'] / info['note']).
+    windows: highlights mode only - render these [s0, s1) sample windows
+        instead of the ones around every pitch (render/clips.py: one pitch).
+    show_list: draw the running list of pitches (top right).
     transforms / transform_samples: per-sample (n, 2, 3) or (n, 3, 3)
         (sample -> reference) stabilization transforms and their sample
         indices (pipeline.load_transforms); None = static camera.
@@ -1028,7 +1034,12 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     out_dt = 1.0 / float(fps)
     marks = build_marks(result, _to_sample_fn(source))
     timeline = Timeline(marks, round_half_up(HOLD_S / sample_dt))
-    if mode == "full":
+    if windows is not None:
+        if mode != "highlights":
+            raise ValueError("windows can only be given with mode='highlights'")
+        windows = [(max(0, int(a)), min(n, int(b))) for a, b in windows]
+        windows = [(a, b) for a, b in windows if b > a]
+    elif mode == "full":
         windows = [(0, n)] if n > 0 else []
     else:
         windows = highlight_windows(marks, n, int(math.ceil(PRE_S / sample_dt)), int(math.ceil(POST_S / sample_dt)))
@@ -1039,7 +1050,8 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     factory = writer_factory or _default_writer
     painter = _make_painter((w, h), style, notes)
     drawer = _FrameDrawer(marks, timeline, TransformLookup(transforms, transform_samples), painter,
-                          bool(getattr(source, "interlaced", False)), missed_windows(result), sample_dt)
+                          bool(getattr(source, "interlaced", False)), missed_windows(result), sample_dt,
+                          show_list=show_list)
     sar = _sar(source, result)
     highlights_audio = mode == "highlights" and audio_src is not None
     video_target = (os.path.splitext(out_path)[0] + ".highlights-tmp.mp4") if highlights_audio else out_path

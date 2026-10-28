@@ -735,6 +735,18 @@ class SampleSource:
             return 2 * frame + int(k)
         return max(0, (frame - self.frame_phase) // self.frame_step)
 
+    def set_field_order(self, order: str) -> None:
+        """Switch the field order of an interlaced source in place (e.g. the user saw motion jump
+        back and forth).  Sample s keeps its time but now shows the other field of the same
+        frame, so a mark made on the image of sample s belongs at s ^ 1 afterwards.  The ScanInfo
+        (shared with the results) is updated too."""
+        if not self.interlaced:
+            raise ValueError("progressive video has no field order")
+        if order not in ("tff", "bff"):
+            raise ValueError(f"field order must be 'tff' or 'bff', got {order!r}")
+        self.scan.field_order = order
+        self._first_parity = 0 if order == "tff" else 1
+
     def parity(self, k: int) -> int:
         """Field parity (0 top, 1 bottom) of temporal position k."""
         return (int(k) ^ self._first_parity) if self.interlaced else 0

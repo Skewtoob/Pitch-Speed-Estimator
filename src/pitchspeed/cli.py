@@ -6,7 +6,8 @@ Typical use (Windows: drag a video onto pitchspeed.bat, which runs `run`):
     pitchspeed calibrate game.avi      # click the rubber/plate (or release/catch)
     pitchspeed analyze game.avi        # find pitches, estimate speeds
     pitchspeed review game.avi         # check / fix / add pitches by hand
-    pitchspeed render game.avi         # write the annotated video
+    pitchspeed render game.avi         # write the annotated video (--mode clips: one per pitch)
+    pitchspeed mark game.avi           # mark the pitches by hand (any camera angle) -> one clip each
 
 Running `run` again on a video that already has results asks whether to
 keep them (default; straight to review) or to analyze again.  Analyzing
@@ -441,6 +442,11 @@ def _analyze(args, out_dir: str, cf=None):
         _check_calibration(cf, args.video, _video_info(args.video, out_dir, args.par), interactive=False)
     opts = AnalyzeOptions(field_order=args.field_order, par=args.par, start_s=args.start,
                           end_s=args.end, debug=args.debug)
+    from pitchspeed.calib.model import is_manual
+    if is_manual(cf):
+        raise SystemExit(f"This video is set up for marking the pitches by hand, so there is nothing to search "
+                         f"automatically.\n  Mark them:  pitchspeed mark \"{args.video}\"\n  Or click the rubber "
+                         f"and plate for the automatic search:  pitchspeed calibrate \"{args.video}\"")
     result, source = analyze(args.video, cf, out_dir, opts)
     print()
     print(format_table(result))
@@ -462,9 +468,56 @@ def _wait_until_writable(path: str) -> None:
             return
 
 
-def _render(result, source, out_dir: str, mode: str, audio: bool, style: str = "radar") -> Optional[str]:
+def _render_clips(result, source, out_dir: str, audio: bool, style: str = "radar",
+                  originals: bool = True) -> Optional[str]:
+    """One clip per pitch (render/clips.py); returns the clips folder or None."""
+    from pitchspeed.pipeline import Progress, load_transforms
+    from pitchspeed.render.clips import render_clips
+    if not any(p.status != "rejected" for p in result.pitches):
+        print("\nNo pitches, so no clips were written.")
+        return None
+    tf, ts = load_transforms(out_dir)
+    print("\nWriting one clip per pitch ...")
+    prog = {"p": None}
+
+    def progress(done, total):
+        if prog["p"] is None:
+            prog["p"] = Progress(total, "clips")
+        prog["p"].update(done)
+
+    info: dict = {}
+    try:
+        clips = render_clips(result, source, out_dir, transforms=tf, transform_samples=ts, audio=audio,
+                             progress=progress, style=style, originals=originals, info=info)
+    except ValueError as e:
+        print(f"\nNo clips were written: {e}")
+        return None
+    except (OSError, RuntimeError) as e:
+        print(f"\nCould not write the clips: {e}\n  (the results themselves are saved; try again with:  "
+              f"pitchspeed render \"{os.path.basename(result.video.path or 'VIDEO')}\" --mode clips)")
+        return None
+    if prog["p"] is not None:
+        prog["p"].done()
+    folder = info.get("folder", os.path.join(out_dir, "clips"))
+    print(f"Clips: {len(clips)} in {folder}")
+    if info.get("originals"):
+        print(f"  untouched copies of the original video: {os.path.join(folder, 'originals')} "
+              f"({len(info['originals'])})")
+    for note in (info.get("notes") or [])[:12]:
+        print(f"  note: {note}")
+    if len(info.get("notes") or []) > 12:
+        print(f"  ... and {len(info['notes']) - 12} more notes (see the log)")
+    if info.get("removed"):
+        print(f"  removed {len(info['removed'])} out-of-date clip(s) from the previous time")
+    return folder
+
+
+def _render(result, source, out_dir: str, mode: str, audio: bool, style: str = "radar",
+            originals: bool = True) -> Optional[str]:
     from pitchspeed.pipeline import Progress, load_transforms
     from pitchspeed.render.overlay import render_annotated
+    if mode == "clips":
+        return _render_clips(result, source, out_dir, audio, style, originals)
     tf, ts = load_transforms(out_dir)
     out = out_paths(out_dir)["annotated"]
     if mode == "highlights" and not any(p.status != "rejected" for p in result.pitches):
@@ -512,8 +565,10 @@ def cmd_analyze(args) -> int:
     return 0
 
 
-def _review(args, out_dir: str, source=None, result=None, cf=None):
-    from pitchspeed.pipeline import load_transforms, make_recompute, renumber, save_results
+def _review(args, out_dir: str, source=None, result=None, cf=None, mode: Optional[str] = None):
+    """Open the review window (mode 'mark' for a session marked by hand: long-tape navigation)."""
+    from pitchspeed.calib.model import is_manual
+    from pitchspeed.pipeline import is_marking_session, load_transforms, make_recompute, renumber, save_results
     from pitchspeed.review.ui import run_review_ui
     if result is None:
         result = _load_results(out_dir)
@@ -529,11 +584,19 @@ def _review(args, out_dir: str, source=None, result=None, cf=None):
         renumber(res.pitches)
         save_results(res, out_dir, csv_retry_s=0.0)
 
-    print("\nOpening the review window. Press H in the window for help.")
+    if mode is None:
+        mode = "mark" if (is_marking_session(result) or is_manual(cf)) else "review"
+    if mode == "mark":
+        print("\nOpening the video. Space plays (+ faster, - slower), J/L jump 1 second, click the bar at the\n"
+              "bottom to jump anywhere. At each pitch press N at the release, then C at the glove (or B if\n"
+              "the batter hit it). H shows all keys; Q saves and quits. Everything is saved as you go.")
+    else:
+        print("\nOpening the review window. Press H in the window for help.")
     recompute = make_recompute(cf, result.scan, source, video=result.video,
                                undecodable=(result.params or {}).get("undecodable_frames"))
     result = run_review_ui(result, source, cf, recompute, save,
-                           transforms=tf, transform_samples=ts, ui_scale=getattr(args, "ui_scale", None))
+                           transforms=tf, transform_samples=ts, ui_scale=getattr(args, "ui_scale", None),
+                           mode=mode)
     _final_save(result, out_dir)
     return result, source
 
@@ -549,12 +612,105 @@ def cmd_review(args) -> int:
     return 0
 
 
+def _ask_method() -> str:
+    """'auto' or 'mark': how to find the pitches of a video that has no setup yet."""
+    print("\nHow should the pitches be found?")
+    print("  1) automatically - you click the pitching rubber and home plate once (again if the camera")
+    print("     moves or zooms). Best for a camera on a tripod.")
+    print("  2) by hand - you press a key at each pitch's release and at the catch. Any camera angle;")
+    print("     the camera may move and zoom. Speeds are typically within about 2-3 mph.")
+    while True:
+        a = (_ask("Choose 1 or 2", "1") or "1").strip().lower()
+        if a in ("1", "a", "auto", "automatic"):
+            return "auto"
+        if a in ("2", "m", "h", "hand", "mark"):
+            return "mark"
+
+
+def _marking_setup(args, out_dir: str):
+    """(result, source, calibration) for marking pitches by hand: the saved session (or saved
+    results of any kind) when there is one for this video, else a new session.  None = stopped."""
+    from pitchspeed.calib.model import manual_calibration
+    from pitchspeed.pipeline import start_marking, video_fingerprint
+    from pitchspeed.render.report import load_json
+    p = out_paths(out_dir)
+    cf, cpath = _load_calib(args, out_dir)
+    if cf is not None:
+        _apply_settings_flags(args, cf, cpath)
+    info = _video_info(args.video, out_dir, args.par)
+    if os.path.exists(p["results_json"]):
+        try:
+            saved = load_json(p["results_json"])
+        except (OSError, ValueError) as e:
+            saved = None
+            print(f"\nnote: the saved results.json cannot be read ({e}); starting a new session "
+                  f"(a copy of it is kept)")
+        if saved is not None and int(saved.video.n_frames) == int(info.n_frames):
+            n = sum(1 for q in saved.pitches if q.status != "rejected")
+            print(f"\nContinuing with the saved results: {n} pitch{'es' if n != 1 else ''} so far.")
+            source = _source_for_results(args, out_dir, saved)
+            return saved, source, _calibration_for_results(args, out_dir, saved, source)
+        if saved is not None:
+            print(f"\nnote: the saved results are for a video with {saved.video.n_frames} frames, this one has "
+                  f"{info.n_frames}: starting a new session (the old results are backed up)")
+    if cf is None:
+        print("\nSettings (marking by hand needs no clicks on the picture, only the pitching distance):")
+        st = _settings_from_args(args)
+        st.sar = float(info.sar)
+        cf = manual_calibration(st, image_size=(int(info.width), int(info.height)),
+                                video=video_fingerprint(args.video, info))
+        cf.save(cpath)
+        print(f"Saved the settings: {cpath}")
+    elif not _check_calibration(cf, args.video, info, interactive=True):
+        print("Stopped; nothing was changed.")
+        return None
+    print("\nOpening the video (checking the interlacing and field order) ...")
+    result, source = start_marking(args.video, cf, out_dir, AnalyzeOptions(field_order=args.field_order,
+                                                                           par=args.par))
+    for w in result.warnings[:6]:
+        print(f"  note: {w}")
+    return result, source, cf
+
+
+def _mark_flow(args, out_dir: str, guided: bool = False) -> int:
+    from pitchspeed.render.report import format_table
+    if guided:
+        print("\nStep 1/3: settings")
+    setup = _marking_setup(args, out_dir)
+    if setup is None:
+        return 1
+    result, source, cf = setup
+    if guided:
+        print("\nStep 2/3: mark the pitches")
+    result, source = _review(args, out_dir, source, result=result, cf=cf, mode="mark")
+    print()
+    print(format_table(result))
+    what = args.render
+    if guided:
+        what = (_ask("\nStep 3/3: write the videos? (clips = one per pitch / full / highlights / none)",
+                     "clips") or "clips").strip().lower()
+        what = next((m for m in ("clips", "full", "highlights", "none") if m.startswith(what[:1] or "c")), "clips")
+    if what != "none":
+        _render(result, source, out_dir, what, not args.no_audio)
+    if guided:
+        print("\nDone.")
+    return 0
+
+
+def cmd_mark(args) -> int:
+    _check_video(args.video)
+    out_dir = _out_dir(args)
+    os.makedirs(out_dir, exist_ok=True)
+    return _mark_flow(args, out_dir)
+
+
 def cmd_render(args) -> int:
     _check_video(args.video)
     out_dir = _out_dir(args)
     result = _load_results(out_dir)
     source = _source_for_results(args, out_dir, result)
-    _render(result, source, out_dir, args.mode, not args.no_audio, getattr(args, "style", "radar"))
+    _render(result, source, out_dir, args.mode, not args.no_audio, getattr(args, "style", "radar"),
+            originals=not getattr(args, "no_originals", False))
     return 0
 
 
@@ -602,11 +758,33 @@ def _keep_saved_results(args, out_dir: str, cf, info):
     return saved, source, use
 
 
+def _is_marking_folder(cf, out_dir: str) -> bool:
+    """The saved setup / results of this video are a session marked by hand."""
+    from pitchspeed.calib.model import is_manual
+    if is_manual(cf):
+        return True
+    p = out_paths(out_dir)["results_json"]
+    if cf is None and os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                import json
+                return (json.load(f).get("params") or {}).get("mode") == "marked_by_hand"
+        except (OSError, ValueError, AttributeError):
+            return False
+    return False
+
+
 def cmd_run(args) -> int:
     _check_video(args.video)
     out_dir = _out_dir(args)
     os.makedirs(out_dir, exist_ok=True)
     cf, cpath = _load_calib(args, out_dir)
+    if _is_marking_folder(cf, out_dir):
+        print("This video's pitches are marked by hand (no automatic search).")
+        return _mark_flow(args, out_dir, guided=True)
+    if cf is None and not args.view and not os.path.exists(out_paths(out_dir)["results_json"]):
+        if _ask_method() == "mark":
+            return _mark_flow(args, out_dir, guided=True)
     info = None
     fresh = False
     if cf is not None:
@@ -644,9 +822,10 @@ def cmd_run(args) -> int:
     a = (_ask("\nStep 3/4: open the review window to check/fix pitches? (y/n)", "y") or "y").lower()
     if a.startswith("y"):
         result, source = _review(args, out_dir, source, result=result, cf=cf)
-    a = (_ask("\nStep 4/4: write the annotated video? (full / highlights / none)", args.render) or "full").lower()
-    if a.startswith("f") or a.startswith("h"):
-        _render(result, source, out_dir, "highlights" if a.startswith("h") else "full", not args.no_audio)
+    a = (_ask("\nStep 4/4: write the annotated video? (full / highlights / clips = one per pitch / none)",
+              args.render) or "full").lower()
+    if a[:1] in ("f", "h", "c"):
+        _render(result, source, out_dir, {"f": "full", "h": "highlights", "c": "clips"}[a[:1]], not args.no_audio)
     print("\nDone.")
     return 0
 
@@ -687,8 +866,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--calib", help="calibration file (default: <out>/calibration.json)")
         p.add_argument("--ui-scale", type=float, help="enlarge (e.g. 1.5) or shrink the click/review windows")
 
-    def settings_args(p):
-        p.add_argument("--view", choices=["side", "behind"], help="camera position")
+    def settings_args(p, view=True):
+        if view:
+            p.add_argument("--view", choices=["side", "behind"], help="camera position")
         p.add_argument("--level", help=f"league preset: {', '.join(C.LEVELS)}")
         p.add_argument("--distance", type=float, help="rubber-to-plate distance in feet (overrides --level)")
         p.add_argument("--sport", choices=list(SPORTS),
@@ -703,8 +883,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--start", type=float, help="only analyze from this time (seconds)")
         p.add_argument("--end", type=float, help="only analyze up to this time (seconds)")
         p.add_argument("--debug", action="store_true", help="write debug images to <out>/debug")
-        p.add_argument("--render", choices=["full", "highlights", "none"], default="full",
-                       help="annotated video to write (default: full)")
+        p.add_argument("--render", choices=["full", "highlights", "clips", "none"], default="full",
+                       help="annotated video to write (default: full; clips = one per pitch)")
         p.add_argument("--no-audio", action="store_true", help="do not copy audio into the annotated video")
 
     p = sub.add_parser("probe", help="show video format, interlacing and field order")
@@ -726,20 +906,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("review", help="check, fix, reject or add pitches by hand")
     common(p)
-    p.add_argument("--render", choices=["full", "highlights", "none"], default="none",
-                   help="re-render the annotated video afterwards")
+    p.add_argument("--render", choices=["full", "highlights", "clips", "none"], default="none",
+                   help="re-render the annotated video afterwards (clips = one per pitch)")
     p.add_argument("--no-audio", action="store_true")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("render", help="write the annotated video from saved results")
     common(p, calib=False)
-    p.add_argument("--mode", choices=["full", "highlights"], default="full")
+    p.add_argument("--mode", choices=["full", "highlights", "clips"], default="full",
+                   help="full video, only the pitches, or one clip per pitch (in <out>/clips)")
     p.add_argument("--style", choices=["radar", "classic"], default="radar",
                    help="radar: radar-gun speed display and ball path (default); classic: plain text")
+    p.add_argument("--no-originals", action="store_true",
+                   help="clips mode: no untouched copies of the original video")
     p.add_argument("--no-audio", action="store_true")
     p.set_defaults(func=cmd_render)
 
-    p = sub.add_parser("run", help="guided: calibrate (if needed) -> analyze -> review -> render")
+    p = sub.add_parser("mark", help="mark the pitches by hand (any camera angle, no clicks on the picture), "
+                                    "then write one clip per pitch")
+    common(p)
+    settings_args(p, view=False)
+    p.add_argument("--render", choices=["clips", "full", "highlights", "none"], default="clips",
+                   help="what to write afterwards (default: clips = one per pitch)")
+    p.add_argument("--no-audio", action="store_true")
+    p.set_defaults(func=cmd_mark)
+
+    p = sub.add_parser("run", help="guided: calibrate (if needed) -> analyze -> review -> render; or mark "
+                                   "the pitches by hand")
     common(p)
     settings_args(p)
     analyze_args(p)

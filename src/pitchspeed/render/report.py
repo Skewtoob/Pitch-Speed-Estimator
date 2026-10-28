@@ -420,7 +420,7 @@ def _header_lines(result: AnalysisResult) -> list[str]:
     lvl = a.get("level", st.get("level"))
     n_ok = sum(1 for p in result.pitches if p.status != "rejected")
     n_rej = len(result.pitches) - n_ok
-    view_txt = " + ".join(views) or "?"
+    view_txt = " + ".join("marked by hand (any camera angle)" if v == "manual" else v for v in views) or "?"
     dist_txt = f"{float(dist):.1f} ft rubber->plate" if finite(dist) else "distance ?"
     lines.append(f"View: {view_txt} | {dist_txt}" + (f" (level {lvl})" if lvl else "")
                  + f" | {n_ok} pitch{'es' if n_ok != 1 else ''}"

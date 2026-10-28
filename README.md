@@ -57,7 +57,16 @@ macOS/Linux: `python3 -m venv .venv && .venv/bin/pip install -e .`, then
 
 ## How it works, step by step
 
-`pitchspeed run VIDEO` does four steps. You can also run each one on its own.
+The first time you run a video, the tool asks how to find the pitches:
+
+1. **Automatically** (steps 1-4 below): you click the pitching rubber and home
+   plate once, and the tool finds every pitch and tracks the ball. Best for a
+   camera on a tripod.
+2. **By hand** ([Marking pitches by hand](#marking-pitches-by-hand-any-camera-angle)):
+   you press a key at each release and catch. Works with any camera angle,
+   even if the camera moves or zooms, and on long tapes.
+
+`pitchspeed run VIDEO` does the four automatic steps. You can also run each one on its own.
 
 Running it again on the same video (e.g. dragging it onto `pitchspeed.bat`
 a second time) asks whether to **keep the saved results** and go straight
@@ -193,6 +202,70 @@ the original sound. It should play in the Windows Films & TV app and in VLC
 
 `pitchspeed render VIDEO --style classic` gives the earlier plain-text look.
 
+`pitchspeed render VIDEO --mode clips` writes **one short video per pitch**
+instead (see [One clip per pitch](#one-clip-per-pitch)).
+
+## Marking pitches by hand (any camera angle)
+
+Choose **2** when the tool asks how to find the pitches, or run
+`pitchspeed mark VIDEO`. There is nothing to click on the picture: the
+speed comes from the time between your two marks and the pitching
+distance, so the camera angle, zoom and camera movement don't matter.
+
+1. The console asks for the pitching distance (league) once.
+2. A window opens on the start of the video. Find the pitches:
+   - **Space** plays and pauses; **+** / **-** change the speed (up to 8x);
+   - **J** / **L** jump 1 second back / forward; **W** / **S** 10 fields;
+     **A** / **D** (or the arrow keys) one field;
+   - **click the bar at the bottom** to jump anywhere in the tape: it covers
+     the whole video and shows each pitch you've marked.
+3. At each pitch: step to the **first field with the ball out of the hand**
+   and press **N**, then step to the **first field with the ball in the
+   glove** and press **C** (or **B** at the bat if the batter hit it). The
+   speed appears right away. Space plays on to the next pitch.
+4. **PgUp** / **PgDn** go back through the pitches you've marked. Near a
+   pitch, R/C/B move its marks, X rejects it and U undoes. Keys never change
+   a pitch you're not near.
+   - **If motion jumps back and forth** when you step field by field (a
+     player seems to shake forward-back-forward), the tape's field order was
+     detected wrong: press **K** to switch it. The window says so at the
+     start when the detection was unsure. Marks you already made stay on the
+     same pictures.
+5. **Q** saves and quits (everything is also saved as you go). Then the tool
+   writes [one clip per pitch](#one-clip-per-pitch) (or the full or
+   highlights video if you choose).
+
+Running the same video again continues where you left off.
+
+**How accurate is it?** In a simulation where a quarter of the marks were
+one field off, hand-marked speeds were typically within about 2-3 mph
+(3-4 %), and the shown ± and 90% range matched what really happened. That
+is less precise than the automatic method on a good side view (about 1 %),
+but it works on any footage. Hand-marked pitches get the radar-gun display
+but no ball path (nothing tracked the ball). These numbers come from
+computer-made videos, not real tapes yet.
+
+**Several tapes:** select several video files and drag them onto
+`pitchspeed.bat` together; they are done one after the other.
+
+## One clip per pitch
+
+`pitchspeed render VIDEO --mode clips` (also offered at the end of
+`run` and `mark`) writes into `<video name>_pitchspeed\clips\`:
+
+- `P03_81mph.mp4`: the pitch with the radar-gun display (and the ball path
+  if it was tracked), from 2 s before the release to 3 s after the catch,
+  with sound. A rough estimate is named `P02_66mph_rough.mp4`, a pitch that
+  could not be measured `P05_no_speed.mp4`.
+- `originals\P03.avi` (or `.mpg`, ...): the same moment of your original
+  video, copied **without re-encoding**: same quality and same fields, ready
+  for your own editing. It starts about 1-1.5 s earlier than the clip, because
+  a copy without re-encoding can only start at certain frames.
+
+Making the clips again (after review edits) replaces the clips it made
+before, including ones whose name changed; other files you put in the
+folder are left alone. `--no-originals` skips the untouched copies.
+
 ## Output files
 
 All in `<video name>_pitchspeed\` next to the video:
@@ -202,7 +275,8 @@ All in `<video name>_pitchspeed\` next to the video:
 | `results.csv` | one row per pitch (Excel-friendly) |
 | `results.json` | everything, including ball tracks and the uncertainty breakdown |
 | `annotated.mp4` | the video with speeds overlaid |
-| `calibration.json` | your clicks and settings |
+| `clips\` | one video per pitch, and `clips\originals\` untouched copies (`--mode clips`) |
+| `calibration.json` | your clicks and settings (for marking by hand: only the settings) |
 | `results.backup-<date-time>.json` | your earlier results, kept whenever results with review edits were replaced |
 
 Two files with the same name but a different extension (`game1.avi` and an

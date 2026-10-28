@@ -241,9 +241,9 @@ interval coverage) and `synth/cli.py: main(argv)` used by `pitchspeed synth`.
 
 ### 3.7 pipeline + CLI (lead)
 
-`pitchspeed probe | calibrate | analyze | review | render | run | synth | evaluate | keys`.
+`pitchspeed probe | calibrate | analyze | review | render | mark | run | synth | evaluate | keys`.
 Output folder `<video stem>_pitchspeed/`: `calibration.json`,
-`results.json`, `results.csv`, `annotated.mp4`, `transforms.npz`, `log.txt`.
+`results.json`, `results.csv`, `annotated.mp4`, `clips/`, `transforms.npz`, `log.txt`.
 
 ## 4. Dev environment
 
@@ -316,3 +316,27 @@ results.json is always written before results.csv; a CSV locked by Excel
 is a warning, never a lost result.  The calibration's video fingerprint is
 checked; files with the same stem but different extensions get separate
 output folders.
+
+**Marking by hand (`pitchspeed mark`, `run` option 2).**  For footage the
+automatic finder cannot use (moving / zooming camera, many camera setups,
+long tapes).  The calibration has one segment with view `manual` and no
+points; the speed is E1 (time of flight) from the two hand marks, which
+needs only the settings (distance, extension, heights) - no image geometry.
+`pipeline.start_marking` detects the scan and writes an empty result
+(`params.mode = 'marked_by_hand'`); the review window runs in mode `mark`:
+the bar covers the whole tape, playback runs forward up to 8x without
+looping, J/L jump 1 s, and the current pitch is the one within 60 fields of
+the shown field, so keys never edit a pitch far away.  `analyze` refuses a
+`manual` calibration and skips `manual` segments.  Accuracy (simulation,
+a quarter of the marks one field off): RMS 3-4 %, coverage of the 90 %
+range 88-91 %.  The field order cannot be checked against ball tracks
+here, so a low-confidence scan widens the timing sigma (estimate.tof).
+
+**One clip per pitch (`render --mode clips`, render/clips.py).**  Per pitch:
+an overlay clip (`render_annotated` highlights mode on one window, running
+list hidden) and an untouched stream copy of the original (`ffmpeg -c
+copy`, started 1 s early because copies start at key frames and MPEG-PS
+seeking can land after the target; `.mkv` if the container refuses the
+streams).  `clips/clips.json` lists what was written, so re-rendering
+removes only its own stale files.
+

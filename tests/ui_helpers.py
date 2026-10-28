@@ -86,6 +86,12 @@ class FakeSource:
         self.reader = FakeReader(self)
         self._first_parity = 0 if field_order in (None, "tff") else 1
 
+    def set_field_order(self, order: str) -> None:
+        if not self.interlaced:
+            raise ValueError("progressive video has no field order")
+        self.field_order = self.scan.field_order = order
+        self._first_parity = 0 if order == "tff" else 1
+
     # index arithmetic
     def locate(self, s: int) -> tuple[int, int, int]:
         s = int(s)

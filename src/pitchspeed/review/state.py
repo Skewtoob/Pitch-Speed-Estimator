@@ -64,8 +64,18 @@ or 2x3 affine transforms from older files), like the automatic track.
 
 KEYS: see BINDINGS / HELP_TEXT.  Navigation follows the calibration
 window: Left/A Right/D one field (one frame in the full-frame view),
-Up/W Down/S ten fields back/forward,
+Up/W Down/S ten fields back/forward, J/L one second,
 PgUp/[ PgDn/] previous/next item, Home/End release/catch.
+
+MARK MODE (``mode='mark'``: `pitchspeed mark`, pitches marked by hand on a
+long tape).  The same keys and rules, plus:
+  * the timeline bar always covers the whole video (a click jumps there) and
+    shows every marked pitch as a tick;
+  * the "current" pitch is the one within PITCH_MARGIN fields of the shown
+    field (or none): R/C/B/X/Y act on it, so a key pressed far from every
+    pitch can never move a mark seconds away; N starts a new pitch anywhere;
+  * Space plays forward without looping, at 1/8x .. 8x (+ / -; above 1x
+    several fields are skipped per picture), and stops at the end.
 """
 from __future__ import annotations
 
@@ -83,6 +93,11 @@ from pitchspeed.ui.keys import key_label, resolve
 
 SPEEDS = (0.125, 0.25, 0.5, 1.0)
 SPEED_LABELS = ("1/8x", "1/4x", "1/2x", "1x")
+MARK_SPEEDS = (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+MARK_SPEED_LABELS = ("1/8x", "1/4x", "1/2x", "1x", "2x", "4x", "8x")
+MODES = ("review", "mark")
+MARK_START = ("MARK PITCHES: Space plays (+ faster, - slower), J/L = 1 second, click the bar to jump. "
+              "At each pitch: N at the release, then C at the glove (B if the batter hit it)")
 PITCH_MARGIN = 60          # fields shown before the release / after the catch (io_ux.md 4)
 WINDOW_MARGIN = 30         # fields around a possible-missed window or rejected track
 POINT_TOLERANCE = 3        # ball points may be added this many fields outside R..C
@@ -95,6 +110,8 @@ BINDINGS: dict[str, list[str]] = {
     "next_field": ["right", "d"],
     "back_10": ["up", "w"],
     "fwd_10": ["down", "s"],
+    "back_1s": ["j"],
+    "fwd_1s": ["l"],
     "prev_item": ["pgup", "["],
     "next_item": ["pgdn", "]"],
     "goto_release": ["home"],
@@ -115,6 +132,7 @@ BINDINGS: dict[str, list[str]] = {
     "track": ["t"],
     "loupe": ["z"],
     "toggle_view": ["f"],
+    "flip_order": ["k"],
     "others": ["o"],
     "help": ["h", "?", "f1"],
     "undo": ["u", "backspace"],
@@ -127,6 +145,8 @@ HELP_TEXT: dict[str, str] = {
     "next_field": "forward 1 field (1 frame in the full-frame view)",
     "back_10": "back 10 fields",
     "fwd_10": "forward 10 fields",
+    "back_1s": "back 1 second",
+    "fwd_1s": "forward 1 second",
     "prev_item": "previous pitch / window to check",
     "next_item": "next pitch / window to check",
     "goto_release": "go to the release (R)",
@@ -148,6 +168,8 @@ HELP_TEXT: dict[str, str] = {
     "track": "show / hide the ball track",
     "loupe": "8x loupe at the mouse",
     "toggle_view": "bobbed field / full frame view (marks only in the field view)",
+    "flip_order": "marking by hand: switch the field order (if motion jumps back and forth when you "
+                  "step field by field)",
     "others": "also list the tracks the finder rejected",
     "help": "this help",
     "undo": "undo (unlimited)",
@@ -354,7 +376,12 @@ class ReviewState:
     def __init__(self, result: AnalysisResult, timeline, recompute: Callable[[Pitch], Pitch],
                  save: Callable[[AnalysisResult], None], retrack: Optional[Callable[[Pitch], PitchTrack]] = None,
                  make_event: Optional[Callable[[int, str], EventTime]] = None,
-                 stab: Optional[StabilizeMap] = None):
+                 stab: Optional[StabilizeMap] = None, mode: str = "review"):
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+        self.mode = mode
+        self.speeds = MARK_SPEEDS if mode == "mark" else SPEEDS
+        self.speed_labels = MARK_SPEED_LABELS if mode == "mark" else SPEED_LABELS
         self.result = result
         self.tl = timeline
         self.recompute_cb = recompute
@@ -374,7 +401,7 @@ class ReviewState:
         self.marker = "R"
         self.draft: Optional[dict] = None
         self.playing = False
-        self.speed_i = 1
+        self.speed_i = self.speeds.index(1.0) if mode == "mark" else 1
         self.show_track = True
         self.show_others = False
         self.loupe = False
@@ -388,8 +415,16 @@ class ReviewState:
         self.pending: Optional[tuple] = None
         self.pick_radius = 10.0          # frame rows; set by the shell from the display scale
         self.last_action = ""
+        self.frames_changed = False      # set when the pictures of the samples changed (K)
         items = self.items()
-        if items:
+        if self.mode == "mark":
+            sc = getattr(result, "scan", None)
+            if getattr(timeline, "interlaced", False) and sc is not None and sc.confidence == "low":
+                self._say("FIELD ORDER UNCERTAIN: step through some motion with D; if it jumps back and forth, "
+                          "press K to switch it. Then: Space plays, N at a release, C at the catch", "warn")
+            else:
+                self._say(MARK_START, "ok")
+        elif items:
             self._goto_item(items[0].key)
         else:
             self._say("no pitches found: step through the video and press N at a release to add one", "warn")
@@ -471,18 +506,43 @@ class ReviewState:
         return a, max(a, b)
 
     def item_index(self) -> Optional[int]:
-        for i, it in enumerate(self.items()):
+        items = self.items()
+        self._sync_cur(items)
+        for i, it in enumerate(items):
             if it.key == self.cur:
                 return i
         return None
 
+    @property
+    def marking(self) -> bool:
+        return self.mode == "mark"
+
+    def _pitch_key_near(self, items: list[Item]) -> Optional[ItemKey]:
+        """Mark mode: the pitch within PITCH_MARGIN fields of the shown field (nearest), else None."""
+        best = None
+        for it in items:
+            if it.key.kind != "pitch":
+                continue
+            d = 0 if it.s0 <= self.s <= it.s1 else min(abs(self.s - it.s0), abs(self.s - it.s1))
+            if d <= PITCH_MARGIN and (best is None or d < best[0]):
+                best = (d, it.key)
+        return best[1] if best is not None else None
+
+    def _sync_cur(self, items: Optional[list[Item]] = None) -> None:
+        """Mark mode: the current pitch always follows the shown field (see module doc)."""
+        if self.marking and self.draft is None:
+            self.cur = self._pitch_key_near(self.items() if items is None else items)
+
     def current_item(self) -> Optional[Item]:
-        for it in self.items():
+        items = self.items()
+        self._sync_cur(items)
+        for it in items:
             if it.key == self.cur:
                 return it
         return None
 
     def current_entry(self) -> Optional[_Entry]:
+        self._sync_cur()
         if self.cur is not None and self.cur.kind == "pitch":
             return self.entry(self.cur.ref)
         return None
@@ -492,8 +552,10 @@ class ReviewState:
         return e.pitch if e is not None else None
 
     def _goto_item(self, key: Optional[ItemKey], where: str = "start") -> None:
+        # Find the item by key (not via current_item(): in mark mode that follows the shown
+        # field, which only moves to the item below).
+        it = next((x for x in self.items() if x.key == key), None) if key is not None else None
         self.cur = key
-        it = self.current_item()
         if it is None:
             return
         self.s = self._clamp(it.s1 if where == "end" else it.s0)
@@ -518,7 +580,10 @@ class ReviewState:
             self._say("rejected track: Y makes it a pitch, X confirms the rejection")
 
     def window(self) -> tuple[int, int]:
-        """Sample range [w0, w1] worth showing / looping for the current item or draft."""
+        """Sample range [w0, w1] worth showing / looping for the current item or draft
+        (mark mode: always the whole video)."""
+        if self.marking:
+            return 0, max(0, self.n_samples - 1)
         it = self.current_item()
         if self.draft is not None:
             a = self.draft["s_release"]
@@ -538,8 +603,11 @@ class ReviewState:
         if self.draft is not None:
             a = self.draft["s_release"]
             return self._clamp(a - PITCH_MARGIN), self._clamp(a + 4 * PITCH_MARGIN) + 1
-        if self.current_item() is None:
+        it = self.current_item()
+        if it is None:
             return None
+        if self.marking:
+            return self._clamp(it.s0 - PITCH_MARGIN), self._clamp(it.s1 + PITCH_MARGIN) + 1
         w0, w1 = self.window()
         return w0, w1 + 1
 
@@ -611,6 +679,15 @@ class ReviewState:
     def _do_fwd_10(self) -> None:
         self._step(10)
 
+    def _one_second(self) -> int:
+        return max(1, int(round(1.0 / float(self.tl.sample_dt))))
+
+    def _do_back_1s(self) -> None:
+        self._step(-self._one_second())
+
+    def _do_fwd_1s(self) -> None:
+        self._step(self._one_second())
+
     def _do_prev_item(self) -> None:
         self._move_item(-1)
 
@@ -628,7 +705,8 @@ class ReviewState:
     def _move_item(self, step: int) -> None:
         items = self.items()
         if not items:
-            self._say("nothing to review: press N at a release to add a pitch")
+            self._say("no pitches marked yet: press N at a release to add one" if self.marking else
+                      "nothing to review: press N at a release to add a pitch")
             return
         i = self.item_index()
         if i is None:
@@ -682,26 +760,44 @@ class ReviewState:
     # playback
     def _do_play(self) -> None:
         self.playing = not self.playing
+        if self.playing and self.marking:
+            if self.s >= self.n_samples - 1:
+                self.playing = False
+                self._say("end of the video (click the bar or press PgUp to go back)")
+            return
         if self.playing:
             w0, w1 = self.window()
             if not w0 <= self.s <= w1:
                 self.s = w0
 
     def _do_faster(self) -> None:
-        self.speed_i = min(len(SPEEDS) - 1, self.speed_i + 1)
-        self._say(f"playback {SPEED_LABELS[self.speed_i]}")
+        self.speed_i = min(len(self.speeds) - 1, self.speed_i + 1)
+        self._say(f"playback {self.speed_labels[self.speed_i]}")
 
     def _do_slower(self) -> None:
         self.speed_i = max(0, self.speed_i - 1)
-        self._say(f"playback {SPEED_LABELS[self.speed_i]}")
+        self._say(f"playback {self.speed_labels[self.speed_i]}")
 
     @property
     def play_speed(self) -> float:
-        return SPEEDS[self.speed_i]
+        return self.speeds[self.speed_i]
+
+    @property
+    def play_step(self) -> int:
+        """Fields advanced per shown picture: 1 up to 1x, else the speed (2x shows every 2nd field)."""
+        return max(1, int(round(self.play_speed))) if self.play_speed > 1.0 else 1
 
     def tick(self) -> None:
-        """Advance playback by one field (looping inside window())."""
+        """Advance playback: review mode loops one field at a time inside window();
+        mark mode runs forward by play_step fields and stops at the end."""
         if not self.playing:
+            return
+        if self.marking:
+            last = max(0, self.n_samples - 1)
+            self.s = min(last, self.s + self.play_step)
+            if self.s >= last:
+                self.playing = False
+                self._say("end of the video (Q saves and quits)")
             return
         w0, w1 = self.window()
         self.s = w0 if self.s >= w1 or self.s < w0 else self.s + 1
@@ -1021,7 +1117,8 @@ class ReviewState:
         self._commit()
         self.cur = ItemKey("pitch", e.uid)
         self.marker = "C"
-        self._say(f"manual pitch {e.pitch.number} added: {speed_text(e.pitch.speed)}", "ok")
+        more = " | Space plays on to the next pitch" if self.marking else ""
+        self._say(f"manual pitch {e.pitch.number} added: {speed_text(e.pitch.speed)}{more}", "ok")
 
     def _mark_windows_resolved(self, sr: int, sc: int, origin: Optional[ItemKey]) -> list:
         """Record review = 'pitch_added' on the possible-missed windows a new pitch accounts for.
@@ -1165,6 +1262,9 @@ class ReviewState:
         self._error_said = False
         what, uid = self.pending
         self.pending = None
+        if what == "flip_order":
+            self._flip_order()
+            return
         e = self.entry(uid)
         if what != "retrack" or e is None:
             return
@@ -1183,6 +1283,67 @@ class ReviewState:
 
         self._edit(e, "retrack", mutate, n_points=n)
         self._say(f"re-tracked: {n} ball points; {speed_text(self.current_pitch().speed)}", "ok")
+
+    # field order (marking by hand)
+    def _do_flip_order(self) -> None:
+        if not getattr(self.tl, "interlaced", False):
+            self._say("this video has whole frames only (not interlaced): there is no field order to switch")
+            return
+        if not self.marking:
+            self._say("the field order of analyzed results comes from the analysis: analyze again with "
+                      "--field-order tff or bff to change it", "warn")
+            return
+        auto = [e.pitch.number for e in self.entries if e.pitch.status != "manual"
+                or any(not pt.manual for pt in (e.pitch.track.points if e.pitch.track else []))]
+        if auto:
+            self._say("these results contain automatically found pitches: change the field order by analyzing "
+                      "again with --field-order tff or bff", "warn")
+            return
+        if not hasattr(self.tl, "set_field_order"):
+            self._say("the field order cannot be switched for this video source", "error")
+            return
+        self.pending = ("flip_order", None)
+        self._say("switching the field order ...")
+
+    def _flip_order(self) -> None:
+        """Switch TFF <-> BFF: sample s now shows the other field of its frame, so every mark,
+        clicked ball point and the current position move to s ^ 1 (same picture, time +-1/2
+        field); speeds are recomputed.  Undo history before the switch is dropped."""
+        sc = self.result.scan
+        old = (sc.field_order if sc is not None else None) or "tff"
+        new = "bff" if old == "tff" else "tff"
+        try:
+            self.tl.set_field_order(new)
+        except (ValueError, AttributeError) as ex:
+            self._say(f"the field order could not be switched: {ex}", "error")
+            return
+        if sc is not None:
+            sc.field_order, sc.source, sc.confidence = new, "user", "high"
+            sc.evidence = {**(sc.evidence or {}), "switched_by_user_from": old}
+        for e in self.entries:
+            p = e.pitch
+            for kind in ("release", "catch"):
+                ev = getattr(p, kind)
+                if ev is not None and ev.s is not None:
+                    ne = self.make_event(self._clamp(int(ev.s) ^ 1), kind)
+                    ne.point = getattr(ev, "point", None)
+                    setattr(p, kind, ne)
+            for pt in (p.track.points if p.track is not None else []):
+                pt.s = self._clamp(int(pt.s) ^ 1)
+                pt.t = float(self.tl.sample_time(pt.s))
+            p.edit_history.append({"action": "field_order_switched", "from": old, "to": new, "at": now_text()})
+            self._recompute(e)
+        if self.draft is not None:
+            self.draft["s_release"] = self._clamp(int(self.draft["s_release"]) ^ 1)
+        self.s = self._clamp(self.s ^ 1)
+        self.undo_stack.clear()
+        self.result.warnings = [w for w in (self.result.warnings or [])
+                                if not str(w).startswith("interlace/field-order detection is uncertain")]
+        self.result.warnings.append(f"field order switched by hand from {old.upper()} to {new.upper()}")
+        self.frames_changed = True
+        self._commit()
+        self._say(f"field order switched to {new.upper()}: step through some motion again to check "
+                  f"(K switches back). Marks kept on the same pictures; undo history cleared", "ok")
 
     # undo / quit
     def _do_undo(self) -> None:
@@ -1261,6 +1422,10 @@ class ReviewState:
             sr = self.draft["s_release"]
             return (f"NEW MANUAL PITCH | release field {sr} ({format_time(self.tl.sample_time(sr))}) | "
                     f"now at field {self.s} (+{self.s - sr}) | press C at the catch (B if hit), Esc cancels")
+        if it is None and self.marking:
+            n = sum(1 for e in self.entries if e.pitch.status != "rejected")
+            return (f"no pitch here | {format_time(self.tl.sample_time(self.s))} of {self._total_text()} | "
+                    f"{n} pitch{'es' if n != 1 else ''} marked | N = new pitch at its release")
         if it is None:
             return f"no item selected | field {self.s} | PgUp/PgDn: pitches | N: add a pitch at its release"
         if it.key.kind == "missed":
@@ -1315,15 +1480,25 @@ class ReviewState:
                 rel = f" | R{self.s - r:+d}"
             if c is not None:
                 rel += f" C{self.s - c:+d}"
-        play = f" | PLAY {SPEED_LABELS[self.speed_i]}" if self.playing else ""
+        play = f" | PLAY {self.speed_labels[self.speed_i]}" if self.playing else ""
+        if self.marking:
+            n = sum(1 for e in self.entries if e.pitch.status != "rejected")
+            return (f"MARK | {n} marked | {where} | {format_time(self.tl.sample_time(self.s))} / "
+                    f"{self._total_text()}{rel}{play} | H = help")
         return f"REVIEW | {pos} | {where} | {format_time(self.tl.sample_time(self.s))}{rel}{play} | H = help"
+
+    def _total_text(self) -> str:
+        return format_time(self.tl.sample_time(max(0, self.n_samples - 1)))
 
     def markers(self) -> dict:
         """Timeline data for the bottom strip."""
         w0, w1 = self.window()
         p = self.current_pitch()
         out = {"w0": w0, "w1": w1, "s": self.s, "R": None, "C": None, "points": [], "selected": self.marker,
-               "draft": self.draft["s_release"] if self.draft else None}
+               "draft": self.draft["s_release"] if self.draft else None,
+               "pitches": [(it.s0, it.s1, self.entry(it.key.ref).pitch.status) for it in self.items()
+                           if it.key.kind == "pitch" and self.entry(it.key.ref) is not None]
+               if self.marking else []}
         it = self.current_item()
         if p is not None:
             out["R"], out["C"] = self.ev_s(p.release), self.ev_s(p.catch)
@@ -1367,12 +1542,15 @@ class ReviewState:
 
     def hint_text(self) -> str:
         p = self.current_pitch()
+        if self.marking and self.draft is None and p is None:
+            return "Space play | + - speed | J/L 1 s | W/S 10 fields | A/D 1 field | N new pitch | PgUp/PgDn marked pitches"
         if self.draft is not None or (p is not None and p.status == "manual") or self.current_entry() is None:
             return MANUAL_HINT
         return "R/C set marks here | , . nudge | Y accept | X reject | E re-track | Space play"
 
     def help_rows(self) -> list[tuple[str, str]]:
-        rows = [("", MANUAL_HINT)]
+        rows = [("", MARK_START)] if self.marking else []
+        rows += [("", MANUAL_HINT)]
         rows += [(key_label(BINDINGS[a]), HELP_TEXT[a]) for a in BINDINGS]
         rows += [("L-click", "add/move a manual ball point at this field"),
                  ("R-click", "remove a manual point / exclude-include an automatic one"),
