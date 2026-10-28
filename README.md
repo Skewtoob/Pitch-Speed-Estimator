@@ -30,7 +30,11 @@ timing precision compared with counting frames.
 1. Install **Python 3.10 or newer (64-bit)** from
    [python.org](https://www.python.org/downloads/). The default options are fine.
 2. Download this project (green **Code** button → **Download ZIP**) and unzip
-   it, e.g. to `C:\pitchspeed`.
+   it to a normal folder such as `Documents` or `C:\pitchspeed`. **Not**
+   `C:\Program Files`: Windows only lets a program change that folder when it
+   was started with *Run as administrator*. If you did unzip it there, the
+   installer offers to copy itself to `C:\Users\<you>\pitchspeed`. You can
+   also right-click `install.bat` and choose *Run as administrator*.
 3. Double-click **`windows\install.bat`**. It creates a private Python
    environment in `.venv` and installs everything (a few minutes the first time).
 
