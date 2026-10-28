@@ -241,7 +241,7 @@ class Scene:
                      (cb + [0.6, 0.3, 2.4], gl, 0.2, (70, 60, 60)),
                      (gl, gl + [0, -0.05, 0], 0.42, (30, 60, 110))]
         if D["umpire"] and people:
-            ub = np.array([0.4, -5.8, 0.0])
+            ub = np.array([float(D.get("umpire_x_ft", -0.8)), -5.6, 0.0])     # in the slot (batter side)
             caps += [(ub + [0, 0, 0.5], ub + [0, 0, 3.6], 0.85, (60, 40, 30)),
                      (ub + [0, 0, 4.1], ub + [0, 0, 4.3], 0.45, (40, 40, 40))]
         if D["batter"] and people and p is not None:

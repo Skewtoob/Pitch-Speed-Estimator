@@ -31,6 +31,11 @@ FPS_NUM, FPS_DEN = 30000, 1001
 FRAME_DT = FPS_DEN / FPS_NUM               # 1001/30000 s
 FIELD_DT = FPS_DEN / (2 * FPS_NUM)         # 1001/60000 s
 MPH = C.MPH_TO_FTPS                        # ft/s per mph (22/15)
+
+
+def field_time(k: int) -> float:
+    """Exposure midpoint of global field k: k * 1001/60000 s (correctly rounded)."""
+    return int(k) * FPS_DEN / (2 * FPS_NUM)
 G = C.G_FTPS2
 BALL_R_FT = C.BALL_DIAMETER_FT / 2.0
 
@@ -122,12 +127,13 @@ DEFAULT_CONFIG: dict = {
     "camera": {
         "view": "side",                    # side | behind | custom
         "side": "1b",                      # side view: camera on the 1b | 3b side
-        "distance_ft": 70.0,               # side: from the pitch-line midpoint
+        "distance_ft": 90.0,               # side: from the pitch-line midpoint
         "angle_deg": 90.0,                 # side: optical axis vs pitch line (<90: toward home)
         "height_ft": 5.0,
         "back_ft": 25.0,                   # behind: distance behind the plate apex
         "lateral_ft": 0.0,                 # behind: +x offset
-        "hfov_deg": None,                  # None = auto-fit rubber..plate into the frame
+        "hfov_deg": None,                  # None = auto-fit the pitch into the frame (camera.fit_points)
+        "max_hfov_deg": 55.0,              # auto-fit limit: wide end of an early-2000s camcorder
         "fit_margin": 0.12,
         "roll_deg": 0.0,
         "k1": 0.0,                         # lens distortion: NOT modelled, must be 0
@@ -141,19 +147,22 @@ DEFAULT_CONFIG: dict = {
         "count": 3, "schedule": None,      # schedule: [{t_release?, speed_mph?, cd?, ...}, ...]
         "first_t": 3.0, "gap_s": [5.0, 7.0],
         "speed_mph": "auto", "cd": [0.30, 0.40],
-        "extension_ft": "auto", "release_z_ft": "auto", "release_x_ft": [-1.8, 1.8],
+        "extension_ft": "auto",            # release point in front of the rubber (true value kept in GT)
+        "release_z_ft": "auto",            # release height above the rubber (mound) top
+        "release_x_ft": [-1.8, 1.8],
         "target_x_ft": [-0.7, 0.7], "target_z_ft": [1.6, 3.4],
         "magnus_x": [-10.0, 10.0], "magnus_z": [-6.0, 14.0],
         "catch_behind_ft": [0.8, 2.0], "wind_mph": [0.0, 0.0],
         "hand_time_s": 0.06,               # ball rides the hand this long before release
         "end_margin_s": 0.5,               # last catch must be this far before the clip end
     },
-    "render": {"shutter_s": 1 / 250, "vertical_aperture": 2.0, "lens_sigma_px": 0.0,
+    "render": {"shutter_s": 1 / 250, "lens_sigma_px": 0.0,
                "psf_sigma_px": 0.7, "ball_value": 235, "segments": 6, "draw_balls": True},
     "noise": {"sigma0": 3.0, "beta": 0.02, "chroma_sigma": 4.0},
     "tape": {"profile": "vhs"},
     "date_stamp": {"enabled": True, "text_date": "OCT 12 2003", "start_hms": [16, 35, 2]},
     "distractors": {"pitcher": True, "catcher": True, "umpire": True, "batter": True,
+                    "umpire_x_ft": -0.8,           # umpire in the slot between catcher and (right-handed) batter
                     "swing_prob": 0.5, "throwback": True, "birds": 1},
     "fence": {                             # out-of-focus backstop chain-link in front of the camera
         "enabled": "auto",                 # auto = on for behind views
@@ -167,7 +176,7 @@ DEFAULT_CONFIG: dict = {
         "opacity": 1.0,
     },
     "scene": {"pole": {"enabled": "auto",  # vertical pole (calibration vertical_top/bottom); auto = side
-                       "x_ft": None, "y_ft": None, "height_ft": 12.0, "radius_ft": 0.25,
+                       "x_ft": None, "y_ft": None, "height_ft": 20.0, "radius_ft": 0.25,
                        "value": 140}},
     "capture": {"drop_frames": [], "dup_frames": []},
     "calibration": {"clear_field_s": 1.5,  # no people before this time; reference frame inside
@@ -256,6 +265,11 @@ def resolve_config(config: Optional[dict] = None) -> dict:
         raise ValueError("video.postprocess applies to interlaced renders only")
     if int(V["width"]) % 2 or int(V["height"]) % 4:
         raise ValueError("video.width must be even and video.height a multiple of 4")
+    codecs_used = [V["codec"]] + [ex.get("codec", V["codec"]) for ex in V.get("extra_outputs") or []]
+    if "dv" in codecs_used and (int(V["width"]), int(V["height"])) != (720, 480):
+        raise ValueError("codec 'dv' needs 720x480 (NTSC DV raster)")
+    if V["scan"] == "progressive60" and "dv" in codecs_used:
+        raise ValueError("codec 'dv' cannot store progressive60")
     if float(cam.get("k1") or 0.0) != 0.0:
         raise ValueError("camera.k1 (lens distortion) is not modelled; leave it at 0")
     if cam["view"] == "custom" and (cam.get("C") is None or cam.get("look_at") is None):

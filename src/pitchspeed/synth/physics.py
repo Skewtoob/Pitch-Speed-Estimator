@@ -88,21 +88,27 @@ class Trajectory:
              + (3 * u2 - 2 * u) * v1)
         return p, v
 
-    def time_at_y(self, y: float) -> float:
-        """First time the ball's y coordinate drops to `y` (bisection on the interpolant)."""
-        ys = self.S[:, 1]
-        below = np.nonzero(ys <= y)[0]
-        if len(below) == 0:
-            raise ValueError(f"trajectory never reaches y={y:.3f} ft (min y {ys.min():.3f})")
-        i = max(int(below[0]) - 1, 0)
+    def time_at(self, axis: int, value: float, increasing: bool = False) -> float:
+        """First time coordinate `axis` crosses `value` (downward, or upward if `increasing`)."""
+        c = self.S[:, axis]
+        hit = np.nonzero(c >= value if increasing else c <= value)[0]
+        if len(hit) == 0:
+            raise ValueError(f"trajectory never reaches {'xyz'[axis]}={value:.3f} ft "
+                             f"(range {c.min():.3f}..{c.max():.3f})")
+        i = max(int(hit[0]) - 1, 0)
         lo, hi = self.t0 + i * self.dt, self.t0 + (i + 1) * self.dt
         for _ in range(60):
             m = 0.5 * (lo + hi)
-            if self.state(m)[0][1] > y:
+            q = self.state(m)[0][axis]
+            if (q < value) if increasing else (q > value):
                 lo = m
             else:
                 hi = m
         return 0.5 * (lo + hi)
+
+    def time_at_y(self, y: float) -> float:
+        """First time the ball's y coordinate drops to `y` (a pitch travels toward -y)."""
+        return self.time_at(1, y, increasing=False)
 
     def path_length(self, ta: float, tb: float, n: int = 4000) -> float:
         P, _ = self.states(np.linspace(ta, tb, n + 1))

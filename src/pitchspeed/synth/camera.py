@@ -42,6 +42,25 @@ def rot_small(yaw: float, pitch: float, roll: float) -> np.ndarray:
     return Rz @ Rx @ Ry
 
 
+def fit_points(view: str, lev: LevelGeom) -> np.ndarray:
+    """World points the auto-framing keeps inside the image (with camera.fit_margin)."""
+    D = lev.distance_ft
+    if view == "behind":            # pitcher (ground .. 7 ft), plate, catch zone
+        pts = [[0, D, 0], [0, D, 7], [-1.2, 0.7, 0], [1.2, 0.7, 0], [0, -1.5, 0.8], [0, -1.5, 4.0]]
+    else:                           # rubber (+7 ft) and the plate area with the catcher
+        pts = [[0, D, 0], [0, D, 7], [0, -3.5, 0], [0, -3.5, 5]]
+    return np.array(pts, dtype=float)
+
+
+def _angular_centre(C: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """A look-at point in the middle (azimuth and elevation) of the directions to pts."""
+    d = pts - C
+    az = np.arctan2(d[:, 0], d[:, 1])
+    el = np.arctan2(d[:, 2], np.hypot(d[:, 0], d[:, 1]))
+    a, e = 0.5 * (az.min() + az.max()), 0.5 * (el.min() + el.max())
+    return C + np.array([math.sin(a) * math.cos(e), math.cos(a) * math.cos(e), math.sin(e)])
+
+
 class Camera:
     """Base (un-shaken) camera of a clip."""
 
@@ -57,7 +76,7 @@ class Camera:
             T = mid
         elif c["view"] == "behind":
             C = np.array([float(c["lateral_ft"]), -float(c["back_ft"]), float(c["height_ft"])])
-            T = np.array([0.0, rel_y * 0.55, 3.5])
+            T = _angular_centre(C, fit_points("behind", lev))
         else:
             C = np.asarray(c["C"], dtype=float)
             T = np.asarray(c["look_at"], dtype=float)
@@ -66,15 +85,22 @@ class Camera:
         self.R0 = look_at(C, T, float(c.get("roll_deg", 0.0)))
         self.W, self.H, self.par = int(W), int(H), float(par)
         self.cx, self.cy = (W - 1) / 2.0, (H - 1) / 2.0
+        self.warnings: list = []
+        max_hfov = float(c.get("max_hfov_deg") or 55.0)
         if c.get("hfov_deg") is None:
-            # auto-fit rubber (ground and +7 ft) and the plate area (+ people heights)
-            pts = np.array([[0, lev.distance_ft, 0], [0, lev.distance_ft, 7], [0, -3, 0], [0, -3, 6],
-                            [0, -6, 0]], dtype=float)
+            pts = fit_points(c["view"], lev)
             pc = (self.R0 @ (pts - C).T).T
             xn = max(float(np.abs(pc[:, 0] / pc[:, 2]).max()), 1e-6)
             yn = max(float(np.abs(pc[:, 1] / pc[:, 2]).max()), 1e-6)
             m = float(c["fit_margin"])
             fx = min((W / 2) * (1 - m) / xn, (H / 2) * (1 - m) / (yn * par))
+            fx_min = (W / 2) / math.tan(math.radians(max_hfov) / 2)
+            if fx < fx_min:
+                need = 2 * math.degrees(math.atan((W / 2) / fx))
+                self.warnings.append(f"camera geometry needs a {need:.0f} deg field of view to frame the pitch; "
+                                     f"limited to camera.max_hfov_deg={max_hfov:.0f} (parts of the scene are "
+                                     f"out of frame)")
+                fx = fx_min
         else:
             fx = (W / 2) / math.tan(math.radians(float(c["hfov_deg"])) / 2)
         self.fx0 = float(fx)
@@ -141,9 +167,8 @@ class Shake:
         return rot_small(*self.angles(t)), self.zoom(t)
 
 
-def canvas_margin_px(cam: Camera, shake: Shake, duration_s: float, step_s: float = 1 / 30.0,
-                     extra: float = 24.0, lo: float = 64.0, hi: float = 480.0) -> int:
-    """Margin (output px) the background canvas needs to cover all shake/pan/zoom states."""
+def canvas_margin_needed(cam: Camera, shake: Shake, duration_s: float, step_s: float = 1 / 30.0) -> float:
+    """Largest distance (output px) an image corner moves outside the base view over the clip."""
     corners = np.array([[0, 0, 1], [cam.W - 1, 0, 1], [0, cam.H - 1, 1], [cam.W - 1, cam.H - 1, 1]], float).T
     worst = 0.0
     K0 = cam.K0
@@ -154,4 +179,13 @@ def canvas_margin_px(cam: Camera, shake: Shake, duration_s: float, step_s: float
         q = q[:2] / q[2]
         over = max(-q[0].min(), q[0].max() - (cam.W - 1), -q[1].min(), q[1].max() - (cam.H - 1), 0.0)
         worst = max(worst, float(over))
-    return int(min(max(worst + extra, lo), hi))
+    return worst
+
+
+MARGIN_MAX_PX = 480.0
+
+
+def canvas_margin_px(cam: Camera, shake: Shake, duration_s: float, extra: float = 24.0, lo: float = 64.0,
+                     hi: float = MARGIN_MAX_PX) -> int:
+    """Margin (output px) the background canvas needs to cover all shake/pan/zoom states (capped at hi)."""
+    return int(min(max(canvas_margin_needed(cam, shake, duration_s) + extra, lo), hi))

@@ -14,23 +14,35 @@ Index construction (``index_mode='auto'``), cheapest reliable method first:
 * ``container`` - intra-only codec (DV, MJPEG, HuffYUV, ...) in AVI / MOV /
   MP4: the container's own index (AVI idx1 / OpenDML, MOV sample table)
   lists every frame; for intra-only codecs DTS == PTS.  No data is read.
-* ``demux`` - codec without frame reordering (raw .dv, FFV1 in MKV, WMV2,
-  ...): read packets without decoding; every packet must carry a unique,
-  increasing PTS.
-* ``decode`` - everything else (MPEG-2, H.264, MPEG-4 ASP...): decode every
-  frame (no pixel conversion) and record the PTS the decoder outputs.  This
-  is the ground truth for what `iter_frames()` will deliver.
+* ``demux`` - read packets without decoding (raw .dv, FFV1 in MKV, WMV,
+  and also MPEG-2 / H.264, whose packet PTS are sorted into presentation
+  order); every packet must carry a PTS and the PTS must be unique.
+* ``decode`` - fallback: decode every frame (no pixel conversion) and record
+  the PTS the decoder outputs.  This is the ground truth for what
+  `iter_frames()` delivers, but costs a full decode (H.264 SD: ~300-700
+  frames/s).
 
-The container/demux indexes are validated by decoding the first and last
-frame; on any mismatch the reader falls back to a full decode index.
+A container/demux index is accepted only after decoding spot checks at the
+start, the middle and the end of the file: from the first keyframe of each
+check run, the decoded PTS must equal the indexed PTS one for one.  Frames
+that the decoder never outputs at the very start (leading B-frames of an
+open GOP) are dropped from the index; any other mismatch falls back to the
+full decode index.  During iteration every decoded PTS is checked against
+the index again: index entries that do not decode, or decoded frames that
+are not in the index, are logged and recorded in ``decode_errors`` (never
+silently skipped or substituted).
 
 Timing: the nominal frame duration dt is chosen from the stream's rate
-fields and common broadcast rates, matched against the median PTS step
-(raw .dv advertises a bogus avg_frame_rate of 60000/1; WMV/MKV have 1 ms
-time bases).  If every PTS lies within 0.25*dt of a grid point n*dt the
-video is constant-frame-rate ('cfr') and t_i = n_i*dt exactly (removes the
+fields and common broadcast rates, matched against the PTS (raw .dv
+advertises a bogus avg_frame_rate of 60000/1; WMV/MKV have 1 ms time
+bases).  If every PTS lies within 0.25*dt of a grid point n*dt the video is
+constant-frame-rate ('cfr') and t_i = n_i*dt exactly (removes the
 millisecond jitter); grid slots without a frame are reported as dropped
-frames (PTS gap > 1.5*dt).  Otherwise timing is 'vfr' and t_i = pts_i - pts_0.
+frames (PTS gap > 1.5*dt).  Otherwise timing is 'vfr' and t_i = pts_i - pts_0
+(if the PTS are not even increasing, t_i = i*dt is synthesized and a note
+says so).  Duplicate (repeated) frames cannot be seen in timestamps; they are
+found from content by `pitchspeed.io.interlace` and recorded with
+`VideoReader.note_duplicate_frames()`.
 
 Pixel aspect ratio (SAR, x_square = x * sar), in order of precedence:
 
@@ -62,17 +74,25 @@ from typing import Iterator, Optional, Sequence, Union
 import av
 import numpy as np
 
+try:
+    from av.video.reformatter import VideoReformatter as _Reformatter
+except ImportError:                      # pragma: no cover - older PyAV
+    _Reformatter = None
+
 from pitchspeed.types import VideoInfo
 
 log = logging.getLogger(__name__)
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-INDEX_CACHE_VERSION = 2
+INDEX_CACHE_VERSION = 3
 CFR_JITTER_TOL = 0.25        # max |pts - grid| as a fraction of dt for CFR
 DROP_GAP = 1.5               # a PTS step > DROP_GAP*dt marks a dropped frame
+MAX_GAP_FRACTION = 0.10      # a CFR grid may skip slots on at most this fraction of steps
 SEEK_PREROLLS_S = (1.5, 4.0, 12.0)   # seek this far before the target, then from the start
 FORWARD_DECODE_S = 2.0       # decode forward instead of seeking if target is this close ahead
+VALIDATE_RUN = 48            # frames decoded per index spot check
+MAX_LEADING_SKIP = 4         # leading frames the decoder may drop (open GOP at the start)
 
 _STANDARD_RATES = [Fraction(30000, 1001), Fraction(60000, 1001), Fraction(24000, 1001),
                    Fraction(25), Fraction(50), Fraction(30), Fraction(60), Fraction(24),
@@ -101,10 +121,27 @@ def _fmt(fmt: str) -> str:
         raise ValueError(f"unsupported fmt {fmt!r}; use 'gray', 'bgr', 'rgb' or 'both'") from None
 
 
-def _to_array(frame: "av.VideoFrame", fmt: str):
-    if fmt == "both":
-        return frame.to_ndarray(format="gray"), frame.to_ndarray(format="bgr24")
-    return frame.to_ndarray(format=fmt)
+class _Converter:
+    """Pixel conversion with cached swscale contexts.
+
+    Equivalent (bit-identical) to ``frame.to_ndarray(format=fmt)``, but
+    PyAV's to_ndarray builds a new swscale context for every new frame,
+    which made decoding 3-4x slower (measured: DV 176 -> 578 frames/s with
+    gray+BGR).  Not thread-safe: one converter per decoding loop.
+    """
+
+    def __init__(self):
+        self._r: dict = {}
+
+    def __call__(self, frame: "av.VideoFrame", fmt: str):
+        if fmt == "both":
+            return self(frame, "gray"), self(frame, "bgr24")
+        if _Reformatter is None:
+            return frame.to_ndarray(format=fmt)
+        r = self._r.get(fmt)
+        if r is None:
+            r = self._r[fmt] = _Reformatter()
+        return r.reformat(frame, format=fmt).to_ndarray()
 
 
 def _open_container(path: str):
@@ -197,6 +234,10 @@ def _grid_fit(rel: np.ndarray, dt: float):
     n = np.round(rel / dt).astype(np.int64)
     resid = rel - n * dt
     ok = bool(n[0] == 0 and (len(n) < 2 or np.all(np.diff(n) >= 1)))
+    if ok and len(n) > 1:
+        # Dropped frames are rare; a grid that needs many empty slots is the
+        # wrong rate (e.g. alternating 1.4/0.6-frame steps fit a 1.5x rate).
+        ok = float(np.mean(np.diff(n) > 1)) <= MAX_GAP_FRACTION
     return n, resid, ok and float(np.max(np.abs(resid))) < CFR_JITTER_TOL * dt
 
 
@@ -219,8 +260,9 @@ def analyze_timing(pts_s: np.ndarray, rate_candidates: Sequence = ()) -> TimingA
 
     `rate_candidates` are the stream's claimed rates (most trusted first);
     common broadcast rates are always tried too.  A rate is accepted when
-    every timestamp lies within 0.25*dt of a slot n*dt; among accepted rates
-    the one leaving the fewest empty slots (then the smallest residual) wins.
+    every timestamp lies within 0.25*dt of a slot n*dt and at most 10% of
+    the steps skip slots; among accepted rates the one leaving the fewest
+    empty slots (then the smallest residual) wins.
     """
     pts_s = np.asarray(pts_s, dtype=np.float64)
     n = len(pts_s)
@@ -236,12 +278,19 @@ def analyze_timing(pts_s: np.ndarray, rate_candidates: Sequence = ()) -> TimingA
     if len(pos) == 0:
         return TimingAnalysis(np.arange(n) / float(fallback), fallback, "vfr", [], 0.0,
                               ["all frames share one timestamp; times synthesized from the nominal rate"])
+    if np.any(steps <= 0):
+        # Broken timestamps: keeping them would make time run backwards.
+        rate = fallback
+        return TimingAnalysis(np.arange(n) / float(rate), rate, "vfr", [], 0.0,
+                              [f"timestamps are not strictly increasing ({int(np.sum(steps <= 0))} steps); "
+                               f"frame times synthesized as i / {_fraction_str(rate)} s - treat timing "
+                               f"as uncertain"])
     notes: list[str] = []
     best = _best_grid(rel, cands)
     if best is None:
         # The rate may be slightly off every standard (e.g. a capture clock): fit it.
         mean_step = float(rel[-1] / (n - 1))
-        n0, _, ok0 = _grid_fit(rel, mean_step)
+        n0, _, _ = _grid_fit(rel, mean_step)
         if n0[0] == 0 and np.all(np.diff(n0) >= 1) and n0[-1] > 0:
             dt_fit = float(np.dot(n0, rel) / np.dot(n0, n0))
             r_fit = Fraction(1.0 / dt_fit).limit_denominator(100000)
@@ -254,13 +303,22 @@ def analyze_timing(pts_s: np.ndarray, rate_candidates: Sequence = ()) -> TimingA
         dropped = [int(i) for i in np.nonzero(np.diff(grid) >= 2)[0] + 1]
         return TimingAnalysis(grid * dt, rate, "cfr", dropped, float(np.max(np.abs(resid))), notes)
     # Variable frame rate (or broken timestamps): keep the measured times.
-    median_step = float(np.median(pos))
-    rate = Fraction(1.0 / median_step).limit_denominator(100000)
-    if np.any(steps <= 0):
-        notes.append("timestamps are not strictly increasing")
-    notes.append("timestamps do not lie on a constant-rate grid: timing mode 'vfr'")
-    dropped = [int(i) for i in np.nonzero(steps > DROP_GAP * median_step)[0] + 1]
+    rate = _nominal_vfr_rate(steps)
+    notes.append(f"timestamps do not lie on a constant-rate grid: timing mode 'vfr' "
+                 f"(nominal {float(rate):.3f} frames/s)")
+    dropped = [int(i) for i in np.nonzero(steps > DROP_GAP / float(rate))[0] + 1]
     return TimingAnalysis(rel.copy(), rate, "vfr", dropped, 0.0, notes)
+
+
+def _nominal_vfr_rate(steps: np.ndarray) -> Fraction:
+    """Nominal rate of irregular timestamps: trimmed mean step (gaps excluded),
+    snapped to a standard rate within 1%."""
+    cut = np.percentile(steps, 98)
+    dt = float(np.mean(steps[steps <= cut]))
+    for r in _STANDARD_RATES:
+        if abs(dt * float(r) - 1.0) < 0.01:
+            return r
+    return Fraction(1.0 / dt).limit_denominator(100000)
 
 
 # ------------------------------------------------------------------ index --
@@ -304,16 +362,60 @@ def _index_from_container(stream) -> Optional[np.ndarray]:
     return ts
 
 
-def _index_from_demux(container, stream) -> Optional[np.ndarray]:
+def _index_from_demux(container, stream, reorders: bool) -> Optional[np.ndarray]:
+    """Packet PTS in presentation order, or None if they cannot be trusted.
+
+    Without frame reordering the PTS must already increase in packet order;
+    with reordering (B-frames) they are sorted and must be unique.
+    """
     pts = []
     for packet in container.demux(stream):
         if packet.size == 0:
             continue
+        if getattr(packet, "is_discard", False):
+            continue          # e.g. MP4 edit list: decoded but never output
         if packet.pts is None:
             return None
         pts.append(packet.pts)
     a = np.array(pts, dtype=np.int64)
-    if len(a) < 1 or (len(a) > 1 and not np.all(np.diff(a) > 0)):
+    if len(a) < 1:
+        return None
+    if reorders:
+        a = np.sort(a)
+    if len(a) > 1 and not np.all(np.diff(a) > 0):
+        return None
+    return a
+
+
+def _pts_run(container, stream, max_frames: Optional[int],
+             stop_pts: Optional[int] = None) -> list[tuple[Optional[int], bool]]:
+    """Decode from the current position; return [(pts, is_keyframe), ...]."""
+    run: list[tuple[Optional[int], bool]] = []
+    for fr in _decoded_frames(container, stream):
+        run.append((fr.pts, _is_keyframe(fr)))
+        if max_frames is not None and len(run) >= max_frames:
+            break
+        if stop_pts is not None and fr.pts is not None and fr.pts >= stop_pts:
+            break
+    return run
+
+
+def _match_run(ts: np.ndarray, run: list, after_seek: bool) -> Optional[int]:
+    """Index position where a decoded run starts if it matches `ts` one for one.
+
+    After a seek, frames before the first keyframe are ignored (open-GOP
+    leading frames are not trustworthy).  Returns None on any mismatch.
+    """
+    start = 0
+    if after_seek:
+        start = next((m for m, (_, key) in enumerate(run) if key), None)
+        if start is None:
+            return None
+    seq = [p for p, _ in run[start:]]
+    if not seq or any(p is None for p in seq):
+        return None
+    a = int(np.searchsorted(ts, seq[0]))
+    if a + len(seq) > len(ts) or not np.array_equal(ts[a:a + len(seq)], np.asarray(seq, dtype=np.int64)):
         return None
     return a
 
@@ -466,6 +568,16 @@ class _Cursor:
 class VideoReader:
     """Frame-exact video access (see module docstring).
 
+    Args:
+        path: video file (str or os.PathLike; non-ASCII names work).
+        sar_override: stored-pixel aspect ratio to use instead of the stream's.
+        index_mode: 'auto' (container -> demux -> decode), or force one method.
+        index_cache: optional .npz path; the PTS index is saved there and
+            reused while the file's size and mtime are unchanged (worth it
+            for long files whose index needs a full decode).
+        cache_size: number of decoded frames kept for get_frame() (LRU).
+        threads: let FFmpeg decode with frame/slice threads.
+
     Attributes:
         info: VideoInfo with exact n_frames, timing mode, dropped frames.
         frame_times: (n_frames,) seconds from the first frame.
@@ -494,6 +606,8 @@ class VideoReader:
         self._cursor: Optional[_Cursor] = None
         self.notes: list[str] = []
         self.decode_errors: list[dict] = []
+        self._reported: set = set()
+        self._convert = _Converter()     # used under self._lock by get_frame
 
         self._container = _open_container(self.path)
         if not self._container.streams.video:
@@ -508,7 +622,11 @@ class VideoReader:
         fmt_start = self._container.start_time
         self.container_start_s = (fmt_start / 1e6) if fmt_start is not None else 0.0
 
-        idx = self._get_index(index_mode, os.fspath(index_cache) if index_cache else None)
+        try:
+            idx = self._get_index(index_mode, os.fspath(index_cache) if index_cache else None)
+        except BaseException:
+            self._container.close()
+            raise
         self.pts = idx.pts
         self.index_method = idx.method
         self.decode_errors.extend(idx.decode_errors)
@@ -568,21 +686,23 @@ class VideoReader:
         stream = self._stream
         fmt = self._container.format.name.split(",")[0]
         intra = _codec_intra_only(stream)
-        reorders = _codec_reorders(stream)
+        reorders = _codec_reorders(stream) and not intra
         tried = []
         if mode in ("auto", "container") and intra and fmt in _CONTAINER_INDEX_FORMATS:
             ts = _index_from_container(stream)
             tried.append("container")
-            if ts is not None and self._validate_index(ts):
+            ts = self._validate_index(ts) if ts is not None else None
+            if ts is not None:
                 return _Index(ts, "container")
-        if mode in ("auto", "demux", "container") and (mode != "auto" or not reorders):
+        if mode in ("auto", "demux", "container"):
             c, s = self._new_container()
             try:
-                ts = _index_from_demux(c, s)
+                ts = _index_from_demux(c, s, reorders)
             finally:
                 c.close()
             tried.append("demux")
-            if ts is not None and self._validate_index(ts):
+            ts = self._validate_index(ts) if ts is not None else None
+            if ts is not None:
                 return _Index(ts, "demux")
         if tried:
             log.info("%s: %s index not usable, decoding all frames", self.path, "/".join(tried))
@@ -593,32 +713,55 @@ class VideoReader:
         finally:
             c.close()
 
-    def _validate_index(self, ts: np.ndarray) -> bool:
-        """Decode the first and last frame and check they carry the indexed PTS."""
+    def _validate_index(self, ts: np.ndarray) -> Optional[np.ndarray]:
+        """Spot-check a container/demux index against the decoder.
+
+        Returns the (possibly start-trimmed) index, or None if it is not
+        trustworthy.  Checks: the run decoded from the very start, a run
+        around the middle (after a seek) and the run up to the last frame.
+        """
         if len(ts) == 0:
-            return False
+            return None
         c, s = self._new_container()
         try:
-            first = None
-            for f in _decoded_frames(c, s):
-                first = f.pts
-                break
-            if first != ts[0]:
-                return False
-            if len(ts) == 1:
-                return True
-            target = int(ts[-1])
-            back = int(round(2.0 / float(self.time_base)))
-            c.seek(max(int(ts[0]), target - back), stream=s, backward=True, any_frame=False)
-            last = None
-            for f in _decoded_frames(c, s):
-                last = f.pts
-            return last == target
+            run = _pts_run(c, s, VALIDATE_RUN)
+            if not run:
+                return None
+            j = int(np.searchsorted(ts, run[0][0]))
+            if j >= len(ts) or ts[j] != run[0][0] or j > MAX_LEADING_SKIP:
+                return None
+            if _match_run(ts, run, after_seek=False) != j:
+                return None
+            if j:
+                self.notes.append(f"{j} leading frame(s) listed in the file are never output by the decoder "
+                                  f"(open GOP at the start); they are not counted")
+                ts = ts[j:]
+            n = len(ts)
+            if n > 2 * VALIDATE_RUN:
+                mid = n // 2
+                if not self._check_after_seek(c, s, ts, mid, stop_index=mid + VALIDATE_RUN):
+                    return None
+            if n > VALIDATE_RUN and not self._check_after_seek(c, s, ts, n - 1, stop_index=None):
+                return None
+            return ts
         except av.error.FFmpegError as e:
             log.info("index validation failed: %s", e)
-            return False
+            return None
         finally:
             c.close()
+
+    def _check_after_seek(self, c, s, ts: np.ndarray, target: int, stop_index: Optional[int]) -> bool:
+        """Seek before ts[target], decode, and match the run against the index."""
+        back = int(round(SEEK_PREROLLS_S[0] / float(self.time_base)))
+        c.seek(max(int(ts[0]), int(ts[target]) - back), stream=s, backward=True, any_frame=False)
+        stop_pts = None if stop_index is None else int(ts[min(stop_index, len(ts) - 1)])
+        run = _pts_run(c, s, None, stop_pts=stop_pts)
+        a = _match_run(ts, run, after_seek=True)
+        if a is None or a > target:
+            return False
+        if stop_index is None:            # the run went to the end of the stream
+            return run[-1][0] == int(ts[-1])
+        return True
 
     # ------------------------------------------------------------ access
     @property
@@ -645,6 +788,10 @@ class VideoReader:
         if j >= self.n_frames:
             return self.n_frames - 1
         return j if abs(self.frame_times[j] - t) < abs(t - self.frame_times[j - 1]) else j - 1
+
+    def _check_open(self) -> None:
+        if self._container is None:
+            raise ValueError(f"VideoReader({self.path!r}) is closed")
 
     def _check_index(self, i: int) -> int:
         i = int(i)
@@ -678,11 +825,12 @@ class VideoReader:
         i = self._check_index(i)
         f = _fmt(fmt)
         fmts = ("gray", "bgr24") if f == "both" else (f,)
+        self._check_open()
         with self._lock:
             vals = [self._cache_get((i, x)) for x in fmts]
             if any(v is None for v in vals):
                 frame = self._decode_frame(i)
-                vals = [v if v is not None else frame.to_ndarray(format=x) for v, x in zip(vals, fmts)]
+                vals = [v if v is not None else self._convert(frame, x) for v, x in zip(vals, fmts)]
                 for x, v in zip(fmts, vals):
                     self._cache_put((i, x), v)
             out = tuple(v.copy() for v in vals)
@@ -716,11 +864,15 @@ class VideoReader:
 
     def _seek_cursor(self, start_pts: Optional[int]) -> _Cursor:
         """New cursor at a keyframe before `start_pts` (None: reopen at the start)."""
+        if start_pts is not None:
+            try:
+                self._container.seek(start_pts, stream=self._stream, backward=True, any_frame=False)
+            except av.error.FFmpegError as e:
+                log.info("%s: seek failed (%s); decoding from the start", self.path, e)
+                start_pts = None
         if start_pts is None:
             self._container.close()
             self._container, self._stream = self._new_container()
-        else:
-            self._container.seek(start_pts, stream=self._stream, backward=True, any_frame=False)
         frames = self._indexed(self._decoded(self._container, self._stream))
         self._cursor = _Cursor(frames, start_after_seek=start_pts is not None)
         return self._cursor
@@ -729,14 +881,29 @@ class VideoReader:
         return _decoded_frames(c, s, self.decode_errors)
 
     def _indexed(self, frames: Iterator["av.VideoFrame"]) -> Iterator[tuple[int, "av.VideoFrame"]]:
-        """Attach frame indices: by PTS lookup, or by counting when PTS are unusable."""
+        """Attach frame indices: by PTS lookup, or by counting when PTS are unusable.
+
+        A decoded frame whose PTS is not in the index (should not happen
+        with a validated index) is reported, not silently mapped elsewhere.
+        """
         if self._seekable:
             for fr in frames:
                 j = self.index_of_pts(fr.pts)
                 if j is not None:
                     yield j, fr
+                elif fr.pts is not None and int(self.pts[0]) <= fr.pts <= int(self.pts[-1]):
+                    self._report_unindexed(fr.pts)
         else:
             yield from enumerate(frames)
+
+    def _report_unindexed(self, pts: int) -> None:
+        key = ("unindexed", int(pts))
+        if key in self._reported:
+            return
+        self._reported.add(key)
+        log.warning("%s: decoded a frame with pts %d that is not in the frame index; ignored",
+                    self.path, pts)
+        self.decode_errors.append({"pts": int(pts), "error": "decoded frame not in the index"})
 
     def _advance(self, cur: _Cursor, target: int):
         """Decode forward on `cur` until frame `target`; None if it cannot be reached cleanly.
@@ -768,12 +935,14 @@ class VideoReader:
         replaced by a neighbour.
         """
         f = _fmt(fmt)
+        self._check_open()
         n = self.n_frames
         start = max(0, int(start))
         stop = n if stop is None else min(n, int(stop))
         if start >= stop:
             return
         c, s = self._new_container()
+        convert = _Converter()
         try:
             want = start
             for j, fr in self._iter_from(c, s, start):
@@ -783,7 +952,7 @@ class VideoReader:
                     break
                 if j > want:
                     self._report_missing(want, j)
-                yield j, _to_array(fr, f)
+                yield j, convert(fr, f)
                 want = j + 1
             if want < stop:
                 self._report_missing(want, stop)
@@ -791,18 +960,31 @@ class VideoReader:
             c.close()
 
     def _report_missing(self, a: int, b: int) -> None:
+        key = ("missing", a, b)
+        if key in self._reported:
+            return
+        self._reported.add(key)
         msg = f"frames {a}..{b - 1} could not be decoded and were skipped"
         log.warning("%s: %s", self.path, msg)
         self.decode_errors.append({"frames": [a, b - 1], "error": "not decoded during iteration"})
 
     def _iter_from(self, c, s, start: int) -> Iterator[tuple[int, "av.VideoFrame"]]:
-        """(index, frame) pairs, clean from `start` on, starting at or before `start`."""
+        """(index, frame) pairs, clean from `start` on, starting at or before `start`.
+
+        `c` must be a freshly opened container (positioned at the start).
+        """
+        seeked = False
         if self._seekable and start > 0:
             for preroll in SEEK_PREROLLS_S:
                 start_pts = self._preroll_pts(start, preroll)
                 if start_pts is None:
                     break
-                c.seek(start_pts, stream=s, backward=True, any_frame=False)
+                seeked = True
+                try:
+                    c.seek(start_pts, stream=s, backward=True, any_frame=False)
+                except av.error.FFmpegError as e:
+                    log.info("%s: seek failed (%s); decoding from the start", self.path, e)
+                    break
                 frames = self._indexed(self._decoded(c, s))
                 first = self._clean_start(frames, start)
                 if first is not False:
@@ -810,8 +992,10 @@ class VideoReader:
                         yield first
                     yield from frames
                     return
+        if seeked:
+            # The demuxer is no longer at the start: reopen and decode from frame 0.
             c.close()
-            c, s = self._new_container()       # from the very start
+            c, s = self._new_container()
             try:
                 yield from self._indexed(self._decoded(c, s))
             finally:
@@ -837,6 +1021,17 @@ class VideoReader:
             if j >= start:
                 return j, fr
         return None if key_seen else False
+
+    def note_duplicate_frames(self, frames) -> None:
+        """Record frames found (from content) to repeat their predecessor.
+
+        Merged into ``info.duplicate_frames`` (sorted, unique).  Called by
+        `pitchspeed.io.interlace` while it decodes; the reader itself cannot
+        see duplicates in timestamps.
+        """
+        new = {int(i) for i in frames if 0 < int(i) < self.n_frames}
+        if new - set(self.info.duplicate_frames):
+            self.info.duplicate_frames = sorted(set(self.info.duplicate_frames) | new)
 
     # ----------------------------------------------------------- lifecycle
     def close(self) -> None:

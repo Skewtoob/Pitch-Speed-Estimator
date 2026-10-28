@@ -191,8 +191,11 @@ def _make_throwback(p: PitchEvent, u: np.ndarray, lev: LevelGeom) -> ThrowEvent:
     p1 = np.array([0.0, lev.distance_ft - 1.0, lev.mound_h_ft + 5.0])
     sp = (40.0 + 15.0 * u[1]) * MPH
     vt = throw_velocity(p0, p1, sp)
-    trt = Trajectory(p0, vt, 0.0018, np.zeros(3), np.zeros(3), ts, tmax=2.5)
-    te = trt.time_at_y(p1[1]) if trt.S[:, 1].max() > p1[1] else ts + 1.2
+    trt = Trajectory(p0, vt, 0.0018, np.zeros(3), np.zeros(3), ts, tmax=2.5, stop_z=-0.5)
+    if trt.S[:, 1].max() >= p1[1]:
+        te = trt.time_at(1, p1[1], increasing=True)              # reaches the pitcher (+y direction)
+    else:                                                       # falls short: until it lands
+        te = trt.time_at(2, 0.0) if trt.S[:, 2].min() <= 0.0 else trt.t_end
     return ThrowEvent(t_start=ts, t_end=te, traj=trt, speed_mph=sp / MPH, after_pitch=p.id, p0=p0, p1=p1)
 
 
@@ -251,6 +254,9 @@ def make_events(cfg: dict, lev: LevelGeom, cam: Camera) -> Events:
         ev.pitches.append(p)
         if D["throwback"]:
             th = _make_throwback(p, u[[12, 15]], lev)
-            if th.t_end < duration:
+            if th.t_start < duration:                  # may be cut by the end of the clip
                 ev.throws.append(th)
+    # a catcher does not throw back while the next pitch is on its way
+    ev.throws = [th for th in ev.throws
+                 if not any(q.t_hand - 1.0 < th.t_end and th.t_start < q.t_catch + 0.5 for q in ev.pitches)]
     return ev
