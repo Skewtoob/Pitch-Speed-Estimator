@@ -499,6 +499,23 @@ class ReviewState:
         self.s = self._clamp(it.s1 if where == "end" else it.s0)
         self.marker = "R"
         self.playing = False
+        self._say_arrival(it)
+
+    def _say_arrival(self, it: Item) -> None:
+        """Replace any old message with what this item is and what to do with it."""
+        if it.key.kind == "pitch":
+            e = self.entry(it.key.ref)
+            if e is not None:
+                p = e.pitch
+                what = "rejected pitch (Y restores it)" if p.status == "rejected" else f"pitch {p.number}"
+                self._say(f"{what}: {speed_text(p.speed)} - Y accepts, R/C (or B) fix the marks, X rejects")
+        elif it.key.kind == "missed":
+            m = (self.result.possible_missed or [])[it.key.ref]
+            why = m.get("reason", "") if isinstance(m, dict) else ""
+            self._say(f"possible missed pitch{(' (' + why[:60] + ')') if why else ''}: if there is a pitch, "
+                      f"press N at its release then C (or B); if not, press X")
+        else:
+            self._say("rejected track: Y makes it a pitch, X confirms the rejection")
 
     def window(self) -> tuple[int, int]:
         """Sample range [w0, w1] worth showing / looping for the current item or draft."""
@@ -600,6 +617,14 @@ class ReviewState:
     def _do_next_item(self) -> None:
         self._move_item(1)
 
+    def _navigable(self, it: Item) -> bool:
+        """PgUp/PgDn stop here?  Windows already handled ('no pitch' / pitch added) are
+        skipped unless O (show everything) is on; they stay in the results."""
+        if it.key.kind != "missed" or self.show_others:
+            return True
+        m = (self.result.possible_missed or [])[it.key.ref]
+        return not (isinstance(m, dict) and m.get("review") in ("pitch_added", "no_pitch"))
+
     def _move_item(self, step: int) -> None:
         items = self.items()
         if not items:
@@ -608,14 +633,34 @@ class ReviewState:
         i = self.item_index()
         if i is None:
             # not on an item: go to the first one after / before the current field
-            cands = [k for k, it in enumerate(items) if (it.s0 > self.s if step > 0 else it.s0 < self.s)]
-            j = (cands[0] if step > 0 else cands[-1]) if cands else (len(items) - 1 if step > 0 else 0)
+            cands = [k for k, it in enumerate(items) if (it.s0 > self.s if step > 0 else it.s0 < self.s)
+                     and self._navigable(it)]
+            if not cands:
+                self._say_end(step)
+                return
+            j = cands[0] if step > 0 else cands[-1]
         else:
             j = i + step
+            while 0 <= j < len(items) and not self._navigable(items[j]):
+                j += step
             if not 0 <= j < len(items):
-                self._say("this is the last item" if step > 0 else "this is the first item")
+                self._say_end(step)
                 return
         self._goto_item(items[j].key)
+
+    def _move_then_say(self, done: str) -> None:
+        """Go to the next item; show what was just done followed by where we are now."""
+        self._move_item(1)
+        now = self.message.text if self.message else ""
+        level = self.message.level if self.message else "ok"
+        self._say(f"{done} | {now}" if done and now and now != done else (done or now), level)
+
+    def _say_end(self, step: int) -> None:
+        if step > 0:
+            self._say("that was the last one - everything is checked. Press Q to save and quit "
+                      "(PgUp goes back)", "ok")
+        else:
+            self._say("this is the first item (PgDn goes forward)")
 
     def _do_goto_release(self) -> None:
         if self.draft is not None:
@@ -880,8 +925,7 @@ class ReviewState:
             msg = "accepted"
         self._push([("replace", e.uid, before)], "accept")
         self._commit()
-        self._say(f"{msg}: pitch {p.number}", "ok")
-        self._move_item(1)
+        self._move_then_say(f"{msg}: pitch {p.number}")
 
     def _do_reject(self) -> None:
         it = self.current_item()
@@ -903,7 +947,7 @@ class ReviewState:
                 self._say("window marked: checked, no pitch")
             self._push([("missed", it.key.ref, before)], "dismiss")
             self._save()
-            self._move_item(1)
+            self._move_then_say(self.message.text if self.message else "")
             return
         if it.key.kind == "rtrack":
             tr = self.result.rejected_tracks[it.key.ref]

@@ -236,8 +236,11 @@ def test_manual_pitch_from_window_marks_it_checked():
     keys(st, "c")
     m = res.possible_missed[0]
     assert m["review"] == "pitch_added"
-    keys(st, "pgdn")                                    # the window comes after the new pitch
-    assert st.cur.kind == "missed" and "checked: pitch added" in st.info_text()
+    keys(st, "pgdn")                    # the handled window is skipped: nothing left to check
+    assert st.cur.kind == "pitch" and "everything is checked" in st.message.text
+    from pitchspeed.review.state import ItemKey
+    st._goto_item(ItemKey("missed", 0))                 # still reachable (e.g. via O / the timeline)
+    assert "checked: pitch added" in st.info_text()
     keys(st, "x")                                       # X must not hide the added pitch
     assert m["review"] == "pitch_added" and "select that pitch" in st.message.text
     keys(st, "u")                                       # undo the manual pitch: window unchecked again

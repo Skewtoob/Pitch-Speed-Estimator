@@ -62,7 +62,7 @@ def test_field_and_item_navigation():
     keys(st, "]")
     assert st.cur.kind == "missed" and st.s == 420
     keys(st, "pgdn", "pgdn")
-    assert st.s == 500 and "last item" in st.message.text
+    assert st.s == 500 and "last one" in st.message.text and "Q" in st.message.text
     keys(st, "pgup", "[")
     assert st.s == 300
 
@@ -158,9 +158,14 @@ def test_missed_window_dismiss_toggle_and_accept_hint():
     assert st.cur.kind == "missed" and "Possible missed pitch 1/1" in st.info_text()
     keys(st, "y")
     assert "press N" in st.message.text
-    keys(st, "x")
+    keys(st, "x")                                   # mark 'no pitch' and move on
     assert res.possible_missed[0]["review"] == "no_pitch" and rec.saved == 1
-    keys(st, "pgup", "x")
+    assert st.cur.kind == "pitch" and "no pitch" in st.message.text
+    keys(st, "pgup")                                # a handled window is skipped by PgUp / PgDn
+    assert st.cur.kind == "pitch"
+    keys(st, "o", "pgdn")                           # O shows everything: the window is reachable
+    assert st.cur.kind == "missed"
+    keys(st, "x")                                   # X again: 'not checked' again
     assert "review" not in res.possible_missed[0]
     keys(st, "u")
     assert res.possible_missed[0]["review"] == "no_pitch"

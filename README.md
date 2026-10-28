@@ -141,6 +141,9 @@ Steps through every pitch and every "possible missed pitch". The main keys:
 | Q / Esc | save and quit |
 
 Every edit re-computes that pitch's speed immediately and saves the results.
+Windows you have dealt with (a pitch added there, or X = no pitch) are skipped
+by `[` / `]`; **O** shows everything again. When the message says *everything
+is checked*, press **Q** to save and quit.
 
 **Balls the batter hit.** The tool usually notices a hit by itself and ends
 the flight at the bat (the table shows the flag `contact_end`). If it got a hit
