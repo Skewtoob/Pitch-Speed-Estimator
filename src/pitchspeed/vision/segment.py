@@ -129,6 +129,14 @@ CUE_LATE_GAP_S = 5 * 1001 / 60000   # first clean detection > 5 fields after the
 CUE_LEAD_S = 3 * 1001 / 60000       # the burst may lag the release by this much
 
 
+
+# wind-up detection (behind view): see Segmenter._flight_start
+WINDUP_WIN = 3            # samples per displacement
+WINDUP_MIN_PX = 3.0       # both displacements must exceed this (and 3 sigma)
+WINDUP_ANGLE_DEG = 100.0  # a reversal: direction change larger than this
+RELEASE_GAP_SAMPLES = 6   # a gap longer than this right after the first clean detection
+RELEASE_GAP_SEARCH_S = 0.35   # ... looked for only this soon after it
+
 def truncated_normal(mu: float, sigma: float, lo: float = -math.inf, hi: float = math.inf) -> tuple[float, float]:
     """(mean, sd) of N(mu, sigma^2) truncated to [lo, hi]; (nan, nan) if [lo, hi] has no mass."""
     if not (sigma > 0 and math.isfinite(sigma)):
@@ -350,10 +358,58 @@ class Segmenter:
                 hits += 1
         return hits >= 2
 
-    def _first_clean(self, tr: Track) -> Optional[int]:
+    def _flight_start(self, P) -> int:
+        """Index of the first inlier of the final, continuous flight (behind view).
+
+        Tracks can start on the ball still in the pitcher's hand during the wind-up
+        (seen on synthetic clips: 0.7 s of arm motion before the release, which made
+        the 'first free field' 0.3 s early and the speed 28 mph low with a tight
+        sigma).  In flight the image velocity keeps its direction and grows; the
+        hand-held ball reverses direction.  The flight is taken to start after the
+        last clear reversal: two consecutive displacements over WINDUP_WIN samples,
+        both well above the position noise, at more than WINDUP_ANGLE_DEG.
+        """
+        n = len(P)
+        if n < 2 * WINDUP_WIN + 4:
+            return 0
+        sar = self.geom.sar
+        xy = np.array([[p.x * sar, p.y] for p in P])
+        sig = float(np.median([max(p.sigma, 0.4) for p in P]))
+        thr = max(WINDUP_MIN_PX, 3.0 * sig)
+        cut = 0
+        cos_lim = math.cos(math.radians(WINDUP_ANGLE_DEG))
+        for i in range(WINDUP_WIN, n - WINDUP_WIN):
+            a = xy[i] - xy[i - WINDUP_WIN]
+            b = xy[i + WINDUP_WIN] - xy[i]
+            na, nb = float(np.hypot(*a)), float(np.hypot(*b))
+            if na > thr and nb > thr and float(a @ b) / (na * nb) < cos_lim:
+                cut = i
+        # keep enough of the flight to fit; never cut into the last third of the track
+        if cut > 0 and n - cut >= 6 and cut < 0.67 * n:
+            return cut
+        return 0
+
+    def _continuous_flight_start(self, P, i_clean: int) -> Optional[int]:
+        """Index of the first point of the continuous flight if a gap separates it from
+        the first clean detection (behind view), else None."""
+        gap = int(self.opts.extra.get("release_gap_samples", RELEASE_GAP_SAMPLES))
+        for j in range(i_clean + 1, len(P)):
+            if P[j].s - P[j - 1].s > gap:
+                # the part after the gap must be the substantial, continuous flight
+                rest = P[j:]
+                if len(rest) >= 6 and len(rest) >= 2 * (j - i_clean):
+                    return j
+                return None
+            if P[j].t - P[i_clean].t > RELEASE_GAP_SEARCH_S:
+                return None
+        return None
+
+    def _first_clean(self, tr: Track, start: int = 0) -> Optional[int]:
         P = [p for p in tr.sorted() if p.inlier]
         o = self.opts
         for i, p in enumerate(P):
+            if i < start:
+                continue
             if p.attached or p.z < o.z_strong or p.src != "det":
                 continue
             # the next two inliers must exist within a few samples (track continues)
@@ -367,7 +423,11 @@ class Segmenter:
         P = [p for p in tr.sorted() if p.inlier]
         t_first = P[0].t
         manual = [p for p in tr.sorted() if p.src == "manual"]
-        i_clean = self._first_clean(tr)
+        i_start = self._flight_start(P) if g.view == "behind" else 0
+        if i_start:
+            flags.append("windup_trimmed")
+            diag["windup_trimmed_until_t"] = P[i_start].t
+        i_clean = self._first_clean(tr, i_start)
         t_clean = P[i_clean].t if i_clean is not None else None
         diag["t_first_clean"] = t_clean
         diag["s_first_clean"] = P[i_clean].s if i_clean is not None else None
@@ -430,6 +490,22 @@ class Segmenter:
         # anywhere in [cue - CUE_LEAD_S, first clean detection - latency].
         t_cue = self._delivery_cue_time(P[i_clean].s, t_clean)
         diag["release_cue_t"] = t_cue
+        # Early detections cut off from the main flight by a gap: a released ball does
+        # not vanish for many fields right after release, so the early group may be the
+        # ball still in the hand (wind-up) or something else near the release point.
+        # The release then lies anywhere between the early group and the start of the
+        # continuous flight: widen to that interval (honest "uncertain", not a guess).
+        j = self._continuous_flight_start(P, i_clean)
+        if j is not None:
+            flags.append("release_gap")
+            if "release_uncertain" not in flags:
+                flags.append("release_uncertain")
+            gap_hi = P[j].t - lat_m
+            diag["release_gap_until_t"] = P[j].t
+            lo = (t_clean - lat_m) if lo is None else min(lo, t_clean - lat_m)
+            t_clean_hi = gap_hi
+        else:
+            t_clean_hi = None
         if t_cue is not None and t_clean - t_cue > float(o.extra.get("cue_late_gap_s", CUE_LATE_GAP_S)):
             flags.append("release_detection_late")
             if "release_uncertain" not in flags:
@@ -437,7 +513,7 @@ class Segmenter:
             c_lo = t_cue - float(o.extra.get("cue_lead_s", CUE_LEAD_S))
             lo = c_lo if lo is None else min(lo, c_lo)
         if lo is not None:
-            hi = t_clean - lat_m
+            hi = t_clean - lat_m if t_clean_hi is None else max(t_clean - lat_m, t_clean_hi)
             lo = min(lo, hi)
             t_rel = 0.5 * (lo + hi)
             sigma = math.sqrt(lat_s ** 2 + (hi - lo) ** 2 / 12.0 + dt * dt / 12.0)

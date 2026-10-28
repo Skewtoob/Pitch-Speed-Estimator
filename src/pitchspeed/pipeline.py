@@ -343,6 +343,7 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
         rejected.extend(fr.rejected)
         missed.extend(fr.possible_missed)
 
+    pitches = _demote_throwbacks(pitches, rejected, missed)
     missed.sort(key=lambda m: m.get("t_start", 0.0))
     renumber(pitches)
     if tf_s:
@@ -364,6 +365,40 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
     write_json(result, paths["results_json"])
     write_csv(result, paths["results_csv"])
     return result, source
+
+
+THROWBACK_WINDOW_S = 4.0      # catcher's return throw arrives this soon after a catch
+THROWBACK_MAX_PROGRESS = 0.3  # ... and is only seen near the pitcher's end of the path
+
+
+def _demote_throwbacks(pitches: list[Pitch], rejected: list, missed: list) -> list[Pitch]:
+    """Move likely catcher throw-backs from the pitch list to the review list.
+
+    After every pitch the catcher throws the ball back, typically 1.5-4 s after
+    the catch; near the pitcher that lob can look like the start of a pitch.
+    A track is demoted only if it has no measurable speed, starts within
+    THROWBACK_WINDOW_S of the previous pitch's catch, and never gets far along
+    the release->catch path.  Real pitches come much further apart.
+    """
+    kept: list[Pitch] = []
+    prev_catch = None
+    for p in sorted(pitches, key=lambda q: q.release.t):
+        d = (p.track.diagnostics if p.track else {}) or {}
+        prog_last = d.get("progress_last")
+        if (prev_catch is not None and p.speed.v_release_mph is None and p.status == "auto"
+                and 0.0 <= p.release.t - prev_catch <= THROWBACK_WINDOW_S
+                and prog_last is not None and prog_last < THROWBACK_MAX_PROGRESS):
+            tr = p.track
+            tr.status, tr.reject_code = "rejected", "THROWBACK_TIMING"
+            rejected.append(tr)
+            missed.append({"s_start": tr.points[0].s, "s_end": tr.points[-1].s,
+                           "t_start": tr.points[0].t, "t_end": tr.points[-1].t,
+                           "reason": f"probably the catcher's throw back to the pitcher "
+                                     f"({p.release.t - prev_catch:.1f} s after the previous catch)"})
+            continue
+        kept.append(p)
+        prev_catch = p.catch.t
+    return kept
 
 
 def _affine_to_3x3(A: np.ndarray) -> np.ndarray:

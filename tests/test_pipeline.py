@@ -113,3 +113,33 @@ def test_slow_ball_is_unclear():
     scan = _scan()
     # ~0.3 px per field: no timing hypothesis can be told apart
     assert resolve_field_order(scan, [_sim_track("interlaced", v=18.0, a=0.0)], _Src(), 1001 / 30000) == "unknown"
+
+
+def _tp(t, prog_last, speed=None, status="auto"):
+    tr = PitchTrack(track_id=0, points=[TrackPoint(s=int(t * 60), t=t, x=0.0, y=0.0),
+                                        TrackPoint(s=int(t * 60) + 20, t=t + 0.33, x=0.0, y=0.0)],
+                    diagnostics={"progress_last": prog_last})
+    return Pitch(number=0, status=status, release=EventTime(t=t, sigma=0.01, method="first_free_field"),
+                 catch=EventTime(t=t + 0.5, sigma=0.01, method="extrapolated"),
+                 speed=SpeedEstimate(v_release_mph=speed), track=tr)
+
+
+def test_throwback_after_catch_is_demoted():
+    from pitchspeed.pipeline import _demote_throwbacks
+    rejected, missed = [], []
+    ps = [_tp(2.0, 0.8, 70.0), _tp(5.0, 0.15), _tp(14.0, 0.8, 68.0)]   # catch 2.5 -> 2.5 s later
+    kept = _demote_throwbacks(ps, rejected, missed)
+    assert [p.release.t for p in kept] == [2.0, 14.0]
+    assert rejected[0].reject_code == "THROWBACK_TIMING" and "throw back" in missed[0]["reason"]
+
+
+@pytest.mark.parametrize("pitch", [
+    _tp(5.0, 0.15, speed=65.0),      # has a speed: never demoted
+    _tp(5.0, 0.6),                    # got far along the path
+    _tp(9.0, 0.15),                   # too long after the catch
+    _tp(5.0, 0.15, status="manual"),  # user-made
+])
+def test_throwback_rule_keeps_real_candidates(pitch):
+    from pitchspeed.pipeline import _demote_throwbacks
+    kept = _demote_throwbacks([_tp(2.0, 0.8, 70.0), pitch], [], [])
+    assert len(kept) == 2
