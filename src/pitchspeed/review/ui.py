@@ -25,6 +25,13 @@ coords); ball points are mapped with the full homography.  In the
 full-frame view (F) the picture holds two fields: R/C marks and the
 badges of both fields are shown, but marking is refused (review/state.py).
 
+SIDE BY SIDE (G): the picture area becomes a 4 x 2 grid of the fields
+around the shown one (`ReviewState.strip_samples`), each magnified around
+the same spot of the frame.  A tile is drawn straight from the stored
+field with one affine warp (bob + square pixels + zoom), so it costs about
+as much as one normal picture.  A click on a tile picks that field, a
+right-click moves the magnified spot there.
+
 Extra keyword arguments (not in DESIGN.md's contract, all optional):
 ``retrack(pitch) -> PitchTrack`` for the E key (default: built from
 ``pitchspeed.vision.finder.track_between`` with the calibration's
@@ -44,7 +51,8 @@ import cv2
 import numpy as np
 
 from pitchspeed.calib.model import CalibrationFile, is_manual
-from pitchspeed.review.state import ReviewState, StabilizeMap
+from pitchspeed.io.display import display_transform
+from pitchspeed.review.state import STRIP_N, ReviewState, StabilizeMap
 from pitchspeed.types import AnalysisResult, Pitch, PitchTrack
 from pitchspeed.ui import canvas as cv
 from pitchspeed.ui.frames import FrameStore
@@ -62,6 +70,9 @@ PREFETCH_PER_POLL = 6        # samples decoded ahead per loop pass (keeps the ke
 PICK_RADIUS_DISPLAY_PX = 14.0
 LEVEL_COLORS = {"info": cv.WHITE, "ok": cv.GREEN, "warn": cv.ORANGE, "error": cv.RED}
 STATUS_COLORS = {"auto": cv.GREEN, "edited": cv.YELLOW, "manual": cv.CYAN, "rejected": cv.RED}
+STRIP_COLS, STRIP_ROWS, STRIP_GAP = 4, 2, 4
+TAG_COLORS = {"R": cv.GREEN, "C": cv.RED, "B": cv.RED, "new R": cv.YELLOW}
+assert STRIP_COLS * STRIP_ROWS == STRIP_N
 
 
 # --------------------------------------------------------------- retrack --
@@ -98,14 +109,18 @@ def render(state: ReviewState, store: FrameStore, canvas: cv.Canvas,
     src = store.source
     interlaced = bool(getattr(src, "interlaced", False))
     frame = int(src.locate(state.s)[0])
-    if state.view_mode == "frame" and interlaced:
-        img = canvas.render_frame(store.frame_image(frame))
-    else:
-        img = canvas.render_sample(store.sample(state.s), is_field=interlaced)
     vw, vh = canvas.video_size
-    if state.show_track:
-        _draw_track(img, state, canvas)
-    _draw_event_badge(img, state, vw)
+    if state.strip:
+        img = canvas.blank()
+        _draw_side_by_side(img, state, store, canvas)
+    else:
+        if state.view_mode == "frame" and interlaced:
+            img = canvas.render_frame(store.frame_image(frame))
+        else:
+            img = canvas.render_sample(store.sample(state.s), is_field=interlaced)
+        if state.show_track:
+            _draw_track(img, state, canvas)
+        _draw_event_badge(img, state, vw)
     if state.loupe and mouse_uv is not None and canvas.in_video(*mouse_uv):
         pts = []
         for x, y, manual, inlier, here in state.overlay_points():
@@ -165,6 +180,110 @@ def _draw_event_badge(img: np.ndarray, state: ReviewState, vw: int) -> None:
         x -= 16
 
 
+# ---------------------------------------------------------- side by side --
+def strip_tiles(canvas: cv.Canvas) -> list[tuple[int, int, int, int]]:
+    """(x0, y0, w, h) of the side-by-side tiles in display px, row by row."""
+    vw, vh = canvas.video_size
+    tw = (vw - STRIP_GAP * (STRIP_COLS - 1)) // STRIP_COLS
+    th = (vh - STRIP_GAP * (STRIP_ROWS - 1)) // STRIP_ROWS
+    return [(c * (tw + STRIP_GAP), r * (th + STRIP_GAP), tw, th)
+            for r in range(STRIP_ROWS) for c in range(STRIP_COLS)]
+
+
+def strip_focus_uv(state: ReviewState, canvas: cv.Canvas) -> tuple[float, float]:
+    """Display point magnified in every tile (the chosen spot, else the picture centre)."""
+    if state.strip_focus is not None:
+        w, h = canvas.frame_size
+        x = min(max(state.strip_focus[0], 0.0), w - 1.0)
+        y = min(max(state.strip_focus[1], 0.0), h - 1.0)
+        return tuple(canvas.to_display([(x, y)])[0])
+    vw, vh = canvas.video_size
+    return (vw - 1) / 2.0, (vh - 1) / 2.0
+
+
+def _tile_zoom(tile, focus_uv, zoom: float) -> np.ndarray:
+    """3x3: display coords -> tile coords (focus at the tile centre, `zoom` x magnified)."""
+    _, _, tw, th = tile
+    return np.array([[zoom, 0.0, (tw - 1) / 2.0 - zoom * focus_uv[0]],
+                     [0.0, zoom, (th - 1) / 2.0 - zoom * focus_uv[1]],
+                     [0.0, 0.0, 1.0]])
+
+
+def tile_to_frame(state: ReviewState, canvas: cv.Canvas, tile, u: float, v: float) -> tuple[float, float]:
+    """Window point (u, v) inside `tile` -> frame px of the picture it shows."""
+    T = _tile_zoom(tile, strip_focus_uv(state, canvas), state.strip_zoom)
+    du, dv = np.linalg.solve(T, [u - tile[0], v - tile[1], 1.0])[:2]
+    x, y = canvas.to_frame([(du, dv)])[0]
+    return float(x), float(y)
+
+
+def _picture(state: ReviewState, store: FrameStore, canvas: cv.Canvas, t: int):
+    """(image, 3x3 image px -> display px) of sample t as the normal view would show it."""
+    src = store.source
+    w, h = canvas.frame_size
+    A = np.vstack([display_transform(w, h, canvas.sar, canvas.video_size), [0.0, 0.0, 1.0]])
+    if state.woven():
+        return store.frame_image(int(src.locate(t)[0])), A
+    smp = store.sample(t)
+    img = smp.bgr if smp.bgr is not None else smp.image
+    if getattr(src, "interlaced", False):         # bob: field row r is frame row 2r + parity
+        A = A @ np.array([[1.0, 0.0, 0.0], [0.0, 2.0, float(smp.parity)], [0.0, 0.0, 1.0]])
+    return img, A
+
+
+def _draw_side_by_side(img: np.ndarray, state: ReviewState, store: FrameStore, canvas: cv.Canvas) -> None:
+    samples = state.strip_samples()
+    if not samples:
+        return
+    lo, hi = (samples[0] - 1, samples[-1] + 2) if state.woven() else (samples[0], samples[-1] + 1)
+    missing = [t for t in range(max(0, lo), min(store.source.n_samples, hi)) if not store.known(t)]
+    if missing:                                    # one sequential decode instead of 8+ seeks
+        store.prefetch(missing[0], missing[-1] + 1)
+    src = store.source
+    focus = strip_focus_uv(state, canvas)
+    z = state.strip_zoom
+    to_disp = np.vstack([canvas.A, [0.0, 0.0, 1.0]])
+    for tile, t in zip(strip_tiles(canvas), samples):
+        x0, y0, tw, th = tile
+        T = _tile_zoom(tile, focus, z)
+        pic, A = _picture(state, store, canvas, t)
+        W = (T @ A)[:2]
+        out = cv2.warpAffine(np.ascontiguousarray(pic), W, (tw, th), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 40, 40))
+        if out.ndim == 2:
+            out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+        if state.show_track:
+            for x, y, manual, inlier in state.strip_points(t):
+                u, v = (T @ to_disp @ [x, y, 1.0])[:2]
+                if inlier:
+                    cv.draw_marker(out, (u, v), cv.YELLOW if manual else cv.GREEN, size=int(4 + 2 * z),
+                                   style="circle", thickness=1)
+                else:
+                    cv.draw_marker(out, (u, v), cv.GRAY, size=6, style="cross")
+        frame = int(src.locate(t)[0])
+        label = f"field {t}" if getattr(src, "interlaced", False) and not state.woven() else f"frame {frame}"
+        cv.draw_text(out, label, (6, th - 8), 0.5, cv.YELLOW if t == state.s else cv.WHITE)
+        tx = tw - 8
+        for tag in reversed(state.strip_tags(t)):
+            tx -= cv.text_size(tag, 0.8, 2)[0]
+            cv.draw_text(out, tag, (tx, 56), 0.8, TAG_COLORS.get(tag, cv.WHITE), thickness=2)
+            tx -= 10
+        if t == state.s:
+            cv2.rectangle(out, (1, 1), (tw - 2, th - 2), cv.YELLOW, 3)
+        else:
+            cv2.rectangle(out, (0, 0), (tw - 1, th - 1), (90, 90, 90), 1)
+        img[y0:y0 + th, x0:x0 + tw] = out
+
+
+def strip_tile_at(state: ReviewState, canvas: cv.Canvas, u: float, v: float):
+    """(tile, sample) under window point (u, v) in the side-by-side view, else None."""
+    for tile, t in zip(strip_tiles(canvas), state.strip_samples()):
+        x0, y0, tw, th = tile
+        if x0 <= u < x0 + tw and y0 <= v < y0 + th:
+            return tile, t
+    return None
+
+
 def _bar_geometry(canvas: cv.Canvas) -> tuple[int, int, int, int]:
     vw, vh = canvas.video_size
     return 10, vh + 6, vw - 10, vh + 6 + BAR_H
@@ -219,8 +338,12 @@ def _draw_strip(img: np.ndarray, state: ReviewState, canvas: cv.Canvas) -> None:
     cv.draw_text(img, cv.wrap_text(state.hint_text(), vw - 16, 0.42)[0], (8, y), 0.42, cv.GRAY)
     y += 18
     if state.message is not None:
-        cv.draw_text(img, cv.wrap_text(state.message.text, vw - 16, 0.42)[0], (8, y), 0.42,
-                     LEVEL_COLORS.get(state.message.level, cv.WHITE))
+        bottom = img.shape[0]
+        for part in cv.wrap_text(state.message.text, vw - 16, 0.42):     # as many lines as fit
+            if y + 4 > bottom:
+                break
+            cv.draw_text(img, part, (8, y), 0.42, LEVEL_COLORS.get(state.message.level, cv.WHITE))
+            y += 18
 
 
 # ------------------------------------------------------------------- run --
@@ -273,10 +396,12 @@ def run_review_ui(result: AnalysisResult, source, calib_file: CalibrationFile,
                 break
             name = normalize_key(code)
             if name is not None:
+                state.pointer = _pointer(state, canvas, mouse_uv)
                 state.on_key(name)
             for ev in win.mouse_events():
                 mouse_uv = (ev.x, ev.y)
                 _feed_mouse(state, canvas, ev.kind, ev.x, ev.y)
+            state.pointer = _pointer(state, canvas, mouse_uv)
             if state.playing and time.monotonic() >= next_tick:
                 state.tick()
                 next_tick = time.monotonic() + float(source.sample_dt) * state.play_step / state.play_speed
@@ -293,12 +418,30 @@ def run_review_ui(result: AnalysisResult, source, calib_file: CalibrationFile,
     return result
 
 
+def _pointer(state: ReviewState, canvas: cv.Canvas, mouse_uv) -> Optional[tuple[float, float]]:
+    """Mouse position in frame px on the normal picture (None: elsewhere / side by side)."""
+    if mouse_uv is None or state.strip or not canvas.in_video(*mouse_uv):
+        return None
+    x, y = canvas.to_frame([mouse_uv])[0]
+    return float(x), float(y)
+
+
 def _feed_mouse(state: ReviewState, canvas: cv.Canvas, kind: str, u: int, v: int) -> None:
     if kind not in ("ldown", "rdown"):
         return
     x0, y0, x1, y1 = _bar_geometry(canvas)
     if kind == "ldown" and x0 - 4 <= u <= x1 + 4 and y0 - 8 <= v <= y1 + 4:
         state.goto(bar_sample(state, canvas, u))
+        return
+    if state.strip:
+        hit = strip_tile_at(state, canvas, u, v)
+        if hit is None:
+            return
+        tile, t = hit
+        if kind == "ldown":
+            state.strip_pick(t)
+        else:
+            state.strip_refocus(*tile_to_frame(state, canvas, tile, u, v))
         return
     if not canvas.in_video(u, v):
         return

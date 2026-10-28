@@ -155,6 +155,7 @@ ffmpeg -y -f rawvideo -pix_fmt bgr24 -s 960x720 -r 60000/1001 -i - -i SRC
 | E | re-run the tracker constrained to R..C |
 | Space, +/- | loop playback, 1/8–1× speed |
 | T Z F H | track overlay, loupe, view, help |
+| G | side by side: 8 consecutive fields (frames) in a 4×2 grid, all magnified 1.5–8× around one spot (the mouse at G; R-click a tile moves it, +/- zoom). A/D or a click picks the shown field (yellow border), marks act on it; the set slides only when the pick leaves it. G/Esc closes, Space closes and plays |
 | U/Backspace | undo (unbounded) |
 | Q/Esc | save, re-export CSV, offer re-render |
 

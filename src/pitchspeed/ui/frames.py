@@ -41,6 +41,7 @@ class FrameStore:
         self._cache: "OrderedDict[int, Sample]" = OrderedDict()
         self._bytes = 0
         self.errors: list[str] = []
+        self._bad: dict[int, Sample] = {}      # placeholders of samples that failed to decode
         self._pf_range: Optional[tuple[int, int]] = None
         self._pf_iter = None
         self._pf_next = 0
@@ -59,6 +60,10 @@ class FrameStore:
     def cached(self, s: int) -> bool:
         return int(s) in self._cache
 
+    def known(self, s: int) -> bool:
+        """Decoded, or already known not to decode (no point in trying again)."""
+        return int(s) in self._cache or int(s) in self._bad
+
     def __len__(self) -> int:
         return len(self._cache)
 
@@ -70,6 +75,8 @@ class FrameStore:
         if smp is not None:
             self._cache.move_to_end(s)
             return smp
+        if s in self._bad:
+            return self._bad[s]
         try:
             smp = self.source.get_sample(s, color=True)
         except IndexError:
@@ -78,7 +85,10 @@ class FrameStore:
             msg = f"sample {s}: could not be decoded ({e})"
             log.warning(msg)
             self.errors.append(msg)
-            return self.placeholder(s, "could not decode this field/frame")
+            ph = self.placeholder(s, "could not decode this field/frame")
+            if len(self._bad) < 10_000:
+                self._bad[s] = ph               # decoding is deterministic: do not retry every redraw
+            return ph
         if smp.bgr is None:
             smp.bgr = cv2.cvtColor(smp.image, cv2.COLOR_GRAY2BGR)
         self._put(smp)

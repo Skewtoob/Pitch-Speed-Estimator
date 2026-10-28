@@ -149,6 +149,7 @@ Steps through every pitch and every "possible missed pitch". The main keys:
 | **X** / Del | reject it (kept in the file as "rejected") |
 | **N** | add a pitch the tool missed: press N at the release, then C at the catch (or B if it was hit) |
 | **E** | re-run the ball tracker between R and C |
+| **G** | side by side: the 8 fields around this one, magnified (see [Picking the exact field](#picking-the-exact-field)) |
 | Space | play/pause, loops around the pitch; `+`/`-` change speed |
 | U | undo |
 | H | all keys |
@@ -225,6 +226,7 @@ distance, so the camera angle, zoom and camera movement don't matter.
    bat if the batter hit it). The speed appears right away. Space plays on to
    the next pitch. (Pressing N, C or B while the video plays just pauses it:
    a mark has to be on the exact field, or the speed would be off.)
+   **G** shows the fields side by side to pick the exact one: see below.
 4. **PgUp** / **PgDn** go back through the pitches you've marked. Near a
    pitch, R/C/B move its marks, X rejects it and U undoes. Keys never change
    a pitch you're not near.
@@ -238,6 +240,35 @@ distance, so the camera angle, zoom and camera movement don't matter.
    highlights video if you choose).
 
 Running the same video again continues where you left off.
+
+### Picking the exact field
+
+On old tape one field is 1/60 s, and **one field off at either end changes
+the speed by about 2-3 mph** (one frame, on video without separate fields,
+by about 4-6 mph). The ball and the arm are small and blurry, so it is easy to
+be a field or two early or late. **G** helps:
+
+1. Pause near the release, **point the mouse at the pitcher's hand** and
+   press **G**. The picture area now shows the **8 fields around this one
+   side by side**, each magnified around the spot you pointed at. The one
+   with the **yellow border** is the field you're on.
+2. Compare them: the arm comes forward, the ball leaves the hand. Press
+   **A**/**D** or **click a picture** to move the yellow border to the
+   **first field with the ball out of the hand**, then press **N**.
+3. Step on to the glove (**D**, or **S** for 10 fields; the pictures follow),
+   **right-click the glove** so it is the magnified spot, put the yellow
+   border on the **first field with the ball in the glove** and press **C**
+   (or **B** at the bat).
+
+**Right-click** a picture to magnify somewhere else, **+** / **-** zoom in
+and out (1.5x to 8x), **G** or **Esc** goes back to the normal view. Marks
+you've made show on the pictures (R, C, B). G works in `pitchspeed review`
+too.
+
+If you can't see the ball leave the hand at all, a rough guide is the arm:
+the ball leaves when the hand is out in front of the head, just before the
+arm whips down across the body. It is only a guide; the ball itself, where
+you can see it, is better.
 
 **How accurate is it?** In a simulation where a quarter of the marks were
 one field off, hand-marked speeds were typically within about 2-3 mph
