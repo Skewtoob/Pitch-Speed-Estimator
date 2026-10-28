@@ -173,33 +173,37 @@ other's results.
 
 ## Accuracy
 
-The ± range on each pitch is the tool's own estimate. On simulated videos
-the true speed fell inside the 90% range at least 90% of the time. What
-limits accuracy:
+The ± range on each pitch is the tool's own estimate of its uncertainty. On
+computer-generated test videos with known speeds, which were not used during
+development, it did this:
+
+| | Side view | Behind the plate |
+|---|---|---|
+| Pitches found | 45 of 45 | 44 of 45 |
+| Typical error (RMS) | 0.7 mph (1 %) | 3.3 mph (6 %) |
+| Pitches given a speed | all | 28 of 44 (the rest: "n/a" with a reason) |
+| True speed inside the 90 % range | 45 of 45 | 27 of 28 |
+
+Details and caveats are in [docs/ACCURACY.md](docs/ACCURACY.md). In short:
 
 - **Side view** is the most accurate. Speed is measured from the ball's
-  motion across the frame, using the rubber-to-plate distance as a ruler.
-  Typical ±1–3%.
+  motion across the frame, with the rubber-to-plate distance as the ruler.
 - **Behind the plate** can only time the flight from release to catch.
-  Two things are uncertain there:
-  - where exactly the pitcher let go: the **extension**, assumed about 5.5 ft
-    in front of the rubber for high-school distances and less for youth
-    fields;
-  - the exact catch instant, when the catcher's body hides the ball.
-
-  Expect roughly ±4–8%. Entering the pitcher's real extension
-  (`--extension`) helps.
-- **Video quality**: the ball is often only 1–3 pixels across. A heavily
-  re-compressed file (e.g. downloaded from YouTube) may have erased it
-  completely. Use the **original capture file** (DV-AVI or MPEG-2 from the
-  capture device) whenever possible.
-- **Deinterlaced or 30p files** lose the half-frame timing. The tool detects
-  this, falls back to whole frames, and widens the ±.
-
-Results on synthetic test videos (computer-generated, with known speeds) are
-in [docs/ACCURACY.md](docs/ACCURACY.md). They show the method works under
-realistic noise, blur, shake and compression. They do **not** prove accuracy
-on real tapes; that needs real footage, ideally with radar readings.
+  - It depends on where the pitcher lets go (the **extension**, assumed
+    about 5.5 ft in front of the rubber at high-school distance, less for
+    youth fields) and on the catch instant, which the catcher often hides.
+  - Expect "poor" (±5–10 %) or "n/a". Entering the pitcher's real
+    extension (`--extension`) and marking release and catch by hand in
+    review help.
+- **Video quality**:
+  - The ball is often only 1–3 pixels across, and heavy re-compression
+    (e.g. a YouTube download) can erase it. Use the **original capture
+    file** (DV-AVI or MPEG-2 from the capture device) whenever possible.
+  - Deinterlaced or 30p files lose the half-frame timing. The tool detects
+    this and widens the ±.
+- **Not yet tested on real tapes or on a Windows PC.** Simulated videos
+  can't prove accuracy on real footage; that needs real clips, ideally with
+  radar readings.
 
 ## Settings you may want
 
