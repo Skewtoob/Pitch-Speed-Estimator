@@ -15,7 +15,6 @@ Files written to `FinderOptions.debug_dir`:
 from __future__ import annotations
 
 import json
-import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -178,20 +177,21 @@ def timeline_image(finder: "PitchFinder", res: "FinderResult", width: int = 1600
     pw = width - left - 10
 
     def X(s):
-        return int(left + (np.asarray(s) - s_lo) / span * pw)
+        v = left + (np.asarray(s, dtype=np.float64) - s_lo) / span * pw
+        return v.astype(int) if np.ndim(v) else int(v)
 
     # windows
-    def band(s0, s1, col):
-        cv2.rectangle(img, (X(s0), top), (max(X(s1), X(s0) + 1), H - 30), col, -1)
+    def band(s0, s1, col, y0=top, y1=H - 30):
+        cv2.rectangle(img, (X(s0), y0), (max(X(s1), X(s0) + 1), y1), col, -1)
 
     for d in res.possible_missed:
         band(d["s_start"], d["s_end"], (0, 70, 120))
-    for p in res.rejected:
-        if p.points:
-            band(p.points[0].s, p.points[-1].s, (40, 40, 110))
     for p in res.tracks:
         if p.points:
             band(p.points[0].s, p.points[-1].s, (40, 110, 40))
+    for p in res.rejected:                       # thin strip: there can be many
+        if p.points:
+            band(p.points[0].s, p.points[-1].s, (60, 60, 200), H - 28, H - 20)
     for i, (name, v, s, rng) in enumerate(rows):
         y0 = top + i * rh
         cv2.rectangle(img, (left, y0 + 4), (width - 10, y0 + rh - 4), (70, 70, 70), 1)
@@ -213,7 +213,8 @@ def timeline_image(finder: "PitchFinder", res: "FinderResult", width: int = 1600
             yy = int(y0 + rh - 6 - colmax[c] * (rh - 12))
             cv2.line(img, (int(c), y0 + rh - 6), (int(c), yy), (200, 200, 200), 1)
         _text(img, f"{hi:.3g}", (left - 45, y0 + 14), (160, 160, 160), 0.35)
-    _text(img, f"samples {s_lo}..{s_hi}   green: pitch   red: rejected   orange: possible missed", (left, 20))
+    _text(img, f"samples {s_lo}..{s_hi}   green: pitch   red strip: rejected tracks   orange: possible missed",
+          (left, 20))
     for p in res.tracks:
         if p.release is not None and p.release.s is not None:
             cv2.line(img, (X(p.release.s), top), (X(p.release.s), H - 30), GREEN, 1)

@@ -1,8 +1,8 @@
 """Turn a fitted track into a `PitchTrack`: reject codes, events, confidence.
 
 Reject codes (cv.md section 5): TOO_SHORT, NO_PROGRESS, THROWBACK,
-OFF_AXIS, SPEED_IMPLAUSIBLE, POOR_FIT (rms > 2 px, or < 60 % inliers, or
-inliers cover < 40 % of the spanned samples), DUPLICATE (finder, across
+OFF_AXIS, SPEED_IMPLAUSIBLE, POOR_FIT (rms > 2 px, or < 50 % inliers between
+the first and last inlier, or inliers cover < 40 % of the spanned samples), DUPLICATE (finder, across
 tracks); additionally NO_EVENTS (release or catch time not determinable)
 and LOW_CONFIDENCE (confidence < FinderOptions.min_confidence, default 0.1).
 End kinds: 'catch' | 'contact' | 'occluded' | 'lost'.
@@ -26,18 +26,33 @@ release
     in diagnostics; if it is precise and disagrees by > 2 sigma the flag
     'release_methods_disagree' is set and sigma is inflated to cover both.
   If the first clean detection is far into the flight (behind view) the
-    flag 'release_not_observed' is set.
-catch
-  'last_moving_field': the track reaches the glove zone (progress >=
-    catch_near_progress) and stops: t = t_last + dt / 2 (catch somewhere in
-    the next field interval), sigma = dt / sqrt(12).
-  'extrapolated' (stop point): if the ball is found again in the next
-    field nearer than predicted (stopped in the glove), t is the time the
-    model reaches that point, clipped to [t_last, t_last + dt], sigma 3 ms.
-  'extrapolated' (occluded / lost end): the model is extrapolated to the
-    catch progress (s = 1); sigma combines the model uncertainty and the
-    glove-position uncertainty (catch_sigma_ft / v side, 0.15 |Pc - Prel|
-    in the image for behind views).  end_kind 'occluded' or 'lost'.
+    flag 'release_not_observed' is set and the release is taken uniform over
+    [catch - slowest plausible flight time, first clean detection].
+  If weak / attached detections on the flight path run continuously from
+    earlier up to the first clean one (the ball merged with the hand), the
+    release is taken as the middle of [t_pre, t_clean] - latency with sigma
+    covering the interval (flag 'release_uncertain').
+catch  (t_c = time the fitted track crosses the catch point, progress 1)
+  'last_moving_field': t_c <= t_last + dt (the catch point is reached in the
+    field interval after the last detection): t = t_last + dt / 2,
+    sigma^2 = dt^2/12 + (dt/2)^2 (+ sigma_glove^2 behind the plate, where the
+    ball usually vanishes behind the catcher).
+  'extrapolated', track ran > 2 ft past the catch point (side view): the
+    last detections are glove / catcher motion; t = t_c, sigma from the
+    model and the glove-position prior (flag 'track_past_catch_point').
+  'extrapolated', track ended before the catch point: the glove may have
+    been in front of the click (caught right away) or the ball was hidden,
+    so the catch is taken uniform over [t_last + dt/2, t_c]: t = middle,
+    sigma^2 = width^2/12 + sigma_model^2 + sigma_glove^2 + dt^2/12, with
+    sigma_glove = catch_sigma_ft / v (side) or 0.15 |Pc - Prel| / image
+    speed (behind).  end_kind 'occluded' (runs into a body blob) or 'lost';
+    flag 'catch_extrapolated'.  Side view only: if the ball is seen again in
+    the next field short of the prediction (stopped in the glove), t is the
+    model's closest approach to that point (sigma dt / sqrt(12)).
+  Uninformative ('catch_not_observed'): extrapolation longer than 0.25 s
+    (side) or 6 fields (behind, degenerate there, math.md 4b) or outside
+    the flight-time window: t = middle of the plausible window given the
+    release, sigma = window / sqrt(12).
   'contact': a fast candidate track leaves the end point within
     `contact_gap` samples in another direction: end_kind 'contact', t as for
     'last_moving_field'.
@@ -57,7 +72,7 @@ from pitchspeed.types import EventTime, PitchTrack, TrackPoint
 from pitchspeed.vision.geometry import ViewGeometry
 from pitchspeed.vision.model import TrajModel
 from pitchspeed.vision.options import FinderOptions
-from pitchspeed.vision.track import CandStore, Track, _in_blob, _zmap_peak, field_order_check
+from pitchspeed.vision.track import CandStore, Track, _in_blob, field_order_check
 
 MPH = C.MPH_TO_FTPS
 
@@ -119,6 +134,7 @@ class Segmenter:
         self.rs = 2 if interlaced else 1
         self.store = store
         self.quality_of = quality_of or (lambda s0, s1: 1.0)
+        self.s_range = (None, None)          # (first, last) processed sample, set by the finder
 
     # -------------------------------------------------------------- main
     def classify(self, tr: Track, manual: bool = False) -> PitchTrack:
@@ -193,11 +209,14 @@ class Segmenter:
             if (abs(lat[0]) > o.off_axis_rel + max(0.0, prog[0]) * 0.3 or abs(lat[-1]) > o.off_axis_catch + 0.1) \
                     and not manual:
                 return self._reject(pt, "OFF_AXIS")
-        n_all = len(pts)
-        span = int(Ai["s"][-1] - Ai["s"][0] + 1)
+        # leading / trailing outliers (extension into the hand or the glove) are not a
+        # poor fit; judge the inlier share between the first and the last inlier
+        s_in0, s_in1 = int(Ai["s"][0]), int(Ai["s"][-1])
+        n_all = sum(1 for p in pts if s_in0 <= p.s <= s_in1)
+        span = s_in1 - s_in0 + 1
         diag["inlier_fraction"] = n_inl / max(1, n_all)
         diag["coverage"] = n_inl / max(1, span)
-        if (m.rms > o.max_rms_px or n_inl < 0.6 * n_all or n_inl < 0.4 * span) and not manual:
+        if (m.rms > o.max_rms_px or n_inl < 0.5 * n_all or n_inl < 0.4 * span) and not manual:
             return self._reject(pt, "POOR_FIT")
         # speed (side view): along-axis image speed of the model
         v_mph = None
@@ -212,6 +231,15 @@ class Segmenter:
         # events
         rel = self._release(tr, m, Ai, prog, diag, pt.flags)
         cat, end_kind = self._catch(tr, m, Ai, prog, diag, pt.flags, rel)
+        if (rel is not None and cat is not None and g.view == "behind"
+                and "release_not_observed" in pt.flags and rel.method == "first_free_field"):
+            # the first clean detection is deep in the flight: all we know is
+            # catch - (slowest plausible flight) <= release <= first clean detection
+            lo, hi = cat.t - g.t_window[1], rel.t
+            if hi > lo:
+                rel = EventTime(t=0.5 * (lo + hi), sigma=(hi - lo) / math.sqrt(12.0), method="first_free_field",
+                                s=self._nearest_s(0.5 * (lo + hi)))
+                diag["release_interval"] = [lo, hi]
         pt.release, pt.catch, pt.end_kind = rel, cat, end_kind
         if (rel is None or cat is None) and not manual:
             return self._reject(pt, "NO_EVENTS")
@@ -314,6 +342,17 @@ class Segmenter:
         diag["progress_first_clean"] = p_clean
         if p_clean > 0.15:
             flags.append("release_not_observed")
+        # Evidence of the ball before the first clean detection (weak, attached or
+        # off-model detections near the release end that run continuously into it):
+        # the ball was probably there but merged with the hand -> the release lies
+        # anywhere in [t_pre, t_clean] - latency.  Widen sigma to that interval.
+        t_pre = self._pre_clean_start(tr, P[i_clean])
+        if t_pre is not None and t_clean - t_pre >= 2 * dt:
+            flags.append("release_uncertain")
+            lo, hi = t_pre - lat_m, t_clean - lat_m
+            t_rel = 0.5 * (lo + hi)
+            sigma = math.sqrt(lat_s ** 2 + (hi - lo) ** 2 / 12.0 + dt * dt / 12.0)
+            diag["release_pre_clean_t"] = t_pre
         if t_x is not None and np.isfinite(sig_x) and sig_x < 2 * dt:
             delta = t_x - t_rel
             diag["release_methods_delta"] = delta
@@ -322,7 +361,41 @@ class Segmenter:
                 sigma = math.sqrt(sigma ** 2 + (delta / 2) ** 2)
         return EventTime(t=float(t_rel), sigma=float(sigma), method="first_free_field", s=self._nearest_s(t_rel))
 
+    def _pre_clean_start(self, tr, clean) -> Optional[float]:
+        """Earliest time of a near-continuous run of detections (any kind) ending at the
+        first clean one, near the release end of the corridor (progress <= 0.2)."""
+        g, o = self.geom, self.opts
+        m = tr.model
+        before = [p for p in tr.sorted() if p.s < clean.s and p.z >= o.z_pass2]
+        t_pre, s_prev = None, clean.s
+        for p in reversed(before):
+            if s_prev - p.s > 3:
+                break
+            prog = float(g.progress(np.array([[p.x, p.y]]))[0])
+            # in-hand positions lie behind the release point and off the flight path
+            if prog > 0.2 or prog < -0.03:
+                break
+            if m is not None:
+                q = m.eval([p.t])[0]
+                d = float(np.hypot((q[0] - p.x) * g.sar, q[1] - p.y))
+                if d > max(3.0, 1.5 * float(g.ball_diameter(prog))):
+                    break
+            t_pre, s_prev = p.t, p.s
+        return t_pre
+
     def _nearest_s(self, t: float) -> Optional[int]:
+        """Nearest sample index to time t, clamped to the samples processed so far."""
+        s = self._nearest_s_raw(t)
+        if s is None:
+            return None
+        lo, hi = self.s_range
+        if lo is not None:
+            s = max(int(lo), s)
+        if hi is not None:
+            s = min(int(hi), s)
+        return int(s)
+
+    def _nearest_s_raw(self, t: float) -> Optional[int]:
         best, bd = None, float("inf")
         for s, df in self.store.frames.items():
             d = abs(df.t - t)
@@ -344,7 +417,11 @@ class Segmenter:
         v = m.vel([last.t])[0]
         v_sq = float(np.hypot(v[0] * g.sar, v[1]))             # square px / s
         catch_sig_ft = float(self.opts.extra.get("catch_sigma_ft", C.CATCH_SIGMA_FT))
-        lmf = EventTime(t=last.t + dt / 2, sigma=dt / math.sqrt(12), method="last_moving_field", s=last.s + 1)
+        # catch in the field interval after the last detection (dt^2/12), plus half a
+        # field for a track ending one field early / late (measured on the synthetic
+        # suite: RMS 8 ms vs 4.8 ms for dt/sqrt(12) alone)
+        lmf = EventTime(t=last.t + dt / 2, sigma=math.sqrt(dt * dt / 12 + (dt / 2) ** 2),
+                        method="last_moving_field", s=self._nearest_s(last.t + dt))
         # contact: a fast departing track
         if self._contact(tr, m, last):
             flags.append("contact")
@@ -356,16 +433,19 @@ class Segmenter:
             if rate > 1e-6:
                 t_c = last.t + (1.0 - p_last) / rate
         diag["catch_point_crossing_t"] = t_c
-        stop = self._stop_point(tr, m, last)
-        if stop is not None and p_last >= 0.6:
-            t_s, gpt = stop
-            diag["glove_point"] = [float(gpt[0]), float(gpt[1])]
-            return EventTime(t=float(t_s), sigma=dt / math.sqrt(12), method="extrapolated", s=last.s), "catch"
         T_lo, T_hi = g.t_window
         lo, hi = last.t + dt / 2, last.t + T_hi
         if rel is not None:
             lo = max(lo, rel.t + T_lo)
             hi = max(lo + dt, rel.t + T_hi)
+        if g.view == "side":
+            v_fts = max(v_sq / max(g.scale_rel, 1e-6), 1.0)
+            sig_glove = catch_sig_ft / v_fts                  # glove position along the axis, in time
+            max_ext = 0.25
+        else:
+            rate = abs(_progress_rate(m, g, t_c)) if t_c is not None else 0.0
+            sig_glove = 0.15 / max(rate, 1e-6)                # glove position in the image, in time
+            max_ext = 6 * dt                                  # longer extrapolation is degenerate (math.md 4b)
 
         def prior(kind):
             flags.append("catch_not_observed")
@@ -373,48 +453,50 @@ class Segmenter:
             return EventTime(t=float(t_mid), sigma=float((hi - lo) / math.sqrt(12.0)), method="extrapolated",
                              s=self._nearest_s(t_mid)), kind
 
-        def extrap(t_x, sig_g, kind):
-            sig_m = _time_sigma(m, g, t_x)
-            sigma = math.sqrt(min(sig_m, 1.0) ** 2 + min(sig_g, 1.0) ** 2 + dt * dt / 12)
-            diag["catch_extrapolation_s"] = t_x - last.t
-            if t_x - last.t > 0.15:
-                flags.append("catch_far_extrapolated")
-            return EventTime(t=float(t_x), sigma=float(sigma), method="extrapolated", s=self._nearest_s(t_x)), kind
-
-        if g.view == "side":
-            L_ft = max(1.0, g.length_ft)
-            v_fts = max(v_sq / max(g.scale_rel, 1e-6), 1.0)
-            if p_last > 1.0 + 2.0 / L_ft and t_c is not None and t_c < last.t:
-                # the track ran > 2 ft past the catch point: the last detections are most
-                # likely glove / catcher motion on the extrapolated path
-                flags.append("track_past_catch_point")
-                return extrap(t_c, catch_sig_ft / v_fts, "catch")
-            if (1.0 - p_last) * L_ft <= 1.5:
-                return lmf, "catch"
-            end_kind = "occluded" if self._end_occluded(tr, +1) else "lost"
-            flags.append("catch_extrapolated")
-            if t_c is None or not (lo <= t_c <= hi) or t_c - last.t > 0.25:
-                return prior(end_kind)
-            return extrap(t_c, catch_sig_ft / v_fts, end_kind)
-        # behind view: image progress is non-linear; judge in samples of remaining motion
         if t_c is None:
-            if p_last >= o.catch_near_progress - 0.1:
+            if p_last >= 1.0 or (g.view == "behind" and p_last >= o.catch_near_progress - 0.1):
                 return lmf, "catch"
             flags.append("catch_extrapolated")
             return prior("occluded" if self._end_occluded(tr, +1) else "lost")
-        n_rem = (t_c - last.t) / dt
-        diag["catch_remaining_samples"] = n_rem
-        if n_rem <= 1.0:
+        diag["catch_remaining_samples"] = (t_c - last.t) / dt
+        if g.view == "behind":
+            # behind the plate the ball usually disappears behind the catcher, and the
+            # glove is not at the clicked point: add the glove-position spread
+            lmf = EventTime(t=lmf.t, sigma=math.sqrt(lmf.sigma ** 2 + min(sig_glove, 3 * dt) ** 2),
+                            method=lmf.method, s=lmf.s)
+        if t_c <= last.t + dt:
+            # the catch point is reached within the next field interval (or was passed)
+            if g.view == "side" and t_c < last.t and p_last > 1.0 + 2.0 / max(1.0, g.length_ft):
+                # > 2 ft past the catch point: the last detections are most likely
+                # glove / catcher motion on the extrapolated path
+                flags.append("track_past_catch_point")
+                sigma = math.sqrt(min(_time_sigma(m, g, t_c), 1.0) ** 2 + sig_glove ** 2)
+                return EventTime(t=float(t_c), sigma=float(sigma), method="extrapolated",
+                                 s=self._nearest_s(t_c)), "catch"
             return lmf, "catch"
+        # The ball should have been seen again before reaching the catch point.  Either the
+        # glove was in front of the clicked point (caught right after the last detection)
+        # or the ball was hidden / lost: the catch lies in [t_last, t_c] (+ glove spread).
+        if g.view == "side":
+            stop = self._stop_point(tr, m, last)
+            if stop is not None:
+                t_s, gpt = stop
+                diag["glove_point"] = [float(gpt[0]), float(gpt[1])]
+                return EventTime(t=float(t_s), sigma=dt / math.sqrt(12), method="extrapolated",
+                                 s=last.s), "catch"
         end_kind = "occluded" if self._end_occluded(tr, +1) else "lost"
         flags.append("catch_extrapolated")
-        # long extrapolations are degenerate behind the plate (perspective scale / time
-        # ambiguity, math.md 4b); a few samples toward the clicked glove point are fine
-        if n_rem > 6.0 or not (lo <= t_c <= hi):
+        if t_c - last.t > max_ext or not (lo <= t_c <= hi):
             return prior(end_kind)
-        rate = abs(_progress_rate(m, g, t_c))
-        sig_g = max(0.15 / max(rate, 1e-6), 0.35 * (t_c - last.t))
-        return extrap(t_c, sig_g, end_kind)
+        a, b = last.t + dt / 2, t_c
+        t_mid = 0.5 * (a + b)
+        sig_m = min(_time_sigma(m, g, t_c), 1.0)
+        sigma = math.sqrt((b - a) ** 2 / 12.0 + sig_m ** 2 + sig_glove ** 2 + dt * dt / 12.0)
+        diag["catch_extrapolation_s"] = t_c - last.t
+        if t_c - last.t > 0.15:
+            flags.append("catch_far_extrapolated")
+        return EventTime(t=float(t_mid), sigma=float(sigma), method="extrapolated",
+                         s=self._nearest_s(t_mid)), end_kind
 
     def _stop_point(self, tr, m, last):
         """Ball seen in the next field short of the prediction (stopped in the glove)."""
@@ -517,7 +599,7 @@ class Segmenter:
                 lo, hi = g.t_window
                 f_speed = 1.0 if lo <= T <= hi else 0.3
         s0, s1 = int(Ai["s"][0]), int(Ai["s"][-1])
-        f_mc = float(min(1.0, max(0.0, self.quality_of(s0, s1)) / 0.15))
+        f_mc = float(min(1.0, max(0.0, self.quality_of(s0, s1)) / 0.15))   # median q, see finder
         f_cue = 1.0 if diag.get("delivery_cue") else 0.8
         conf = f_snr * f_cov * f_fit * f_ends * f_speed * f_mc * f_cue
         diag["confidence_factors"] = {"snr": f_snr, "coverage": f_cov, "fit": f_fit, "ends": f_ends,

@@ -21,6 +21,7 @@ class FinderOptions:
     stab_max_features: int = 300
     stab_ransac_thr: float = 1.0          # square px
     stab_min_inliers: int = 30
+    stab_homography: str = "auto"         # 'auto' | 'prefer' | 'never' (see stabilize.py)
     border_px: int = 12                   # feature-free left/right border (frame px)
     bottom_rows: int = 12                 # feature-free bottom lines (VHS head switching)
     corridor_feature_margin: int = 12     # dilate the corridor for the feature mask (px)
@@ -60,6 +61,7 @@ class FinderOptions:
     merge_dist_px: float = 3.0
     merge_gap: int = 12
     ransac_iters: int = 200
+    max_builds_per_run: int = 40          # track builds per tracker run (bounded work in clutter)
     pass2: bool = True
     pass2_back: int = 14                  # samples to search before the first point
     pass2_fwd: int = 8
@@ -84,7 +86,7 @@ class FinderOptions:
     # true release and the first clean detection.  Prior measured on the
     # synthetic clips (see finder module docstring); revisit on real footage.
     release_latency_mean: float = 1.0
-    release_latency_sigma: float = 1.0
+    release_latency_sigma: float = 1.5
     catch_near_progress: float = 0.85     # track reaching this progress ends at the glove
 
     # ---- cues

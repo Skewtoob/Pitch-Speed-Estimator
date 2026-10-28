@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -209,13 +209,14 @@ def find_seeds(store: CandStore, s_lo: int, s_hi: int, geom: ViewGeometry, opts:
                 for ci in np.nonzero(ok)[0]:
                     C_list.append((g2, c[ci], v2[ci]))
             for g1, a, v1 in A_list:
+                n1 = math.hypot(v1[0], v1[1])
                 for g2, c, v2 in C_list:
                     if g1 + g2 > 4:
                         continue
-                    tol = max(1.5, 0.25 * float(np.linalg.norm(v1))) * (g1 + g2) / 2.0
-                    if np.linalg.norm(v2 - v1) > tol:
+                    tol = max(1.5, 0.25 * n1) * (g1 + g2) / 2.0
+                    if math.hypot(v2[0] - v1[0], v2[1] - v1[1]) > tol:
                         continue
-                    if float(v1 @ v2) <= 0:
+                    if v1[0] * v2[0] + v1[1] * v2[1] <= 0:
                         continue
                     zsum = float(a["z"] + b["z"] + c["z"])
                     if zsum < 3.0 * opts.z_strong:

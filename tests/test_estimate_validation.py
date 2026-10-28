@@ -53,10 +53,11 @@ def test_side_view_perpendicular(kind):
     assert st.rms < 2.3
 
 
-def test_side_view_very_oblique_falls_back_to_time_of_flight():
+def test_side_view_very_oblique_is_not_measurable_without_manual_events():
     st = H.run_side("deep-oblique", "75FB", 20, seed=23)
-    assert st.methods == {"tof": 20}
-    assert st.flags.get("oblique_view") == 20
+    assert st.n_none == 20 and st.flags.get("oblique_view") == 20
+    man = H.run_side("deep-oblique", "75FB", 20, seed=23, manual=True)
+    assert man.n_none == 0 and man.methods == {"manual_tof": 20}
 
 
 # ------------------------------------------------------------------ slow
@@ -77,16 +78,18 @@ def test_behind_view_grid(scenario, kind):
 def test_side_view_grid(scene, kind):
     st = H.run_side(scene, kind, 150, seed=32)
     print(st.line(f"side {scene} {kind}"))
-    # n = 150: +-2.5 binomial sd around 0.90-0.95.  Strongly oblique scenes may
-    # over-cover: the focal length (hence phi) is only loosely determined there,
-    # and E2 is (partly) rejected in favour of the conservative time of flight;
-    # at 66 deg some pitches are honestly 'not measurable'.
-    oblique = scene in ("mound-side", "deep-oblique")
-    _check(st, 0.84, 1.0 if oblique else 0.985, 1.0 if oblique else 0.8, allow_none=scene == "deep-oblique")
+    # n = 150: +-2.5 binomial sd around 0.90-0.95.  mound-side (42 deg) may
+    # over-cover: the focal length (hence phi) is only loosely determined, E2 is
+    # partly rejected in favour of the conservative time of flight, and a few
+    # pitches are gated as too oblique (no number).
+    if scene == "deep-oblique":          # 66 deg: neither E2 nor an image-space release is trusted
+        assert st.n_none == st.n and st.flags.get("oblique_view") == st.n
+        return
+    mound = scene == "mound-side"      # some pitches are gated as too oblique (phi known to a few deg)
+    _check(st, 0.84, 1.0 if mound else 0.985, 0.8, allow_none=mound)
+    assert st.n_none <= 0.25 * st.n
     if scene in SIDE_RMS:
         assert st.rms < SIDE_RMS[scene][SIDE_KINDS.index(kind)] + 0.7
-    if scene == "deep-oblique":
-        assert st.methods.get("side_fit", 0) == 0
 
 
 @pytest.mark.slow

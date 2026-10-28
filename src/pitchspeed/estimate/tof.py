@@ -53,6 +53,12 @@ def _timing_inflation(scan: Optional[ScanInfo], sample_dt: float, track_flags) -
     return var, flags, notes
 
 
+# An image-space (side-view 'extrapolated') release time is not trusted when
+# E2's obliquity estimate exceeds this, or when even the widest plausible lens
+# gives more than MAX_OBLIQUITY_MIN_DEG (validation: fine at 42 deg, biased by
+# 5-15 % at 66 deg, where phi is sometimes under-estimated by ~10 deg).
+MAX_OBLIQUITY_FOR_IMAGE_RELEASE_DEG = 55.0
+MAX_OBLIQUITY_MIN_DEG = 45.0
 SIDE_RELEASE_CLICK_SIGMA_FT = 0.3     # a clicked release point (2 px) mapped to world y
 SIDE_RELEASE_NO_RHO_SIGMA_FT = 1.5    # rho unknown: the affine map can be off by ~1-2 ft near the rubber
 
@@ -189,7 +195,16 @@ def tof_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: float,
         "rel_sigma_k": abs(dv_k) / v0,
         "dv_k_mph": K.mph(dv_k),
     }
-    if not (K.V_MIN_MPH <= K.mph(v0) <= K.V_MAX_MPH):
+    phi = (side or {}).get("phi_deg")
+    phi_min = (side or {}).get("phi_min_deg")
+    too_oblique = ((K.finite(phi) and phi > MAX_OBLIQUITY_FOR_IMAGE_RELEASE_DEG)
+                   or (K.finite(phi_min) and phi_min > MAX_OBLIQUITY_MIN_DEG))
+    if at_point and too_oblique:
+        details["usable"] = False
+        details["reason"] = (f"camera too oblique (phi ~ {phi:.0f} deg) for a release time extrapolated in "
+                             f"the image; mark the release by hand or calibrate as a behind-plate view")
+        details["flags"] = sorted(set(flags + [K.F_OBLIQUE]))
+    elif not (K.V_MIN_MPH <= K.mph(v0) <= K.V_MAX_MPH):
         details["usable"] = False
         details["reason"] = (f"time of flight gives {K.mph(v0):.0f} mph, outside "
                              f"{K.V_MIN_MPH:.0f}-{K.V_MAX_MPH:.0f} mph: check release/catch and distance")

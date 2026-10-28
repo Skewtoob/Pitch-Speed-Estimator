@@ -18,14 +18,17 @@ Coordinates: candidate / track positions are reference-frame pixel
 coordinates (stored pixels, *frame* rows) -- see `pitchspeed.types`.
 
 Release latency prior (behind view, 'first_free_field'): default
-1.0 +- 1.0 samples between the true release and the first clean detection.
-On the prototype synthetic clips the first clean detection came 0.6-1.6
-fields after the true release; real tapes may differ (hand occlusion,
-blur), which is why the sigma is a full field.  Revisit with labelled
-footage.  See `segment` for the exact event semantics.
+1.0 +- 1.5 samples between the true release and the first clean detection.
+On 10 synthetic behind-view pitches where the ball was seen right after
+release the latency was -1.7 .. +3.5 fields (mean ~1.0, sd ~1.9; negative
+= ball visible in the hand); when the ball stays merged with the hand the
+first clean detection can come 10+ fields late, which `segment` widens
+via 'release_uncertain' but cannot always detect.  Real tapes may differ;
+revisit with labelled footage.  See `segment` for the exact event
+semantics.
 
-Rejected tracks keep their reject code; tracks with fewer than 5 points
-that never looked like a ball flight (seed score < 30) are only counted
+Rejected tracks keep their reject code; tracks with fewer than 6 points
+that never looked like a ball flight (seed score < 40) are only counted
 (`diagnostics['n_discarded_short']`) and, with `debug_dir`, written to
 tracks.jsonl.  "Possible missed pitch" windows come from a delivery-energy
 cue (activity near the release point followed by activity near the catch
@@ -36,7 +39,7 @@ from __future__ import annotations
 
 import logging
 import math
-import os
+import time
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
@@ -104,7 +107,7 @@ class PitchFinder:
         o = self.opts
         static = self._static_mask(ref.shape)
         so = StabilizerOptions(max_features=o.stab_max_features, ransac_thr=o.stab_ransac_thr,
-                               min_inliers=o.stab_min_inliers)
+                               min_inliers=o.stab_min_inliers, homography=o.stab_homography)
         self.stab = Stabilizer(ref, calib.sar, self.interlaced, static, so)
         self.debug = bool(o.debug_dir)
         self.det = Detector(self.geom, self.interlaced, self.shape, o, ref_masks=self.masks,
@@ -129,6 +132,7 @@ class PitchFinder:
         self._n_overlay = 0
         self._finished: Optional[FinderResult] = None
         self._diag = {"n_discarded_short": 0, "n_seeds": 0, "n_tracks_built": 0, "n_merged": 0}
+        self._time = {"stabilize": 0.0, "detect": 0.0, "track": 0.0}
         self._t_first: Optional[float] = None
         self._s_first: Optional[int] = None
         self._s_last: Optional[int] = None
@@ -153,8 +157,14 @@ class PitchFinder:
         return m
 
     def _min_quality(self, s0: int, s1: int) -> float:
-        qs = [self._qd.get(s, 0.0) for s in range(s0, s1 + 1) if s in self._qd]
-        return float(min(qs)) if qs else 0.0
+        """Registration quality over a sample range: median quality times sqrt(share registered)."""
+        qs = np.array([self._qd[s] for s in range(s0, s1 + 1) if s in self._qd])
+        if not len(qs):
+            return 0.0
+        ok = qs > 0
+        if not ok.any():
+            return 0.0
+        return float(np.median(qs[ok]) * math.sqrt(ok.mean()))
 
     # ----------------------------------------------------------- stream
     def process(self, sample: Sample) -> None:
@@ -167,7 +177,9 @@ class PitchFinder:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         if img.shape != self.shape:
             img = np.ascontiguousarray(img[:self.shape[0], :self.shape[1]])
+        t0 = time.perf_counter()
         r = self.stab.register(img, sample.parity)
+        self._time["stabilize"] += time.perf_counter() - t0
         if self._s_first is None:
             self._s_first, self._t_first = sample.s, sample.t
         self._s_last = sample.s
@@ -181,7 +193,10 @@ class PitchFinder:
         self._qd[sample.s] = r.quality
         self._method.append(r.method)
         self._update_overlay_mask()
-        for df in self.det.push(sample.s, sample.t, sample.k, sample.parity, img, r.A, r.quality):
+        t0 = time.perf_counter()
+        dfs = self.det.push(sample.s, sample.t, sample.k, sample.parity, img, r.A, r.quality)
+        self._time["detect"] += time.perf_counter() - t0
+        for df in dfs:
             self._on_detection(df)
 
     def _update_overlay_mask(self) -> None:
@@ -223,6 +238,13 @@ class PitchFinder:
 
     # ---------------------------------------------------------- tracking
     def _run_tracker(self, final: bool) -> None:
+        t0 = time.perf_counter()
+        try:
+            self._run_tracker_inner(final)
+        finally:
+            self._time["track"] += time.perf_counter() - t0
+
+    def _run_tracker_inner(self, final: bool) -> None:
         st = self.store
         if not st.frames:
             return
@@ -241,14 +263,20 @@ class PitchFinder:
         if seed_hi >= seed_lo:
             seeds = find_seeds(st, seed_lo, seed_hi, self.geom, o)
             self._diag["n_seeds"] += len(seeds)
+            n_built = 0
             for seed in seeds:
                 _, a, b, c = seed
                 if any(st.is_used(int(n["s"]), int(n["uid"])) for n in (a, b, c)):
                     continue
+                if n_built >= o.max_builds_per_run:
+                    # bounded work in heavy clutter; seeds are processed strongest first
+                    self._diag["n_seeds_skipped"] = self._diag.get("n_seeds_skipped", 0) + 1
+                    continue
+                n_built += 1
                 tr = build_track(self._next_tid, seed, st, self.geom, o, self.dt, s_lo, s_hi,
                                  self.s_min_allowed, self.s_max_allowed)
                 self._diag["n_tracks_built"] += 1
-                if tr.n_inliers < 5 and not tr.open_fwd and tr.seed_score < 30:
+                if tr.n_inliers < 6 and not tr.open_fwd and tr.seed_score < 40:
                     self._discard(tr)
                     continue
                 self._next_tid += 1
@@ -256,13 +284,12 @@ class PitchFinder:
                 self._open.append(tr)
             self._seed_hi = seed_hi
         # finalize
-        keep = []
         for tr in sorted(self._open, key=lambda t: t.s_first):
+            if tr.info.get("merged_into") is not None or tr not in self._open:
+                continue                       # absorbed by a merge in this loop
             if final or (tr.s_last < s_hi - o.finalize_lag and not tr.open_fwd):
+                self._open.remove(tr)
                 self._finalize(tr)
-            else:
-                keep.append(tr)
-        self._open = keep
 
     def _discard(self, tr: Track) -> None:
         self._diag["n_discarded_short"] += 1
@@ -273,8 +300,6 @@ class PitchFinder:
 
     def _finalize(self, tr: Track) -> None:
         o, st = self.opts, self.store
-        if tr in self._open:
-            pass
         # merge with other ended fragments
         for other in list(self._open):
             if other is tr or other.model is None or tr.model is None:
@@ -286,31 +311,42 @@ class PitchFinder:
                 st.claim(other, False)
                 st.claim(tr, False)
                 self._open.remove(other)
+                other.info["merged_into"] = tr.tid
                 m.tid = tr.tid
                 tr.pts, tr.model, tr.open_fwd = m.pts, m.model, m.open_fwd
                 st.claim(tr)
                 self._diag["n_merged"] += 1
-        if o.pass2 and tr.model is not None:
+        if o.pass2 and tr.model is not None and self._worth_pass2(tr):
             n_add = pass2(tr, st, self.geom, o, self.rs, clutter_factor=self.det._clutter_factor,
                           s_min_allowed=self.s_min_allowed, s_max_allowed=self.s_max_allowed)
             if n_add:
                 fit_track(tr, self.geom, o)
                 st.claim(tr)
         tr.info["delivery_cue"] = self._delivery_cue(tr)
+        self.seg.s_range = (self._s_first, self._s_last)
         pt = self.seg.classify(tr)
         pt.diagnostics["delivery_cue"] = tr.info["delivery_cue"]
-        if pt.status == "rejected" and pt.reject_code == "TOO_SHORT" and len(pt.points) < 5 and tr.seed_score < 30:
+        if pt.status == "rejected" and pt.reject_code == "TOO_SHORT" and len(pt.points) < 6 and tr.seed_score < 40:
             st.claim(tr, False)
             self._discard(tr)
             return
         rec = _Record(track=tr, pt=pt)
-        if self.debug:
+        n_rej_img = sum(1 for r in self._records if r.strobe is not None and r.pt.status != "pitch")
+        if self.debug and (pt.status == "pitch" or n_rej_img < self.opts.debug_max_pitch_images):
             from pitchspeed.vision import debug as D
             try:
                 rec.strobe = D.strobe_image(tr, pt, st, self.geom, self.rs)
             except Exception as e:      # debug output must never break the analysis
                 log.debug("strobe image failed: %s", e)
         self._records.append(rec)
+
+    def _worth_pass2(self, tr: Track) -> bool:
+        """Cheap pre-check: pass 2 only for tracks that could still become pitches."""
+        A = tr.arrays(inliers_only=True)
+        if len(A["t"]) < self.opts.min_inliers - 2:
+            return False
+        prog = self.geom.progress(np.stack([A["x"], A["y"]], 1))
+        return bool(prog[-1] - prog[0] > 0.02)
 
     def _delivery_cue(self, tr: Track) -> bool:
         """Activity burst near the release point shortly before the track."""
@@ -333,13 +369,17 @@ class PitchFinder:
     def finish(self) -> FinderResult:
         if self._finished is not None:
             return self._finished
-        for df in self.det.flush():
+        t0 = time.perf_counter()
+        flushed = self.det.flush()
+        self._time["detect"] += time.perf_counter() - t0
+        for df in flushed:
             self.store.add(df)
             tl = self._tl
             for k, v in (("s", df.s), ("t", df.t), ("n", len(df.cands)), ("sigma", df.sigma),
                          ("e_rel", df.e_rel), ("e_catch", df.e_catch), ("skipped", df.skipped)):
                 tl[k].append(v)
         self._run_tracker(final=True)
+        self._parity_pairs()
         tracks, rejected = self._resolve_duplicates()
         missed = self._possible_missed(tracks, rejected)
         n = len(self._s)
@@ -348,6 +388,7 @@ class PitchFinder:
         diag.update(self._summary())
         diag["transforms_3x3"] = np.array(self._H, dtype=np.float64).reshape(n, 3, 3) if n else np.zeros((0, 3, 3))
         diag["n_homography_samples"] = int(self._n_h)
+        diag["timing_ms_per_sample"] = {k: 1000.0 * v / max(1, n) for k, v in self._time.items()}
         res = FinderResult(tracks=tracks, rejected=rejected, possible_missed=missed, transforms=transforms,
                            transform_quality=np.array(self._q, dtype=np.float64),
                            sample_index=np.array(self._s, dtype=np.int64), diagnostics=diag)
@@ -361,6 +402,42 @@ class PitchFinder:
         res.diagnostics.pop("discarded", None)
         self._finished = res
         return res
+
+    def _parity_pairs(self) -> None:
+        """Field-order check across tracks.
+
+        With the wrong field order the two fields of a flight are offset by a
+        field of motion, so the tracker builds one track per parity.  Two
+        overlapping tracks that are each (almost) single-parity and of
+        opposite parity are tested jointly: if their union is much smoother
+        under the flipped field timing, both get 'field_order_conflict'.
+        """
+        if not self.interlaced:
+            return
+        from pitchspeed.vision.track import field_order_check
+
+        def parity_share(r):
+            P = [p for p in r.track.sorted() if p.inlier]
+            if len(P) < 6:
+                return None, 0.0
+            k1 = sum(p.k for p in P) / len(P)
+            return (1 if k1 >= 0.5 else 0), max(k1, 1 - k1)
+
+        recs = [(r,) + parity_share(r) for r in self._records]
+        recs = [(r, k, sh) for r, k, sh in recs if k is not None and sh >= 0.85]
+        for i, (a, ka, _) in enumerate(recs):
+            for b, kb, _ in recs[i + 1:]:
+                if ka == kb or b.pt.t_first > a.pt.t_last or a.pt.t_first > b.pt.t_last:
+                    continue
+                P = [p for p in a.track.sorted() + b.track.sorted() if p.inlier]
+                P.sort(key=lambda p: p.t)
+                fo = field_order_check([p.t for p in P], [p.x for p in P], [p.y for p in P],
+                                       [p.k for p in P], self.frame_dt)
+                if fo.get("conflict"):
+                    for r, other in ((a, b), (b, a)):
+                        if "field_order_conflict" not in r.pt.flags:
+                            r.pt.flags.append("field_order_conflict")
+                        r.pt.diagnostics["field_order_pair"] = {"other_track": other.pt.track_id, **fo}
 
     def _resolve_duplicates(self):
         o = self.opts
@@ -434,9 +511,16 @@ class PitchFinder:
                         if w.any() and np.max(ec[w]) > tc_ and not covered(tb, t[j] + o.cue_max_gap_s):
                             add(tb - 0.5, t[j] + o.cue_max_gap_s + 0.3, "delivery_cue_without_track")
                     i = j + 1
-        # 2. rejected tracks that look like partial pitches
+        # 2. rejected tracks that look like partial pitches: enough clear detections moving
+        #    from the release end toward the catch end
         for p in rejected:
-            if p.reject_code in PARTIAL_CODES and len(p.points) >= 6 and not covered(p.t_first, p.t_last):
+            if p.reject_code not in PARTIAL_CODES or covered(p.t_first, p.t_last):
+                continue
+            inl = [q for q in p.points if q.inlier]
+            d = p.diagnostics
+            if (len(inl) >= 8 and float(np.median([q.score for q in inl])) >= o.z_strong + 1.0
+                    and d.get("progress_rate", 0.0) > 0
+                    and (d.get("progress_last", 0.0) - d.get("progress_first", 0.0)) >= 0.15):
                 add(p.t_first - 0.5, p.t_last + 0.5, f"rejected_track:{p.reject_code}")
         # 3. stabilization failures
         q = np.asarray(self._q)

@@ -78,6 +78,28 @@ class KernelSpec:
     kernel: np.ndarray
     diam: float = 0.0          # ball diameter (px) the kernel is matched to (behind view: used to
                                # restrict it to the part of the corridor where that size is expected)
+    sep: Optional[tuple] = None   # (gx, gy, mean, norm) when the kernel is a separable round blob
+
+    def apply(self, R: np.ndarray) -> np.ndarray:
+        """Correlate R with the kernel (separable fast path for round blobs)."""
+        if self.sep is not None:
+            gx, gy, mean, norm = self.sep
+            kh, kw = self.kernel.shape
+            out = cv2.sepFilter2D(R, cv2.CV_32F, gx, gy, borderType=cv2.BORDER_REPLICATE)
+            box = cv2.boxFilter(R, cv2.CV_32F, (kw, kh), normalize=False, borderType=cv2.BORDER_REPLICATE)
+            return (out - np.float32(mean) * box) * np.float32(1.0 / norm)
+        return cv2.filter2D(R, cv2.CV_32F, self.kernel, borderType=cv2.BORDER_REPLICATE)
+
+
+def _blob_spec(width: float, sar: float, row_scale: int, diam: float = 0.0) -> KernelSpec:
+    k = line_kernel(0.0, 0.0, width, sar, row_scale)
+    hy, hx = k.shape[0] // 2, k.shape[1] // 2
+    gx = np.exp(-((np.arange(-hx, hx + 1) * sar) ** 2) / (2 * width * width)).astype(np.float32)
+    gy = np.exp(-((np.arange(-hy, hy + 1) * row_scale) ** 2) / (2 * width * width)).astype(np.float32)
+    g = np.outer(gy, gx)
+    mean = float(g.mean())
+    norm = float(np.sqrt(((g - mean) ** 2).sum()))
+    return KernelSpec(0.0, 0.0, width, k, diam=diam, sep=(gx, gy, mean, norm))
 
 
 def kernel_bank(geom: ViewGeometry, row_scale: int) -> list[KernelSpec]:
@@ -91,7 +113,7 @@ def kernel_bank(geom: ViewGeometry, row_scale: int) -> list[KernelSpec]:
         dbar = 70.0 * G.MPH * geom.scale_rel * geom.sample_dt
         ax = math.atan2(geom.axis_sq[1], geom.axis_sq[0])
         lens = sorted({float(np.clip(d + f * dbar, 3.0, 30.0)) for f in (0.15, 0.5, 1.0)})
-        bank.append(KernelSpec(0.0, 0.0, w, line_kernel(0.0, 0.0, w, sar, row_scale)))
+        bank.append(_blob_spec(w, sar, row_scale))
         for i, L in enumerate(lens):
             angs = (0.0,) if i == 0 else (0.0, -math.radians(20), math.radians(20))
             for da in angs:
@@ -102,11 +124,13 @@ def kernel_bank(geom: ViewGeometry, row_scale: int) -> list[KernelSpec]:
         sizes = sorted({round(float(v), 1) for v in (d0, math.sqrt(d0 * d1), d1)})
         for d in sizes:
             w = max(0.8, d / 2.5)
-            bank.append(KernelSpec(0.0, 0.0, w, line_kernel(0.0, 0.0, w, sar, row_scale), diam=d))
+            bank.append(_blob_spec(w, sar, row_scale, diam=d))
         dm = math.sqrt(d0 * d1)
         w = max(0.8, dm / 2.5)
         ax = math.atan2(geom.axis_sq[1], geom.axis_sq[0])
-        for a in (0.0, math.pi / 4, math.pi / 2, 3 * math.pi / 4):
+        # short streaks along the image axis of the pitch and +-45 deg (the ball comes
+        # roughly along the release->catch line; perpendicular streaks are not useful)
+        for a in (ax, ax - math.pi / 4, ax + math.pi / 4):
             L = float(np.clip(dm + 4.0, 3.0, 12.0))
             bank.append(KernelSpec(L, a, w, line_kernel(L, a, w, sar, row_scale), diam=dm))
         # longer streaks along the axis near the catch (fast image motion there)
@@ -299,7 +323,8 @@ class Detector:
         self.bank = kernel_bank(geom, self.rs)
         self.kmax_h = max(k.kernel.shape[0] for k in self.bank) // 2
         self.kmax_w = max(k.kernel.shape[1] for k in self.bank) // 2
-        self._ck = np.ones(len(self.bank), np.float64)
+        self._ck_white = self._white_noise_gain()
+        self._ck = self._ck_white.copy()
         self._ck_age = 10 ** 9
         self.ref_masks = list(ref_masks or [])
         self.raw_mask = raw_mask        # uint8 (rows, cols) sample grid, 0 = ignore (date stamp)
@@ -394,12 +419,26 @@ class Detector:
         return median_stack(stack)
 
     def _progress_map(self, b: _Buf, roi: tuple) -> np.ndarray:
+        """Corridor progress of every ROI pixel (first-order in the transform; cheap)."""
         c0, r0, w, h = roi
-        jj, ii = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
-        x = jj + c0
-        y = (ii + r0) * self.rs + b.parity
-        ref = G.apply(b.A, np.stack([x.ravel(), y.ravel()], axis=1))
-        return self.geom.progress(ref).reshape(h, w)
+        jc, ic = 0.5 * w, 0.5 * h
+        g = np.array([[jc, ic], [jc + 1, ic], [jc, ic + 1]])
+        x = g[:, 0] + c0
+        y = (g[:, 1] + r0) * self.rs + b.parity
+        p = self.geom.progress(G.apply(b.A, np.stack([x, y], axis=1)))
+        pj, pi = p[1] - p[0], p[2] - p[0]
+        jj = (np.arange(w, dtype=np.float32) - jc)[None, :]
+        ii = (np.arange(h, dtype=np.float32) - ic)[:, None]
+        return (p[0] + pj * jj + pi * ii).astype(np.float32)
+
+    def _sub_rect(self, mask: np.ndarray, mh: int, mw: int):
+        """Bounding (r0, r1, c0, c1) of a boolean mask, expanded by a margin; None if empty."""
+        rows = np.nonzero(mask.any(axis=1))[0]
+        if not len(rows):
+            return None
+        cols = np.nonzero(mask.any(axis=0))[0]
+        h, w = mask.shape
+        return (max(0, rows[0] - mh), min(h, rows[-1] + mh + 1), max(0, cols[0] - mw), min(w, cols[-1] + mw + 1))
 
     # ---------------------------------------------------------- detection
     def _detect(self, s: int) -> DetFrame:
@@ -423,13 +462,20 @@ class Detector:
         cur = b.image[r0:r0 + h, c0:c0 + w].astype(np.float32)
         a, off = robust_gain(cur, B)
         D = cur - (a * B + off)
+        behind_multi = self.geom.view == "behind"
+        prog = self._progress_map(b, roi) if (self.use_slow or behind_multi) else None
         if self.use_slow:
-            Bs = self._background(b, roi, self.slow_offsets)
-            if Bs is not None:
-                prog = self._progress_map(b, roi)
-                a2, off2 = robust_gain(cur, Bs)
-                Ds = cur - (a2 * Bs + off2)
-                D = np.where(prog < o.slow_progress, Ds, D)
+            # long-offset background only where the ball moves slowly (release end)
+            slow = prog < o.slow_progress
+            rect = self._sub_rect(slow, self.kmax_h + 2, self.kmax_w + 2)
+            if rect is not None:
+                sr0, sr1, sc0, sc1 = rect
+                Bs = self._background(b, (c0 + sc0, r0 + sr0, sc1 - sc0, sr1 - sr0), self.slow_offsets)
+                if Bs is not None:
+                    cs = cur[sr0:sr1, sc0:sc1]
+                    a2, off2 = robust_gain(cs, Bs)
+                    Ds = cs - (a2 * Bs + off2)
+                    D[sr0:sr1, sc0:sc1] = np.where(slow[sr0:sr1, sc0:sc1], Ds, D[sr0:sr1, sc0:sc1])
         if o.preblur_x > 0 or o.preblur_y > 0:
             R = cv2.GaussianBlur(D, (0, 0), sigmaX=max(o.preblur_x, 0.01), sigmaY=max(o.preblur_y, 0.01))
         else:
@@ -439,18 +485,28 @@ class Detector:
         sig_map, sig = block_noise(R, o.noise_block, o.noise_floor)
         df.sigma = sig
         # matched filters
-        resp = np.empty((len(self.bank), h, w), np.float32)
-        for j, ks in enumerate(self.bank):
-            resp[j] = cv2.filter2D(R, cv2.CV_32F, ks.kernel, borderType=cv2.BORDER_REPLICATE)
+        resp = np.zeros((len(self.bank), h, w), np.float32)
+        rects = [(0, h, 0, w, None)] * len(self.bank)
+        if behind_multi and len({k.diam for k in self.bank}) > 1:
+            # each kernel only where its ball size is expected (also saves most of the work)
+            dmap = self.geom.ball_diameter(prog).astype(np.float32)
+            rects = []
+            for j, ks in enumerate(self.bank):
+                good = (dmap >= ks.diam / 2.2) & (dmap <= ks.diam * 2.2) if ks.diam > 0 else np.ones_like(dmap, bool)
+                kh, kw = ks.kernel.shape[0] // 2, ks.kernel.shape[1] // 2
+                rect = self._sub_rect(good, kh, kw)
+                rects.append(None if rect is None else rect + (good[rect[0]:rect[1], rect[2]:rect[3]],))
+                if rect is None:
+                    continue
+                q0, q1, p0, p1 = rect
+                resp[j, q0:q1, p0:p1] = ks.apply(np.ascontiguousarray(R[q0:q1, p0:p1]))
+                resp[j][~good] = 0.0
+        else:
+            for j, ks in enumerate(self.bank):
+                resp[j] = ks.apply(R)
         self._ck_age += 1
         if self._ck_age >= 4:
-            self._update_ck(R, resp)
-        if self.geom.view == "behind" and len({k.diam for k in self.bank}) > 1:
-            dmap = self.geom.ball_diameter(self._progress_map(b, roi)).astype(np.float32)
-            for j, ks in enumerate(self.bank):
-                if ks.diam > 0:
-                    bad = (dmap < ks.diam / 2.2) | (dmap > ks.diam * 2.2)
-                    resp[j][bad] = 0.0
+            self._update_ck(R, resp, rects)
         best = np.abs(resp[0]) / np.float32(self._ck[0])
         kidx = np.zeros((h, w), np.int16)
         for j in range(1, len(self.bank)):
@@ -493,10 +549,39 @@ class Detector:
         self.n_processed += 1
         return df
 
-    def _update_ck(self, R: np.ndarray, resp: np.ndarray) -> None:
-        sub = (slice(None, None, 2), slice(None, None, 3))
-        mr = float(np.median(np.abs(R[sub]))) + 1e-6
-        ck = np.array([float(np.median(np.abs(r[sub]))) / mr for r in resp]) + 1e-6
+    def _white_noise_gain(self) -> np.ndarray:
+        """c_k for white noise through the same pre-blur (a physical lower bound).
+
+        Protects the z normalization on noise-free or heavily quantized input,
+        where the measured residual is mostly exact zeros.
+        """
+        o = self.opts
+        n = np.random.default_rng(12345).normal(0, 1, (160, 480)).astype(np.float32)
+        if o.preblur_x > 0 or o.preblur_y > 0:
+            n = cv2.GaussianBlur(n, (0, 0), sigmaX=max(o.preblur_x, 0.01), sigmaY=max(o.preblur_y, 0.01))
+        core = (slice(30, -30), slice(40, -40))
+        mr = float(np.median(np.abs(n[core])))
+        return np.array([float(np.median(np.abs(ks.apply(n)[core]))) / mr for ks in self.bank])
+
+    def _update_ck(self, R: np.ndarray, resp: np.ndarray, rects=None) -> None:
+        """Noise gain c_k of each kernel response relative to R (robust, over its valid area)."""
+        ck = np.empty(len(resp))
+        for j, r in enumerate(resp):
+            rect = rects[j] if rects is not None else (0, R.shape[0], 0, R.shape[1], None)
+            if rect is None:
+                ck[j] = self._ck[j]
+                continue
+            q0, q1, p0, p1, good = rect
+            Rs = R[q0:q1:2, p0:p1:3]
+            rs_ = r[q0:q1:2, p0:p1:3]
+            if good is not None:            # only where the kernel was evaluated
+                g = good[::2, ::3]
+                Rs, rs_ = Rs[g], rs_[g]
+            if rs_.size < 50:
+                ck[j] = self._ck[j]
+                continue
+            ck[j] = float(np.median(np.abs(rs_))) / (float(np.median(np.abs(Rs))) + 1e-6)
+        ck = np.maximum(ck, self._ck_white) + 1e-6
         if self._ck_age > 10 ** 8:
             self._ck = ck
         else:
@@ -522,25 +607,41 @@ class Detector:
         o = self.opts
         if len(rr) == 0:
             return np.zeros(0, CAND_DTYPE)
+        # cheap pre-filter on the raw peaks (vectorized): corridor, masks, clutter weight
+        pre = df.grid_to_ref(cc, rr, self.rs)
+        keep = self.geom.in_corridor(pre, margin=4.0)
+        if self.ref_masks:
+            for (x0, y0, x1, y1) in self.ref_masks:
+                keep &= ~((pre[:, 0] >= x0 - 3) & (pre[:, 0] <= x1 + 3) & (pre[:, 1] >= y0 - 3) & (pre[:, 1] <= y1 + 3))
+        if not keep.any():
+            return np.zeros(0, CAND_DTYPE)
+        rr, cc, vv, pre = rr[keep], cc[keep], vv[keep], pre[keep]
+        cf = self._clutter_factor(pre[:, 0], pre[:, 1])
+        ok = vv * cf >= o.z_weak * 0.9
+        rr, cc, vv = rr[ok], cc[ok], vv[ok]
+        order = np.argsort(-(vv * cf[ok]), kind="stable")[:int(1.5 * o.max_cands) + 2]
+        rr, cc, vv = rr[order], cc[order], vv[order]
         h, w = R.shape
-        out = []
-        for r, c, v in zip(rr, cc, vv):
+        sar = self.geom.sar
+        rows = []
+        for r, c, v in zip(rr.tolist(), cc.tolist(), vv.tolist()):
             sign = int(sgn[r, c]) or 1
-            ks = self.bank[int(kidx[r, c])]
+            ki = int(kidx[r, c])
+            ks = self.bank[ki]
             L = ks.length
-            ca, sa = math.cos(ks.angle), math.sin(ks.angle)
-            hx = int(math.ceil((L / 2 * abs(ca) + 2.0) / self.geom.sar)) + 1
-            hy = max(1, int(math.ceil((L / 2 * abs(sa) + 1.5) / self.rs)))
+            hx = int(math.ceil((L / 2 * abs(math.cos(ks.angle)) + 2.0) / sar)) + 1
+            hy = max(1, int(math.ceil((L / 2 * abs(math.sin(ks.angle)) + 1.5) / self.rs)))
             j0, j1 = max(0, c - hx), min(w, c + hx + 1)
             i0, i1 = max(0, r - hy), min(h, r + hy + 1)
             win = sign * R[i0:i1, j0:j1] - 1.5 * sig_map[r, c]
             np.maximum(win, 0, out=win)
             tot = float(win.sum())
             if tot > 0:
-                ii, jj = np.mgrid[i0:i1, j0:j1]
+                jj = np.arange(j0, j1, dtype=np.float64)[None, :]
+                ii = np.arange(i0, i1, dtype=np.float64)[:, None]
                 gx = float((win * jj).sum() / tot)
                 gy = float((win * ii).sum() / tot)
-                dxs = (jj - gx) * self.geom.sar
+                dxs = (jj - gx) * sar
                 dys = (ii - gy) * self.rs
                 cxx = float((win * dxs * dxs).sum() / tot)
                 cyy = float((win * dys * dys).sum() / tot)
@@ -553,21 +654,22 @@ class Detector:
                 gx, gy = float(c), float(r)
                 length, angle = 0.0, 0.0
             # attached: touches a big blob
-            li = lab[max(0, r - 1):r + 2, max(0, c - 1):c + 2]
-            attached = bool(big[li].any())
-            ref = df.grid_to_ref([gx], [gy], self.rs)[0]
-            out.append((ref[0], ref[1], float(v), sign, length, angle, attached, int(kidx[r, c])))
+            attached = bool(big[lab[max(0, r - 1):r + 2, max(0, c - 1):c + 2]].any())
+            rows.append((gx, gy, float(v), sign, length, angle, attached, ki))
+        if not rows:
+            return np.zeros(0, CAND_DTYPE)
+        A = np.array([r_[:2] for r_ in rows])
+        ref = df.grid_to_ref(A[:, 0], A[:, 1], self.rs)
+        out = [(ref[i, 0], ref[i, 1]) + rows[i][2:] for i in range(len(rows))]
         # peaks whose centroids converged to the same place: keep the strongest
-        out.sort(key=lambda r: -r[2])
+        out.sort(key=lambda r_: -r_[2])
         uniq = []
         for r_ in out:
-            if all(math.hypot((r_[0] - u[0]) * self.geom.sar, r_[1] - u[1]) > 1.5 or r_[3] != u[3] for u in uniq):
+            if all(math.hypot((r_[0] - u[0]) * sar, r_[1] - u[1]) > 1.5 or r_[3] != u[3] for u in uniq):
                 uniq.append(r_)
-        out = uniq
-        arr = np.zeros(len(out), CAND_DTYPE)
-        for i, (x, y, v, sign, length, angle, att, ki) in enumerate(out):
+        arr = np.zeros(len(uniq), CAND_DTYPE)
+        for i, (x, y, v, sign, length, angle, att, ki) in enumerate(uniq):
             arr[i] = (0, df.s, df.t, df.k, x, y, v, v, sign, length, angle, att, 1.0, 0.0, ki)
-        # corridor + masks + clutter weighting
         keep = self.geom.in_corridor(np.stack([arr["x"], arr["y"]], 1), margin=2.0)
         for i in range(len(arr)):
             if keep[i] and self._in_ref_masks(arr["x"][i], arr["y"][i]):

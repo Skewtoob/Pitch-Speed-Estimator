@@ -70,6 +70,7 @@ class StabilizerOptions:
     keyframe_every: int = 30
     fail_run_for_reanchor: int = 6
     reanchor_every: int = 15
+    homography: str = "auto"          # 'auto' (only when clearly better) | 'prefer' | 'never'
 
 
 @dataclass
@@ -271,12 +272,23 @@ class Stabilizer:
         A = G.to3(A)
         self._last_h = False
         n = len(src_f)
-        if n >= 20 and inl.sum() < 0.92 * n:
+        mode = self.opts.homography
+        self._n_calls = getattr(self, "_n_calls", 0) + 1
+        # try the homography when the similarity leaves outliers -- every sample while the
+        # previous one needed it, otherwise every 4th sample (cost ~2.5 ms per try)
+        want = mode == "prefer" or (inl.sum() < 0.92 * n and (
+            getattr(self, "_prev_h", False) or self._n_calls % 4 == 0))
+        if mode != "never" and n >= 20 and want:
             keep = ~flags[idx] if flags is not None else np.ones(n, bool)
             Hh, inlh, rmsh = self._fit_h(src_f[keep], dst_f[keep])
-            if Hh is not None and inlh.sum() >= inl.sum() + max(6, 0.08 * n):
-                self._last_h = True
-                return Hh, int(inlh.sum()), rmsh
+            if Hh is not None:
+                if mode == "prefer":
+                    better = inlh.sum() >= max(40, 0.95 * inl.sum())
+                else:
+                    better = inlh.sum() >= inl.sum() + max(6, 0.08 * n)
+                if better:
+                    self._last_h = True
+                    return Hh, int(inlh.sum()), rmsh
         return A, int(inl.sum()), rms
 
     def _overlay_check(self, A, inl, rms, idx, src_f, dst_f, flags, p):
@@ -350,6 +362,7 @@ class Stabilizer:
             if self.n_since_reanchor >= self.opts.reanchor_every or self.fail_run == self.opts.fail_run_for_reanchor:
                 self.n_since_reanchor = 0
                 res = self._try_akaze(img, p)
+        self._prev_h = bool(res is not None and res.homography)
         if res is None:
             self.fail_run += 1
             A = self.A_prev if self.A_prev is not None else np.eye(3)
