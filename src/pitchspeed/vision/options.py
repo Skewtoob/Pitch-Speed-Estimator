@@ -33,6 +33,7 @@ class FinderOptions:
     bg_offsets_slow: tuple = (8, 12, 16, 20)   # behind view, release end (slow image motion)
     slow_progress: float = 0.35           # behind view: use slow offsets below this progress
     interp_cubic: bool = True
+    decimate_min_d: float = 7.0           # behind view: kernels for balls >= this (px) run on a 2x decimated grid
     preblur_x: float = 0.8                # residual pre-blur (px, sample grid)
     preblur_y: float = 0.4
     roi_margin: int = 6                   # extra px around the corridor bbox
@@ -65,13 +66,21 @@ class FinderOptions:
     pass2: bool = True
     pass2_back: int = 14                  # samples to search before the first point
     pass2_fwd: int = 8
+    regrow_back: int = 40                 # behind view: model-driven regrowth reach before / after the track
+    regrow_fwd: int = 12
+    regrow_max_miss: int = 3              # ... misses (prediction inside the image, nothing there) before stopping
+    regrow_max_sigma: float = 6.0         # ... stop where the model's position sigma exceeds this (px)
 
     # ---- segmentation / rejection
     min_inliers: int = 6
     min_progress: float = 0.35           # side view: NO_PROGRESS below this progress span
     min_progress_behind: float = 0.05     # behind view: progress span ...
     min_duration_behind_s: float = 0.12   # ... and duration
-    progress_back_limit: float = -0.08    # extension stops this far behind the release point
+    min_progress_last_behind: float = 0.10   # behind view: a pitch track must get this far past the release point
+    approach_min_expected: float = 1.5    # behind view approach test only when perspective predicts >= this speed-up
+    approach_min_score: float = 0.5       # ... and rejects below this log(observed) / log(expected) speed-up
+    progress_back_limit: float = -0.08    # extension stops this far behind the release point (side view)
+    progress_back_limit_behind: float = -0.25   # behind view (early image motion can run backwards, see geometry)
     max_off_axis_deg: float = 35.0
     off_axis_rel: float = 0.25            # behind: miss release by > this * |Pc - Prel|
     off_axis_catch: float = 0.30

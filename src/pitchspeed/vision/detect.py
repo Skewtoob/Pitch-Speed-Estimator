@@ -11,7 +11,11 @@ box (mapped into c's grid) is processed.
     z = max_k |R * k_k| / (c_k * sigma_loc)   matched line kernels, both signs
 
 `sigma_loc` is a block-median noise scale (floored at the global median);
-`c_k` converts it to the noise of kernel k's response.  Peaks after 5x11
+`c_k` converts it to the noise of kernel k's response.  Each kernel's
+response counts only where the kernel fits inside the ROI (so a ball next
+to the image edge is still seen by the small kernels); kernels for balls of
+>= `decimate_min_d` px (zoomed behind views) run on a 2x column-decimated
+grid (`KernelSpec.sub`).  Peaks after 5x11
 non-maximum suppression become candidates; a clutter map (in reference
 coordinates) down-weights places that fire persistently.
 
@@ -79,9 +83,23 @@ class KernelSpec:
     diam: float = 0.0          # ball diameter (px) the kernel is matched to (behind view: used to
                                # restrict it to the part of the corridor where that size is expected)
     sep: Optional[tuple] = None   # (gx, gy, mean, norm) when the kernel is a separable round blob
+    sub: Optional["KernelSpec"] = None   # same kernel on a 2x column-decimated grid (large balls)
 
     def apply(self, R: np.ndarray) -> np.ndarray:
-        """Correlate R with the kernel (separable fast path for round blobs)."""
+        """Correlate R with the kernel (separable fast path for round blobs).
+
+        With `sub` set (a ball of >= ~7 px, zoomed behind views) the
+        correlation runs on R averaged over column pairs and the response is
+        interpolated back: a matched filter that wide has no content at the
+        frequencies the decimation removes, and it costs 2-4x less.  The
+        noise normalization (Detector._ck) measures the response of this same
+        path, so z stays consistent.
+        """
+        if self.sub is not None:
+            h, w = R.shape
+            wd = max(1, (w + 1) // 2)
+            Rd = cv2.resize(R, (wd, h), interpolation=cv2.INTER_AREA)
+            return cv2.resize(self.sub.apply(Rd), (w, h), interpolation=cv2.INTER_LINEAR)
         if self.sep is not None:
             gx, gy, mean, norm = self.sep
             kh, kw = self.kernel.shape
@@ -102,8 +120,22 @@ def _blob_spec(width: float, sar: float, row_scale: int, diam: float = 0.0) -> K
     return KernelSpec(0.0, 0.0, width, k, diam=diam, sep=(gx, gy, mean, norm))
 
 
-def kernel_bank(geom: ViewGeometry, row_scale: int) -> list[KernelSpec]:
-    """Kernel bank for the view (cv.md section 3, reduced for speed)."""
+def _decimated(spec: KernelSpec, sar: float, row_scale: int) -> KernelSpec:
+    """Attach the 2x column-decimated version of a kernel (grid column step 2 * sar)."""
+    if spec.length <= 0:
+        spec.sub = _blob_spec(spec.width, 2.0 * sar, row_scale, diam=spec.diam)
+    else:
+        spec.sub = KernelSpec(spec.length, spec.angle, spec.width,
+                              line_kernel(spec.length, spec.angle, spec.width, 2.0 * sar, row_scale), diam=spec.diam)
+    return spec
+
+
+def kernel_bank(geom: ViewGeometry, row_scale: int, decimate_min_d: float = 0.0) -> list[KernelSpec]:
+    """Kernel bank for the view (cv.md section 3, reduced for speed).
+
+    decimate_min_d > 0 (behind view): kernels matched to a ball of at least
+    that diameter (px) are evaluated on a 2x column-decimated grid.
+    """
     sar = geom.sar
     bank: list[KernelSpec] = []
     if geom.view == "side":
@@ -138,6 +170,8 @@ def kernel_bank(geom: ViewGeometry, row_scale: int) -> list[KernelSpec]:
         for L in (d1 + 8.0, d1 + 16.0):
             L = float(np.clip(L, 3.0, 30.0))
             bank.append(KernelSpec(L, ax, wl, line_kernel(L, ax, wl, sar, row_scale), diam=d1))
+        if decimate_min_d > 0:
+            bank = [_decimated(k, sar, row_scale) if k.diam >= decimate_min_d else k for k in bank]
     return bank
 
 
@@ -196,6 +230,8 @@ def robust_gain(cur: np.ndarray, bg: np.ndarray, step: int = 4) -> tuple[float, 
         off = float(np.mean(cc) - a * np.mean(bb))
     return a, off
 
+
+CK_MAX_FACTOR = 8.0     # max measured/white-noise kernel gain ratio (correlated noise)
 
 def block_noise(R: np.ndarray, block: tuple = (8, 32), floor: float = 0.0) -> tuple[np.ndarray, float]:
     """Local robust noise scale: 1.4826 * block median |R|, floored at the global value,
@@ -320,9 +356,11 @@ class Detector:
         self.max_off = max(self.offsets + self.slow_offsets)
         self.buf: "OrderedDict[int, _Buf]" = OrderedDict()
         self.next_s: Optional[int] = None
-        self.bank = kernel_bank(geom, self.rs)
+        self.bank = kernel_bank(geom, self.rs, float(getattr(opts, "decimate_min_d", 0.0) or 0.0))
         self.kmax_h = max(k.kernel.shape[0] for k in self.bank) // 2
         self.kmax_w = max(k.kernel.shape[1] for k in self.bank) // 2
+        self._kmin_h = min(k.kernel.shape[0] for k in self.bank) // 2
+        self._kmin_w = min(k.kernel.shape[1] for k in self.bank) // 2
         self._ck_white = self._white_noise_gain()
         self._ck = self._ck_white.copy()
         self._ck_age = 10 ** 9
@@ -504,6 +542,20 @@ class Detector:
         else:
             for j, ks in enumerate(self.bank):
                 resp[j] = ks.apply(R)
+        # Each kernel's response is valid only where the kernel fits inside the ROI (the
+        # border is replicated).  Invalidating per kernel instead of one margin of the
+        # *largest* kernel matters where the ROI is clipped by the image edge: with the
+        # long catch-end streak kernels (half height ~16 field rows) a margin of the largest
+        # kernel blanked the top ~32 frame rows -- exactly where a zoomed behind view puts
+        # the release point.  The small blob kernels still see a ball there.
+        for j, ks in enumerate(self.bank):
+            kh, kw = ks.kernel.shape[0] // 2, ks.kernel.shape[1] // 2
+            if kh > self._kmin_h:
+                resp[j, :min(h, kh)] = 0.0
+                resp[j, max(0, h - kh):] = 0.0
+            if kw > self._kmin_w:
+                resp[j, :, :min(w, kw)] = 0.0
+                resp[j, :, max(0, w - kw):] = 0.0
         self._ck_age += 1
         if self._ck_age >= 4:
             self._update_ck(R, resp, rects)
@@ -519,7 +571,7 @@ class Detector:
         sgn = np.where(sel >= 0, 1, -1).astype(np.int8)
         # invalidate the outer margin (kernels / borders)
         valid = np.zeros((h, w), bool)
-        my, mx = min(self.kmax_h, h // 3), min(self.kmax_w, w // 3)
+        my, mx = min(self._kmin_h, h // 3), min(self._kmin_w, w // 3)
         valid[my:h - my, mx:w - mx] = True
         rr, cc, vv = nms_peaks(zz, o.nms_size, o.z_weak * 0.8, 4 * o.max_cands, valid)
         df.n_peaks = len(rr)
@@ -577,11 +629,19 @@ class Detector:
             if good is not None:            # only where the kernel was evaluated
                 g = good[::2, ::3]
                 Rs, rs_ = Rs[g], rs_[g]
+            # Static areas of compressed / lossless video often have R == 0 exactly
+            # (unchanged blocks).  There the noise is not "small", it is absent, and
+            # including those pixels drives median|R| to ~0 and c_k to absurd values
+            # (seen: 4e4 instead of ~1), which suppresses every detection.
+            nz = np.abs(Rs) > 1e-3
+            Rs, rs_ = Rs[nz], rs_[nz]
             if rs_.size < 50:
                 ck[j] = self._ck[j]
                 continue
             ck[j] = float(np.median(np.abs(rs_))) / (float(np.median(np.abs(Rs))) + 1e-6)
-        ck = np.maximum(ck, self._ck_white) + 1e-6
+        # Correlated (blurred / compressed) noise changes a kernel's gain relative to white
+        # noise by a modest factor, never by orders of magnitude.
+        ck = np.clip(ck, self._ck_white, CK_MAX_FACTOR * self._ck_white) + 1e-6
         if self._ck_age > 10 ** 8:
             self._ck = ck
         else:

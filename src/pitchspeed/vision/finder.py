@@ -10,8 +10,10 @@ push into the detector ring buffer (`detect`, ~10 samples latency), store
 candidates + z maps in a bounded ring (`track.CandStore`).  Every
 `track_every` samples the tracker extends open tracks, seeds new ones in the
 fresh part of the window, and finalizes tracks that ended more than
-`finalize_lag` samples ago (merge, pass-2 re-detection, refit, then
-`segment.Segmenter.classify`).  Memory is bounded by the ring sizes, except
+`finalize_lag` samples ago (merge, pass-2 re-detection, refit; behind view:
+trim / regrow along the global model / trim; then
+`segment.Segmenter.classify` and, behind view, the plausibility guard
+`_behind_past_release_check`).  Memory is bounded by the ring sizes, except
 for the per-sample timeline (a few floats per sample) and the transforms.
 
 Coordinates: candidate / track positions are reference-frame pixel
@@ -53,7 +55,7 @@ from pitchspeed.vision.options import FinderOptions
 from pitchspeed.vision.segment import Segmenter
 from pitchspeed.vision.stabilize import Stabilizer, StabilizerOptions
 from pitchspeed.vision.track import (CandStore, Pt, Track, build_track, continue_track, find_seeds, fit_track,
-                                     pass2, try_merge)
+                                     pass2, regrow, trim_sparse_ends, try_merge)
 
 log = logging.getLogger("pitchspeed.vision")
 
@@ -132,6 +134,8 @@ class PitchFinder:
         self._n_overlay = 0
         self._finished: Optional[FinderResult] = None
         self._diag = {"n_discarded_short": 0, "n_seeds": 0, "n_tracks_built": 0, "n_merged": 0}
+        # sample ranges to seed again once (after a track there was rejected / trimmed)
+        self._reseed: list[tuple[int, int]] = []
         self._time = {"stabilize": 0.0, "detect": 0.0, "track": 0.0}
         self._t_first: Optional[float] = None
         self._s_first: Optional[int] = None
@@ -270,6 +274,33 @@ class PitchFinder:
         if self.s_max_allowed is not None:
             seed_hi = min(seed_hi, self.s_max_allowed)
         if seed_hi >= seed_lo:
+            self._seed_range(seed_lo, seed_hi, s_lo, s_hi)
+            self._seed_hi = seed_hi
+        # Seeding is greedy and streaming: a window is normally seeded once.  If a junk
+        # track held some of the ball's detections at that moment and later let them go
+        # (rejected / trimmed), the ball would never get its own seed.  Seed such
+        # windows once more.
+        self._do_reseed(s_lo, seed_hi, s_hi)
+        self._finalize_open(final, s_hi)
+        if final:
+            # tracks rejected in this last pass get their window re-seeded too
+            for _ in range(2):
+                if not self._reseed:
+                    break
+                self._do_reseed(s_lo, seed_hi, s_hi)
+                self._finalize_open(final, s_hi)
+
+    def _do_reseed(self, s_lo: int, seed_hi: int, s_hi: int) -> None:
+        pending, self._reseed = self._reseed, []
+        for (a, b) in pending:
+            a, b = max(a, s_lo + 1), min(b, seed_hi)
+            if b >= a:
+                self._diag["n_reseeds"] = self._diag.get("n_reseeds", 0) + 1
+                self._seed_range(a, b, s_lo, s_hi, reseed=True)
+
+    def _seed_range(self, seed_lo: int, seed_hi: int, s_lo: int, s_hi: int, reseed: bool = False) -> None:
+        st, o = self.store, self.opts
+        if True:
             seeds = find_seeds(st, seed_lo, seed_hi, self.geom, o)
             self._diag["n_seeds"] += len(seeds)
             n_built = 0
@@ -289,10 +320,13 @@ class PitchFinder:
                     self._discard(tr)
                     continue
                 self._next_tid += 1
+                if reseed:
+                    tr.info["from_reseed"] = True
                 st.claim(tr)
                 self._open.append(tr)
-            self._seed_hi = seed_hi
-        # finalize
+
+    def _finalize_open(self, final: bool, s_hi: int) -> None:
+        o = self.opts
         for tr in sorted(self._open, key=lambda t: t.s_first):
             if tr.info.get("merged_into") is not None or tr not in self._open:
                 continue                       # absorbed by a merge in this loop
@@ -331,10 +365,25 @@ class PitchFinder:
             if n_add:
                 fit_track(tr, self.geom, o)
                 st.claim(tr)
+        if tr.model is not None and self.geom.view == "behind":
+            # behind view: drop wind-up / glove stragglers, regrow along the global model, trim again
+            st.claim(tr, False)
+            n_trim = trim_sparse_ends(tr, self.geom, o)
+            n_re = 0
+            if tr.model is not None:
+                n_re = regrow(tr, st, self.geom, o, self.rs, clutter_factor=self.det._clutter_factor,
+                              s_min_allowed=self.s_min_allowed, s_max_allowed=self.s_max_allowed)
+                if n_re and tr.model is not None:
+                    n_trim += trim_sparse_ends(tr, self.geom, o)
+            tr.info["n_regrow"], tr.info["n_trimmed"] = n_re, n_trim
+            st.claim(tr)
         tr.info["delivery_cue"] = self._delivery_cue(tr)
         self.seg.s_range = (self._s_first, self._s_last)
         pt = self.seg.classify(tr)
         pt.diagnostics["delivery_cue"] = tr.info["delivery_cue"]
+        self._behind_past_release_check(tr, pt)
+        if (pt.status == "rejected" or tr.info.get("n_trimmed")) and not tr.info.get("from_reseed"):
+            self._reseed.append((tr.s_first - 3, tr.s_last + 3))
         if pt.status == "rejected" and pt.reject_code == "TOO_SHORT" and len(pt.points) < 6 and tr.seed_score < 40:
             st.claim(tr, False)
             self._discard(tr)
@@ -348,6 +397,72 @@ class PitchFinder:
             except Exception as e:      # debug output must never break the analysis
                 log.debug("strobe image failed: %s", e)
         self._records.append(rec)
+
+    def _behind_past_release_check(self, tr: Track, pt) -> None:
+        """Behind view plausibility: past the release point, and approaching the camera.
+
+        1. A pitch must get clearly past the release point.
+
+        The behind-view corridor reaches behind and beside the release point
+        (geometry.behind_corridor), where the catcher's throw-back lob comes
+        down onto the pitcher: a short track moving *toward* the release
+        point with positive progress rate that would otherwise pass
+        segmentation.  A pitched ball always moves on toward the catch point;
+        if the track never gets past progress `min_progress_last_behind`
+        (default 0.1) it is not a measurable pitch either way (the ball is
+        hidden right after release: no catch, no speed) and is rejected as
+        NO_PROGRESS (diagnostics['no_progress_reason']).  On the synthetic
+        suites every pitch visible for >= 6 fields beyond the release region
+        reached >= 0.15.
+        2. A pitch comes toward the camera, so its image speed must grow as
+        perspective predicts (see the comment below); otherwise THROWBACK with
+        diagnostics['throwback_reason'].
+        (Both belong in segment.Segmenter.classify; kept here so the corridor
+        change is self-contained.)
+        """
+        if self.geom.view != "behind" or pt.status != "pitch" or pt.release is not None and pt.release.method == "manual":
+            return
+        A = tr.arrays(inliers_only=True)
+        if not len(A["x"]):
+            return
+        g = self.geom
+        prog = g.progress(np.stack([A["x"], A["y"]], 1))
+        pmax = float(np.max(prog))
+        pt.diagnostics["progress_max"] = pmax
+        if pmax < self.opts.min_progress_last_behind:
+            pt.status = "rejected"
+            pt.reject_code = "NO_PROGRESS"
+            pt.diagnostics["no_progress_reason"] = "never_past_release_point"
+            return
+        # Approach test.  A pitched ball comes toward the camera, so its image speed grows
+        # with perspective: with image position ~ 1/Z and progress p linear in 1/Z between
+        # the release (p = 0) and the catch (p = 1, ball q = d_catch / d_rel times larger),
+        # Z_rel / Z = 1 + p (q - 1) and the image speed ~ 1/Z^2 grows by
+        #   expected = ((1 + p2 (q - 1)) / (1 + p1 (q - 1)))^2   from progress p1 to p2.
+        # The end of a throw-back lob coming down to the pitcher's glove also moves toward
+        # the catch point in the image (progress -0.07 -> 0.3) but at a steady or falling
+        # image speed.  Measured log(observed) / log(expected) on the synthetic behind
+        # suites: real pitches 0.68 .. 2.7, throw-back endings -3.9 .. 0.8 (5 of 7 < 0.5).
+        m = tr.model
+        if m is None or len(A["t"]) < 6:
+            return
+        q = g.d_catch / max(g.d_rel, 1e-6)
+        if not g.scale_known:
+            q = min(q, 2.0)                       # guessed scale: weaker, conservative test
+        p1, p2 = (float(np.clip(v, 0.0, 1.2)) for v in (prog[0], prog[-1]))
+        expected = ((1 + p2 * (q - 1)) / (1 + p1 * (q - 1))) ** 2
+        if expected < self.opts.approach_min_expected:
+            return
+        v = m.vel([float(A["t"][0]), float(A["t"][-1])]) * [g.sar, 1.0]
+        sp = np.hypot(v[:, 0], v[:, 1])
+        if sp[0] <= 1e-6 or sp[1] <= 1e-6:
+            return
+        score = math.log(sp[1] / sp[0]) / math.log(expected)
+        pt.diagnostics["approach_score"] = float(score)
+        if score < self.opts.approach_min_score:
+            pt.status = "rejected"
+            pt.reject_code = "THROWBACK"
+            pt.diagnostics["throwback_reason"] = "image_speed_not_growing (not approaching the camera)"
 
     def _worth_pass2(self, tr: Track) -> bool:
         """Cheap pre-check: pass 2 only for tracks that could still become pitches."""

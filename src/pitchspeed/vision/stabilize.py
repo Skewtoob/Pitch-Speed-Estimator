@@ -40,7 +40,30 @@ overlay after 3 votes and dropped.  Their region is exposed by
 Features are detected per tile (4 x 3 grid) so a high-contrast overlay or a
 textured corner cannot take all of them.
 
-Quality: q = clip((inlier_ratio - 0.3) / 0.4, 0, 1) * exp(-rms / 1 px).
+Noisy, low-texture footage (zoomed behind-the-plate views through a blurred
+backstop fence on worn tape: LK errors of 1-2 px per feature) needs three
+things, all measured against the synthetic ground-truth camera:
+
+* features whose LK patch no longer matches (a player walked in front of
+  them since the reference frame) are dropped before fitting
+  (`changed_patch_factor`);
+* the RANSAC inlier threshold follows the measured feature noise
+  (`_adaptive_thr`, 1 .. `ransac_thr_max` px) instead of a fixed 1 px;
+* the quality measures the precision of the fitted transform, not the
+  per-feature residual (see `_quality`).
+With the old fixed threshold / rms-based quality 82-98 % of the samples of
+such clips were rejected ('hold') although the registration was good to
+< 1 px, and the detector skipped them.
+
+A registration that jumps implausibly far from the previous sample's is
+rejected (`_continuous`): after a pan, whole-image phase correlation or LK
+can lock onto a periodic fence lattice or static foreground and the wrong
+transform then propagated through the keyframe chain (synthetic clip with a
+7 deg pan: 300 px error with quality 0.6).  Keyframes are only taken from
+solid direct registrations (`keyframe_min_quality`).
+
+Quality: q = clip((inlier_ratio - 0.3) / 0.4, 0, 1) * exp(-sigma_T / 0.25 px),
+sigma_T = rms * sqrt(2 / n_inliers) ('legacy': exp(-rms / 1 px)).
 """
 from __future__ import annotations
 
@@ -58,7 +81,7 @@ log = logging.getLogger("pitchspeed.vision")
 
 
 # Static-overlay (date stamp) detection limits
-OVERLAY_MIN_CAMERA_MOTION_PX = 1.5   # camera must visibly move to tell overlay from scene
+OVERLAY_MIN_CAMERA_MOTION_PX = 0.8   # camera must visibly move to tell overlay from scene
 OVERLAY_MAX_AREA_FRAC = 0.08         # a date stamp covers a few % of the frame, not a scene
 
 
@@ -67,15 +90,24 @@ class StabilizerOptions:
     max_features: int = 300
     feature_quality: float = 0.01
     min_distance: int = 8
-    lk_win: tuple = (21, 11)          # (cols, rows) in sample grid
+    lk_win: tuple = (31, 15)          # (cols, rows) in sample grid (larger window: less LK noise on low-texture, noisy footage)
     lk_levels: int = 3
-    ransac_thr: float = 1.0           # square px
+    ransac_thr: float = 1.0           # square px; minimum inlier threshold
+    # Noise-adaptive inlier threshold: the threshold is raised to 2.5 x the
+    # per-feature LK noise (estimated from the residuals of the first fit),
+    # at most `ransac_thr_max`.  0 disables.
+    ransac_thr_max: float = 3.0
+    presmooth_sigma: float = 0.0      # Gaussian pre-blur (px) of images before features / LK; 0 = off
+    changed_patch_factor: float = 2.5  # drop features whose LK patch error > this x the 30th percentile; 0 = off
+    quality_mode: str = "precision"   # 'precision' (transform precision) | 'legacy' (feature rms)
     min_inliers: int = 30
     min_quality: float = 0.05
     keyframe_every: int = 30
     fail_run_for_reanchor: int = 6
     reanchor_every: int = 15
     homography: str = "auto"          # 'auto' (only when clearly better) | 'prefer' | 'never'
+    max_jump_frac: float = 0.06       # max image motion between consecutive samples (x width), 0 = no check
+    keyframe_min_quality: float = 0.15  # only registrations at least this good become keyframes
 
 
 @dataclass
@@ -90,11 +122,27 @@ class StabResult:
     homography: bool = False
 
 
-def _quality(n_inl: int, n_tot: int, rms: float) -> float:
-    if n_tot <= 0:
+def _quality(n_inl: int, n_tot: int, rms: float, mode: str = "precision") -> float:
+    """Registration quality 0..1 = support (inlier share) x precision.
+
+    'legacy': exp(-rms / 1 px) with rms the per-feature residual RMS.  That
+    punishes noisy but numerous features: on a zoomed, low-contrast,
+    noisy behind view (LK noise ~1.5 px per feature) a registration that is
+    good to 0.2 px scored < 0.05 and the sample was dropped.
+    'precision': exp(-sigma_T / 0.25 px) with sigma_T = rms * sqrt(2 / n_inl),
+    the approximate 1-sigma error of the fitted transform itself
+    (translation + rotation/zoom lever arm), which is what matters for
+    background subtraction and stabilized track coordinates.
+    """
+    if n_tot <= 0 or n_inl <= 0:
         return 0.0
     ratio = n_inl / n_tot
-    return float(np.clip((ratio - 0.3) / 0.4, 0.0, 1.0) * math.exp(-max(rms, 0.0) / 1.0))
+    support = float(np.clip((ratio - 0.3) / 0.4, 0.0, 1.0))
+    rms = max(float(rms), 0.0) if np.isfinite(rms) else 1.0
+    if mode == "legacy":
+        return float(support * math.exp(-rms / 1.0))
+    sig_t = rms * math.sqrt(2.0 / n_inl)
+    return float(support * math.exp(-sig_t / 0.25))
 
 
 class Stabilizer:
@@ -119,7 +167,7 @@ class Stabilizer:
         self.ref_fields = {}
         self.ref_pts = {}
         for p in parities:
-            img = np.ascontiguousarray(ref[p::2]) if self.interlaced else ref
+            img = self._pre(np.ascontiguousarray(ref[p::2]) if self.interlaced else ref)
             m = np.ascontiguousarray(self.static_mask[p::2]) if self.interlaced else self.static_mask
             self.ref_fields[p] = img
             self.ref_pts[p] = self._features(img, m)
@@ -138,6 +186,13 @@ class Stabilizer:
         self.stats = {"ref": 0, "ref_pc": 0, "key": 0, "akaze": 0, "hold": 0, "identity": 0}
 
     # --------------------------------------------------------------- setup
+    def _pre(self, img: np.ndarray) -> np.ndarray:
+        """Optional Gaussian pre-smoothing (sample grid; rows of a field are 2 frame rows apart)."""
+        s = float(self.opts.presmooth_sigma or 0.0)
+        if s <= 0:
+            return img
+        return cv2.GaussianBlur(img, (0, 0), sigmaX=s, sigmaY=max(s / self.row_scale, 0.3))
+
     def _features(self, img: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
         """Shi-Tomasi corners per tile (4 x 3 grid) for good spatial spread."""
         o = self.opts
@@ -194,7 +249,7 @@ class Stabilizer:
         P = src_pts.reshape(-1, 2).astype(np.float64)
         M = Fd_d @ np.linalg.inv(G.to3(A_dst_to_src_guess)) @ Fu_s
         init = G.apply(M, P).astype(np.float32).reshape(-1, 1, 2)
-        nxt, st, _err = cv2.calcOpticalFlowPyrLK(
+        nxt, st, err = cv2.calcOpticalFlowPyrLK(
             src_img, dst_img, src_pts, init.copy(), winSize=tuple(o.lk_win), maxLevel=o.lk_levels,
             criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 20, 0.03),
             flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
@@ -204,6 +259,19 @@ class Stabilizer:
         Q = nxt.reshape(-1, 2).astype(np.float64)
         h, w = dst_img.shape[:2]
         st &= (Q[:, 0] >= 0) & (Q[:, 0] <= w - 1) & (Q[:, 1] >= 0) & (Q[:, 1] <= h - 1)
+        if o.changed_patch_factor and err is not None and st.sum() >= 16:
+            # A feature whose patch no longer matches (a player walked in front of it,
+            # it sits on a moving object) carries no camera-motion information: its
+            # dissimilarity (mean |difference| after alignment) is far above the noise
+            # level of the matched patches.  Measured on the synthetic behind views:
+            # err > 2.5 x median -> 92-100 % of such features are > 3 px off.
+            with np.errstate(invalid="ignore"):        # lost features carry NaN errors
+                e = np.asarray(err, np.float64).ravel()
+            fin = st & np.isfinite(e)
+            if fin.sum() >= 16:
+                ref_e = float(np.percentile(e[fin], 30))
+                if ref_e > 0:
+                    st &= fin & (e <= o.changed_patch_factor * ref_e)
         idx = np.nonzero(st)[0]
         if len(idx) < 8:
             return None
@@ -211,9 +279,33 @@ class Stabilizer:
         dst_f = Q[idx] @ Fu_d[:2, :2].T + Fu_d[:2, 2]
         return idx, src_f, dst_f
 
+    def _adaptive_thr(self, resid: np.ndarray, thr0: float) -> float:
+        """Inlier threshold matched to the per-feature LK noise.
+
+        resid: |residual| (square px) of every tracked feature under a first
+        fit.  For isotropic Gaussian feature noise sigma, |r| is Rayleigh
+        distributed with median 1.1774 sigma; the median is taken over the
+        features within 2 x ransac_thr_max (gross outliers such as a date
+        stamp or a moving player excluded).  Returns 2.5 sigma (95.6 % of
+        true inliers) clipped to [thr0, ransac_thr_max].
+        """
+        tmax = float(self.opts.ransac_thr_max or 0.0)
+        if tmax <= thr0:
+            return thr0
+        near = resid[resid < 2.0 * tmax]
+        if len(near) < 12:
+            return thr0
+        sigma = float(np.median(near)) / 1.1774
+        return float(np.clip(2.5 * sigma, thr0, tmax))
+
     def _fit(self, src_f, dst_f, thr=None):
         """Similarity dst frame px -> src frame px (RANSAC in square px).
 
+        The inlier threshold starts at `thr` (default ransac_thr) and is
+        raised to the measured feature noise level (`_adaptive_thr`) when
+        the features are noisy (low contrast / heavy tape noise): with a
+        fixed 1 px threshold most correct features of such footage are
+        "outliers" and the registration is rejected although it is precise.
         Returns (A 2x3 or None, inlier mask, rms).
         """
         o = self.opts
@@ -222,12 +314,24 @@ class Stabilizer:
         D = G.sq_matrix(self.sar)
         src_q = src_f * [self.sar, 1.0]
         dst_q = dst_f * [self.sar, 1.0]
+        thr0 = thr or o.ransac_thr
         S, inl = cv2.estimateAffinePartial2D(dst_q, src_q, method=cv2.RANSAC,
-                                             ransacReprojThreshold=thr or o.ransac_thr, maxIters=2000,
+                                             ransacReprojThreshold=thr0, maxIters=2000,
                                              confidence=0.995, refineIters=10)
         if S is None or inl is None:
             return None, np.zeros(len(src_f), bool), float("nan")
         inl = inl.ravel().astype(bool)
+        self._last_thr = thr0
+        if o.ransac_thr_max and o.ransac_thr_max > thr0 and len(src_f) >= 12:
+            r_all = np.linalg.norm(dst_q @ S[:, :2].T + S[:, 2] - src_q, axis=1)
+            thr1 = self._adaptive_thr(r_all, thr0)
+            if thr1 > 1.05 * thr0:
+                S2, inl2 = cv2.estimateAffinePartial2D(dst_q, src_q, method=cv2.RANSAC,
+                                                       ransacReprojThreshold=thr1, maxIters=2000,
+                                                       confidence=0.995, refineIters=10)
+                if S2 is not None and inl2 is not None and inl2.sum() >= inl.sum():
+                    S, inl = S2, inl2.ravel().astype(bool)
+                    self._last_thr = thr1
         pred = dst_q[inl] @ S[:, :2].T + S[:, 2]
         rms = float(np.sqrt(np.mean(np.sum((pred - src_q[inl]) ** 2, axis=1)))) if inl.any() else float("nan")
         return (np.linalg.inv(D) @ G.to3(S) @ D)[:2], inl, rms
@@ -269,6 +373,7 @@ class Stabilizer:
             use = ~flags[idx]
             idx, src_f, dst_f = idx[use], src_f[use], dst_f[use]
         A, inl, rms = self._fit(src_f, dst_f)
+        thr_sim = getattr(self, "_last_thr", None)
         self._last_ntot = len(idx)
         if A is None:
             return None, 0, float("nan")
@@ -285,7 +390,8 @@ class Stabilizer:
             getattr(self, "_prev_h", False) or self._n_calls % 4 == 0))
         if mode != "never" and n >= 20 and want:
             keep = ~flags[idx] if flags is not None else np.ones(n, bool)
-            Hh, inlh, rmsh = self._fit_h(src_f[keep], dst_f[keep])
+            # same inlier threshold as the similarity, so the inlier counts are comparable
+            Hh, inlh, rmsh = self._fit_h(src_f[keep], dst_f[keep], thr=thr_sim)
             if Hh is not None:
                 if mode == "prefer":
                     better = inlh.sum() >= max(40, 0.95 * inl.sum())
@@ -322,8 +428,7 @@ class Stabilizer:
             # must never be taken for an overlay.
             moving = lambda Ah, sel: float(np.median(np.linalg.norm(
                 G.apply(G.invert(Ah), src_f[sel]) - src_f[sel], axis=1))) > OVERLAY_MIN_CAMERA_MOTION_PX
-            if i1 and not i2 and sp2 > sp1 and self._compact(src_f[s1]) and len(s1) < len(s2) \
-                    and moving(A2, s2):
+            if i1 and not i2 and sp2 > sp1 and self._compact(src_f[s1]) and moving(A2, s2):
                 votes[idx[s1]] += 1
                 A, inl, rms = A2, np.isin(np.arange(len(src_f)), s2), r2
             elif i2 and not i1 and sp1 > sp2 and self._compact(src_f[s2]) and moving(A1, s1):
@@ -375,13 +480,13 @@ class Stabilizer:
     def register(self, image: np.ndarray, parity: int) -> StabResult:
         """Register one sample image (grid of the given parity) to the reference."""
         p = int(parity) if self.interlaced else 0
-        img = np.ascontiguousarray(image)
+        img = self._pre(np.ascontiguousarray(image))
         pred = G.to3(self.A_prev) if self.A_prev is not None else np.eye(3)
-        res = self._try_ref(img, p, pred, "ref")
+        res = self._continuous(self._try_ref(img, p, pred, "ref"))
         if res is None:
-            res = self._try_phase(img, p, pred)
+            res = self._continuous(self._try_phase(img, p, pred))
         if res is None:
-            res = self._try_keyframe(img, p)
+            res = self._continuous(self._try_keyframe(img, p))
         if res is None and self.fail_run >= self.opts.fail_run_for_reanchor:
             self.n_since_reanchor += 1
             if self.n_since_reanchor >= self.opts.reanchor_every or self.fail_run == self.opts.fail_run_for_reanchor:
@@ -395,17 +500,51 @@ class Stabilizer:
         else:
             self.fail_run = 0
             self.A_prev = res.A
-            if res.method in ("ref", "ref_pc", "akaze"):
+            # Keyframes only from solid direct registrations: a keyframe's transform is
+            # inherited by every chained ('key') registration until the next refresh.
+            if res.method in ("ref", "ref_pc", "akaze") and res.quality >= self.opts.keyframe_min_quality:
                 self.keyframes[p] = {"img": img.copy(), "A": res.A.copy(), "pts": None, "age": 0}
+            elif res.method == "key" and p in self.keyframes:
+                kf = self.keyframes[p]
+                kf["age"] += 1
+                if kf["age"] >= self.opts.keyframe_every:      # bound the chain length
+                    self.keyframes[p] = {"img": img.copy(), "A": res.A.copy(), "pts": None, "age": 0}
         self.stats[res.method] = self.stats.get(res.method, 0) + 1
         res.params = G.similarity_params(G.local_affine(res.A, (self.W / 2.0, self.H / 2.0)), self.sar)
+        return res
+
+    def _continuous(self, res: Optional[StabResult]) -> Optional[StabResult]:
+        """Reject a registration that jumps implausibly far from the previous sample's.
+
+        A camera moves continuously: between two fields (1/60 s) even a fast
+        telephoto pan or strong shake moves the image by a few tens of px.  A
+        result that puts the image hundreds of px away from where the
+        previous sample was registered is a false match -- typically a
+        periodic backstop-fence lattice or static foreground (people, date
+        stamp) locking phase correlation / LK onto the wrong solution after a
+        pan.  Measured at the four image corners (catches zoom / roll jumps
+        too); the allowance grows with the number of failed samples since
+        the last registration.  AKAZE re-anchoring after a failure run is
+        exempt (it exists to re-acquire after scene cuts / big moves).
+        """
+        if res is None or self.A_prev is None:
+            return res
+        lim = float(self.opts.max_jump_frac) * self.W * (1 + self.fail_run)
+        if lim <= 0:
+            return res
+        C = np.array([[0.0, 0.0], [self.W - 1.0, 0.0], [0.0, self.H - 1.0], [self.W - 1.0, self.H - 1.0]])
+        d = (G.apply(res.A, C) - G.apply(self.A_prev, C)) * [self.sar, 1.0]
+        jump = float(np.max(np.linalg.norm(d, axis=1)))
+        if jump > lim:
+            self.stats["rejected_jump"] = self.stats.get("rejected_jump", 0) + 1
+            return None
         return res
 
     # --------------------------------------------------------- strategies
     def _accept(self, A_p, n_inl, rms, p, method, qmul=1.0) -> Optional[StabResult]:
         if A_p is None or n_inl < self.opts.min_inliers:
             return None
-        q = _quality(n_inl, getattr(self, "_last_ntot", n_inl), rms) * qmul
+        q = _quality(n_inl, getattr(self, "_last_ntot", n_inl), rms, self.opts.quality_mode) * qmul
         if q < self.opts.min_quality:
             return None
         A = self.M[p] @ G.to3(A_p)
@@ -461,10 +600,7 @@ class Stabilizer:
         if res is None:
             return None
         res.A = A / A[2, 2]
-        kf["age"] += 1
-        if kf["age"] >= self.opts.keyframe_every:
-            self.keyframes[p] = {"img": img.copy(), "A": res.A.copy(), "pts": None, "age": 0}
-        return res
+        return res                      # keyframe age / refresh: in register(), once accepted
 
     def _try_akaze(self, img, p) -> Optional[StabResult]:
         try:

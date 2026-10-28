@@ -52,6 +52,29 @@ def _derived_speeds(calib: Calibration, v0_mph: float, k: float, end_kind: str) 
     return K.mph(L / T), K.mph(K.plate_speed(v0, y_r, k))
 
 
+def _dominant_term(comps: list, method: str) -> Optional[str]:
+    """Plain-words name of the largest uncertainty term of the time-of-flight estimate."""
+    if method not in ("tof", "manual_tof"):
+        return None
+    e1 = next((c for c in comps if c.method == "tof"), None)
+    if e1 is None:
+        return None
+    d = e1.details
+    s_r, s_c = d.get("sigma_release_s"), d.get("sigma_catch_s")
+    terms = {"timing": d.get("rel_sigma_timing"), "distance": d.get("rel_sigma_distance")}
+    if not all(K.finite(v) for v in terms.values()):
+        return None
+    if terms["distance"] >= terms["timing"]:
+        return "the assumed release and catch points (extension / catch position)"
+    if not (K.finite(s_r) and K.finite(s_c)):
+        return "the flight time"
+    if s_c >= s_r:
+        return (f"the catch time (+-{1e3 * s_c:.0f} ms, {d.get('catch_method')}): the end of the flight "
+                f"was not seen well enough")
+    return (f"the release time (+-{1e3 * s_r:.0f} ms, {d.get('release_method')}): the ball was not seen "
+            f"clearly right after release")
+
+
 def _is_manual(manual: bool, release: Optional[EventTime], catch: Optional[EventTime]) -> bool:
     return bool(manual) or any(e is not None and e.method == "manual" for e in (release, catch))
 
@@ -143,7 +166,9 @@ def estimate_speed(calib: Calibration, scan: Optional[ScanInfo], sample_dt: floa
         method = "manual_tof"
 
     if label == "none":
+        why = _dominant_term(comps, method)
         reason = (f"not measurable: uncertainty +-{100 * rel:.0f}% (> {100 * K.LABEL_POOR:.0f}%)"
+                  + (f", mostly {why}" if why else "")
                   + (f"; {'; '.join(problems)}" if problems else ""))
         return SpeedEstimate(v_release_mph=None, method=method, label="none", components=comps,
                              flags=flags, assumptions=assumptions, reason=reason)

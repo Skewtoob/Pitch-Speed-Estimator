@@ -11,6 +11,14 @@
   when the prediction leaves the corridor / progress [-0.15, 1.15].
 * Robust global fit (`model.fit_model`), pass-2 weak re-detection inside
   the model gate on the cached z maps, refit.
+* Behind view only (the image path bends sharply: slow drift, often up and
+  briefly out of the frame, then a dive with fast-growing image speed):
+  fragments that follow each other in time go to the joint rational fit
+  even when their own models disagree where they meet (`try_merge`);
+  `regrow` grows a track along its global model (interior samples whose
+  point is an outlier, and both ends, skipping samples where the ball is
+  predicted outside the image); `trim_sparse_ends` drops wind-up / glove
+  stragglers separated from the flight by a long gap.
 * Field-order consistency: residual RMS under the given vs the flipped
   field timing (t' = t + (1 - 2k) frame_dt / 2) plus the lag-1 residual
   alternation; `field_order_conflict` when the flip is strongly preferred.
@@ -239,6 +247,19 @@ def track_sign(tr: "Track") -> int:
     return 1 if v >= 0 else -1
 
 
+def back_limit(geom: ViewGeometry, opts: FinderOptions) -> float:
+    """Lowest progress a ball track may reach behind the release point.
+
+    Behind the plate the first part of the flight often moves *backwards*
+    along the release->catch line in the image (perspective expansion away
+    from a focus of expansion below the release point; measured down to
+    progress -0.19 on the synthetic suites), so the behind view allows more.
+    """
+    if geom.view == "behind":
+        return min(opts.progress_back_limit, opts.progress_back_limit_behind)
+    return opts.progress_back_limit
+
+
 def _in_blob(df: DetFrame, p: np.ndarray, pad: float = 4.0) -> bool:
     for (x0, y0, x1, y1) in df.blobs:
         if x0 - pad <= p[0] <= x1 + pad and y0 - pad <= p[1] <= y1 + pad:
@@ -273,7 +294,7 @@ def extend(tr: Track, store: CandStore, direction: int, geom: ViewGeometry, opts
                                            else P[0].t + (s - P[0].s) * sample_dt)
         pred, sig_p, vel = local_predict(ts_, xs, ys, t_s, max_pts=8)
         prog = float(geom.progress(pred)[0])
-        if prog < opts.progress_back_limit or prog > 1.15 or not geom.in_corridor(pred, margin=10.0)[0]:
+        if prog < back_limit(geom, opts) or prog > 1.15 or not geom.in_corridor(pred, margin=10.0)[0]:
             return "stopped"
         near = P[-1] if direction > 0 else P[0]
         gap = abs(s - near.s)
@@ -427,7 +448,8 @@ def pass2(tr: Track, store: CandStore, geom: ViewGeometry, opts: FinderOptions, 
             return False
         pred = m.eval([df.t])[0]
         prog = float(geom.progress(pred)[0])
-        if prog < max(-0.05, opts.progress_back_limit) or prog > 1.2:
+        lim = back_limit(geom, opts) if geom.view == "behind" else max(-0.05, opts.progress_back_limit)
+        if prog < lim or prog > 1.2:
             return False
         sp = float(m.pos_sigma([df.t])[0])
         if sp > 6.0:
@@ -480,6 +502,200 @@ def pass2(tr: Track, store: CandStore, geom: ViewGeometry, opts: FinderOptions, 
     return added
 
 
+def _pred_in_image(df: DetFrame, pred: np.ndarray, row_scale: int, pad: float = 2.0) -> bool:
+    """Is the predicted (reference px) position inside this sample's processed ROI?"""
+    if df.zmap is None:
+        return False
+    g = df.ref_to_grid(np.atleast_2d(pred), row_scale)[0]
+    h, w = df.zmap.shape
+    return bool(pad <= g[0] <= w - 1 - pad and pad / row_scale <= g[1] <= h - 1 - pad / row_scale)
+
+
+def _point_near(df: DetFrame, s: int, pred: np.ndarray, r: float, sign: int, store: CandStore, geom: ViewGeometry,
+                opts: FinderOptions, row_scale: int, clutter_factor=None) -> Optional[Pt]:
+    """Best detection of the ball near `pred`: a stored candidate (z >= z_weak, same sign) within r,
+    else the z-map peak (z >= z_pass2), as in pass 2.
+
+    A stored candidate keeps src 'det' (it is a detector candidate, only linked by the model);
+    candidates already used by another track are allowed but ranked lower (the other track is
+    usually a rejected fragment of the same flight; duplicates are resolved by the finder).
+    """
+    C = df.cands
+    if len(C):
+        dd = np.hypot((C["x"] - pred[0]) * geom.sar, C["y"] - pred[1])
+        ok = (dd <= r) & (C["sign"] == sign)
+        if ok.any():
+            used = store.used_mask(s)
+            score = C["z"] - 2.0 * (dd / r) ** 2 - np.where(used, 5.0, 0.0)
+            score = np.where(ok, score, -np.inf)
+            return _pt_from(C[int(np.argmax(score))], "det")
+    res = _zmap_peak(df, pred, r, sign, row_scale, geom.sar)
+    if res is None:
+        return None
+    z, ref = res
+    if clutter_factor is not None:
+        z *= float(clutter_factor(np.array([ref[0]]), np.array([ref[1]]))[0])
+    if z < opts.z_pass2:
+        return None
+    return Pt(s=s, t=df.t, k=df.k, x=float(ref[0]), y=float(ref[1]), z=z, attached=_in_blob(df, ref, pad=0.0),
+              sigma=max(0.6, 3.0 / max(z, 1e-3)), src="pass2", sign=sign)
+
+
+def regrow(tr: Track, store: CandStore, geom: ViewGeometry, opts: FinderOptions, row_scale: int,
+           clutter_factor=None, s_min_allowed: Optional[int] = None, s_max_allowed: Optional[int] = None,
+           max_rounds: int = 4) -> int:
+    """Behind view: grow a track along its *global* image-trajectory model.
+
+    Behind the plate the image path is far from a local quadratic: the ball
+    drifts slowly (often up, sometimes briefly out of the top of the frame)
+    and then dives toward the catch point with fast-growing image speed.
+    The local-quadratic extension and pass 2 (fixed reach, stop after two
+    misses) therefore often leave the early flight out of the track or in a
+    separate fragment, which makes the "first free field" release late by
+    up to 0.3 s.  The rational model (exact for a pinhole camera and
+    constant acceleration, cv.md section 4) extrapolates that path well
+    once it has 8+ inliers.  Each round: predict every sample up to
+    `regrow_back` before / `regrow_fwd` after the inliers, accept the best
+    detection within the model gate (radius from the model's position
+    sigma), skip samples whose prediction is outside the image (they are
+    not misses), stop a direction after `regrow_max_miss` misses in the
+    image; then refit.  Rounds repeat while points are added (the model
+    improves as the track grows).  Points the refit rejects stay as
+    outliers.  Returns the number of points added.
+    """
+    if geom.view != "behind" or tr.model is None or tr.n_inliers < 8:
+        return 0
+    sign = track_sign(tr)
+    lim_lo = back_limit(geom, opts)
+    total = 0
+    for _round in range(max_rounds):
+        m = tr.model
+        A = tr.arrays(inliers_only=True)
+        if len(A["s"]) < 8:
+            break
+        s_first, s_last = int(A["s"][0]), int(A["s"][-1])
+        p_last = float(geom.progress(np.array([[A["x"][-1], A["y"][-1]]]))[0])
+        added = 0
+        # interior: samples without an inlier (missing, or an outlier that the local extension
+        # took from clutter) get the best detection inside the model gate
+        for s in range(s_first + 1, s_last):
+            cur = tr.pts.get(s)
+            if cur is not None and cur.inlier:
+                continue
+            df = store.get(s)
+            if df is None or df.skipped or df.zmap is None:
+                continue
+            pred = m.eval([df.t])[0]
+            sp = float(m.pos_sigma([df.t])[0])
+            if sp > opts.regrow_max_sigma or not _pred_in_image(df, pred, row_scale):
+                continue
+            d = float(geom.ball_diameter(float(geom.progress(pred)[0])))
+            r = max(1.5, d / 2 + 0.5) + 2.0 * min(sp, 3.0)
+            p = _point_near(df, s, pred, r, sign, store, geom, opts, row_scale, clutter_factor)
+            if p is not None and (cur is None or math.hypot((p.x - cur.x) * geom.sar, p.y - cur.y) > 0.5):
+                tr.pts[s] = p
+                added += 1
+        for direction, reach in ((-1, opts.regrow_back), (+1, opts.regrow_fwd)):
+            misses = 0
+            s = s_first - 1 if direction < 0 else s_last + 1
+            for _ in range(int(reach)):
+                if (s_min_allowed is not None and s < s_min_allowed) or (s_max_allowed is not None and s > s_max_allowed):
+                    break
+                df = store.get(s)
+                if df is None:
+                    break
+                cur = tr.pts.get(s)
+                if cur is not None and cur.inlier:
+                    misses = 0
+                    s += direction
+                    continue
+                if df.skipped or df.zmap is None:
+                    misses += 1
+                else:
+                    pred = m.eval([df.t])[0]
+                    prog = float(geom.progress(pred)[0])
+                    sp = float(m.pos_sigma([df.t])[0])
+                    # stop: near the model's pole (ball at the camera plane: the rational model is
+                    # meaningless there), outside the plausible progress range, model too uncertain,
+                    # or -- forward, late in flight -- the model turning back toward the release
+                    bad = (float(m.denom([df.t])[0]) <= 0.25 or prog < lim_lo or prog > 1.2
+                           or sp > opts.regrow_max_sigma or (direction > 0 and prog < p_last - 0.02))
+                    if bad:
+                        break
+                    if not _pred_in_image(df, pred, row_scale):
+                        s += direction            # ball outside the frame: not a miss
+                        continue
+                    d = float(geom.ball_diameter(prog))
+                    # the position sigma assumes the model form is exact; drag / spin and the
+                    # short data span make extrapolation errors grow with the distance from the
+                    # data: + 0.5 px per sample beyond the nearest inlier (capped at 3 ball diameters)
+                    n_beyond = (s_first - s) if direction < 0 else (s - s_last)
+                    r = min(max(1.5, d / 2 + 0.5) + 2.0 * min(sp, 3.0) + 0.5 * max(0, n_beyond), max(6.0, 3.0 * d))
+                    p = _point_near(df, s, pred, r, sign, store, geom, opts, row_scale, clutter_factor)
+                    if p is not None:
+                        tr.pts[s] = p
+                        added += 1
+                        misses = 0
+                    else:
+                        misses += 1
+                if misses > opts.regrow_max_miss:
+                    break
+                s += direction
+        if not added:
+            break
+        total += added
+        fit_track(tr, geom, opts)
+        if tr.model is None:
+            break
+    return total
+
+
+def trim_sparse_ends(tr: Track, geom: ViewGeometry, opts: FinderOptions, miss_weight: float = 0.3) -> int:
+    """Behind view: cut sparse junk off the ends of a track (wind-up, glove).
+
+    Before release the ball sits in the pitcher's hand near the release
+    point and moves with the arm (faint, intermittent detections that the
+    local extension strings together); after the catch it sits in the glove.
+    The trajectory model can absorb a few of those as inliers, which
+    stretches the inlier span far beyond the flight: segmentation then
+    calls the track POOR_FIT or THROWBACK, or places the events on the
+    wind-up.  The flight is the interval of samples with the best
+    `inliers - miss_weight * samples_without_inlier` (maximum-sum
+    interval): a faint but real stretch with >= 30 % inlier samples is kept,
+    a wind-up with a few stray inliers is not.  Points outside it (1-sample
+    margin) are removed and the track refitted; regrowth can extend it back
+    along the model if the cut was too eager.  Returns the number of points
+    removed.
+    """
+    if geom.view != "behind":
+        return 0
+    inl = sorted(p.s for p in tr.pts.values() if p.inlier)
+    if len(inl) < 9:
+        return 0
+    s0, s1 = inl[0], inl[-1]
+    have = set(inl)
+    best, best_lo, best_hi = -np.inf, s0, s1
+    run, run_lo = 0.0, s0
+    for s in range(s0, s1 + 1):                    # Kadane
+        v = 1.0 if s in have else -miss_weight
+        if run <= 0:
+            run, run_lo = v, s
+        else:
+            run += v
+        if run > best:
+            best, best_lo, best_hi = run, run_lo, s
+    kept = sum(1 for s in inl if best_lo <= s <= best_hi)
+    if kept < 8 or (best_lo == s0 and best_hi == s1):
+        return 0
+    drop = [s for s in tr.pts if s < best_lo - 1 or s > best_hi + 1]
+    if not drop:
+        return 0
+    for s in drop:
+        del tr.pts[s]
+    fit_track(tr, geom, opts)
+    return len(drop)
+
+
 # ------------------------------------------------------------------ merge ----
 def try_merge(a: Track, b: Track, geom: ViewGeometry, opts: FinderOptions) -> Optional[Track]:
     """Merge two fragments of one flight if a joint fit explains both."""
@@ -493,18 +709,7 @@ def try_merge(a: Track, b: Track, geom: ViewGeometry, opts: FinderOptions) -> Op
     Aa, Ab = a.arrays(True), b.arrays(True)
     if len(Aa["t"]) < 3 or len(Ab["t"]) < 3:
         return None
-    # quick reject: the models must roughly agree where the tracks meet
-    t_meet = 0.5 * (min(Aa["t"][-1], Ab["t"][-1]) + max(Aa["t"][0], Ab["t"][0]))
-    qa, qb = a.model.eval([t_meet])[0], b.model.eval([t_meet])[0]
-    if np.hypot((qa[0] - qb[0]) * geom.sar, qa[1] - qb[1]) > 10.0 + 2.0 * max(0, gap):
-        return None
-    # each model predicts the other's nearest points
-    pa = a.model.eval(Ab["t"])
-    pb = b.model.eval(Aa["t"])
-    da = np.hypot((pa[:, 0] - Ab["x"]) * geom.sar, pa[:, 1] - Ab["y"])
-    db = np.hypot((pb[:, 0] - Aa["x"]) * geom.sar, pb[:, 1] - Aa["y"])
-    lim = opts.merge_dist_px + 0.2 * max(0, gap)
-    if min(np.median(np.sort(da)[:3]), np.median(np.sort(db)[:3])) > lim * 3:
+    if not _models_agree(a, b, Aa, Ab, gap, geom, opts) and not _behind_successive(a, b, Aa, Ab, gap, geom):
         return None
     m = Track(tid=min(a.tid, b.tid), seed_score=max(a.seed_score, b.seed_score))
     for p in a.sorted() + b.sorted():
@@ -519,6 +724,49 @@ def try_merge(a: Track, b: Track, geom: ViewGeometry, opts: FinderOptions) -> Op
         return None
     m.open_fwd = a.open_fwd or b.open_fwd
     return m
+
+
+def _models_agree(a: Track, b: Track, Aa: dict, Ab: dict, gap: int, geom: ViewGeometry, opts: FinderOptions) -> bool:
+    """Quick test: the two fragment models roughly agree where the tracks meet."""
+    t_meet = 0.5 * (min(Aa["t"][-1], Ab["t"][-1]) + max(Aa["t"][0], Ab["t"][0]))
+    qa, qb = a.model.eval([t_meet])[0], b.model.eval([t_meet])[0]
+    if np.hypot((qa[0] - qb[0]) * geom.sar, qa[1] - qb[1]) > 10.0 + 2.0 * max(0, gap):
+        return False
+    # each model predicts the other's nearest points
+    pa = a.model.eval(Ab["t"])
+    pb = b.model.eval(Aa["t"])
+    da = np.hypot((pa[:, 0] - Ab["x"]) * geom.sar, pa[:, 1] - Ab["y"])
+    db = np.hypot((pb[:, 0] - Aa["x"]) * geom.sar, pb[:, 1] - Aa["y"])
+    lim = opts.merge_dist_px + 0.2 * max(0, gap)
+    return not (min(np.median(np.sort(da)[:3]), np.median(np.sort(db)[:3])) > lim * 3)
+
+
+def _behind_successive(a: Track, b: Track, Aa: dict, Ab: dict, gap: int, geom: ViewGeometry) -> bool:
+    """Behind view: may two fragments that follow each other in time be one flight?
+
+    Fragment models extrapolate badly where the image path bends sharply:
+    behind the plate the ball first drifts slowly (often *up*, perspective
+    expansion) and then dives toward the catch point with fast-growing image
+    speed, and the tracker tends to build one fragment per regime (the slow
+    one then looks like a THROWBACK).  Such pairs are handed to the joint
+    rational fit (exact for a pinhole camera and constant acceleration,
+    cv.md section 4), which decides; here only: successive in time (at most
+    2 samples of overlap) and the facing ends within the distance the ball
+    can cover in the gap (1.5 x the faster fragment's end speed, + 6 px).
+    """
+    if geom.view != "behind" or gap < -2:
+        return False
+    if Aa["t"][0] > Ab["t"][0]:
+        a, b, Aa, Ab = b, a, Ab, Aa
+    i_end, i_start = len(Aa["t"]) - 1, 0
+    dt_ = float(Ab["t"][i_start] - Aa["t"][i_end])
+    if dt_ <= 0:
+        return False
+    d = float(np.hypot((Ab["x"][i_start] - Aa["x"][i_end]) * geom.sar, Ab["y"][i_start] - Aa["y"][i_end]))
+    va = a.model.vel([Aa["t"][i_end]])[0]
+    vb = b.model.vel([Ab["t"][i_start]])[0]
+    sp = max(float(np.hypot(va[0] * geom.sar, va[1])), float(np.hypot(vb[0] * geom.sar, vb[1])))
+    return d <= 1.5 * sp * dt_ + 6.0
 
 
 # ------------------------------------------------------------ field order ----

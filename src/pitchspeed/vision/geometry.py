@@ -220,6 +220,50 @@ class ViewGeometry:
         return v_sq_per_sample / s / self.sample_dt / MPH
 
 
+BEHIND_RELEASE_SPREAD_FT = 2.5     # lateral reach of the corridor at the release end (behind view)
+BEHIND_BACK_FRAC = 0.22            # corridor extent behind the release point, fraction of |Pc - Prel|
+
+
+def behind_corridor(calib: Calibration, sr: float, sc: float) -> np.ndarray:
+    """Behind-view search corridor (reference px polygon).
+
+    `Calibration.corridor_polygon()` is a narrow trapezoid around the
+    straight release->catch line (half width max(1.5 ft, 6 % L) at the
+    release end, starting 8 % L behind the release click).  On the synthetic
+    behind-view suites 15 of 84 pitches spent 20-50 % of their flight outside
+    it, for two geometric reasons:
+
+    * the release point varies from pitch to pitch (+-2 ft laterally and
+      +-1 ft in height around the clicked one: arm slot, stride, both
+      pitchers of a game share one calibration);
+    * early in flight the image motion is mostly perspective expansion away
+      from the focus of expansion, which for a camera lower than the
+      release point is *upward*, i.e. backwards along the release->catch
+      line (down to progress -0.19 measured).
+
+    This corridor reaches `BEHIND_RELEASE_SPREAD_FT` (scaled by the
+    release-end px/ft) to each side of the release point and
+    `BEHIND_BACK_FRAC` * L behind it, and keeps the catch end of the
+    calibration's polygon.  The ball (and so the relevant clutter) stays the
+    same; only where we look widens.
+    """
+    Rp = calib.to_sq(calib.release_point())
+    Cp = calib.to_sq(calib.catch_point())
+    e = Cp - Rp
+    L = float(np.linalg.norm(e))
+    e /= L
+    n = np.array([-e[1], e[0]])
+    w_r = max(BEHIND_RELEASE_SPREAD_FT * sr, 0.06 * L, 10.0)
+    w_c = max(3.0 * sc, 0.35 * L, 20.0)
+    back = max(BEHIND_BACK_FRAC * L, 1.5 * sr)
+    a0 = Rp - back * e
+    r0 = Rp                      # full width from the release point on (the region behind it is a cap)
+    a1 = Cp + 0.15 * L * e
+    w_back = 0.75 * w_r
+    poly = [a0 + w_back * n, r0 + w_r * n, a1 + w_c * n, a1 - w_c * n, r0 - w_r * n, a0 - w_back * n]
+    return np.array([calib.from_sq(p) for p in poly])
+
+
 def view_geometry(calib: Calibration, sample_dt: float) -> ViewGeometry:
     """Build the per-segment geometry (scales, ball size, gates) from a calibration."""
     view = calib.view
@@ -255,6 +299,9 @@ def view_geometry(calib: Calibration, sample_dt: float) -> ViewGeometry:
             extra["scale_catch_guess"] = True
         # the glove is behind the plate: slightly closer to the camera
         s_rel, s_c = float(sr), float(sc)
+        corr = behind_corridor(calib, s_rel, s_c)
+        x0, y0 = corr.min(axis=0)
+        x1, y1 = corr.max(axis=0)
     d_rel = max(1.2, diam_ft * s_rel)
     d_c = max(1.2, diam_ft * s_c)
     dt = sample_dt

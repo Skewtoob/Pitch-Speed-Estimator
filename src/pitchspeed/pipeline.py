@@ -323,16 +323,21 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
                 rejected.append(tr)
                 continue
             p = _pitch_from_track(tr, source, calib, scan)
-            if p.speed.label == "none" and tr.confidence < DOUBTFUL_CONFIDENCE:
-                # Probably not a pitch (bird, throw back, ...) and unmeasurable anyway:
-                # list it for review instead of giving it a pitch number.
+            if tr.confidence < DOUBTFUL_CONFIDENCE:
+                # Low-confidence track: often not a pitch at all (bird, throw back, arm,
+                # clutter).  List it for review instead of giving it a pitch number; the
+                # user can accept it there.
                 tr.status = "rejected"
-                tr.reject_code = "DOUBTFUL_NO_SPEED"
+                tr.reject_code = "DOUBTFUL"
                 rejected.append(tr)
+                if p.speed.v_release_mph is not None:
+                    what = (f"if it is a pitch: about {p.speed.v_release_mph:.0f} mph "
+                            f"+/- {p.speed.sigma_mph:.0f}")
+                else:
+                    what = p.speed.reason or "speed not measurable"
                 missed.append({"s_start": tr.points[0].s, "s_end": tr.points[-1].s,
                                "t_start": tr.points[0].t, "t_end": tr.points[-1].t,
-                               "reason": f"unconfirmed moving object (confidence {tr.confidence:.2f}); "
-                                         f"{p.speed.reason or 'speed not measurable'}"})
+                               "reason": f"unconfirmed moving object (confidence {tr.confidence:.2f}); {what}"})
                 continue
             pitches.append(p)
         rejected.extend(fr.rejected)
