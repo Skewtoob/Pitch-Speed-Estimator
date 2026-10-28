@@ -628,7 +628,8 @@ def side_fit_estimate(calib: Calibration, scan: Optional[ScanInfo], sample_dt: f
         usable = False
         flags.append(K.F_OBLIQUE)
         reason = (f"camera too oblique to the pitch line (phi ~ {max(lat.phi_min_deg, lat.phi_deg):.0f} deg, "
-                  f"rho={rho:.2f}); side-view fit not used")
+                  f"rho={rho:.2f}); side-view fit not used (calibrating this setup as a behind-plate view "
+                  f"or marking release/catch by hand may work better)")
     elif fit.at_bound:
         usable = False
         flags.append(K.F_OBLIQUE if abs(fit.theta[2]) > 2.9 else K.F_POOR_FIT)
