@@ -400,10 +400,29 @@ def make_recompute(calib_file: CalibrationFile, scan: ScanInfo, source, video=No
         dup, drop = _glitch_lists(video, getattr(reader, "info", None),
                                   undecodable=list(undecodable or ()) + undecodable_frames(reader))
         set_glitch_flags(pitch, dup, drop)
+        _drop_stale_event_flags(pitch)
         pitch.speed = estimate_for(calib, scan, source.sample_dt, pitch)
         return pitch
 
     return recompute
+
+
+# Flags that describe how the AUTOMATIC event was found; meaningless once the
+# user has marked that event by hand.
+_RELEASE_TRACK_FLAGS = {"release_unconfirmed", "release_uncertain", "release_not_observed",
+                        "release_detection_late", "release_gap", "windup_trimmed",
+                        "release_far_extrapolated", "ball_free_before_release_point"}
+_CATCH_TRACK_FLAGS = {"catch_extrapolated", "catch_not_observed", "track_end_gap_trimmed", "contact"}
+
+
+def _drop_stale_event_flags(pitch: Pitch) -> None:
+    drop = set()
+    if pitch.release is not None and pitch.release.method == "manual":
+        drop |= _RELEASE_TRACK_FLAGS
+    if pitch.catch is not None and pitch.catch.method == "manual":
+        drop |= _CATCH_TRACK_FLAGS
+    if drop:
+        pitch.flags = [f for f in pitch.flags if f not in drop]
 
 
 def recompute_all(result: AnalysisResult, calib_file: CalibrationFile, source) -> int:
@@ -519,6 +538,14 @@ def track_timing_votes(tracks: list[PitchTrack], source, frame_dt: float) -> dic
         x = np.array([p.x for p in pts])
         y = np.array([p.y for p in pts])
         k = np.array([source.locate(p.s)[1] for p in pts], dtype=float)
+        pair = (tr.diagnostics or {}).get("field_order_pair") or {}
+        if min(int((k == 0).sum()), int((k == 1).sum())) < 4:
+            # (nearly) one field parity only: the hypotheses differ by a constant
+            # time shift and cannot be told apart.  With the wrong field order the
+            # tracker tends to build one such track per parity; the finder's pair
+            # check catches that case.
+            votes["flipped" if pair.get("conflict") else "unclear"] += 1
+            continue
         hyp = {"given": t, "flipped": t + (1.0 - 2.0 * k) * frame_dt / 2.0, "progressive": t - k * frame_dt / 2.0}
         rms = {h: _timing_rms(tt, x, y, 3 if len(pts) >= 16 else 2) for h, tt in hyp.items()}
         best = min(rms, key=rms.get)
@@ -596,11 +623,18 @@ def analyze(video_path: str, calib_file: CalibrationFile, out_dir: Optional[str]
     scan = detect_scan(reader, override=fo)
     source = SampleSource(reader, scan)
     if scan.mode != "interlaced":
-        warnings.append("video is not interlaced (or was deinterlaced): timing uses whole frames "
-                        "(1/30 s), roughly doubling timing error")
+        step = 1.0 / scan.sample_rate if scan.sample_rate else source.sample_dt
+        if step > 0.025:
+            warnings.append(f"video is not interlaced (or was deinterlaced): timing uses whole frames "
+                            f"(1/{1.0 / step:.0f} s), roughly doubling timing error compared with "
+                            f"interlaced tape")
+        else:
+            warnings.append(f"video is progressive at {1.0 / step:.2f} frames/s (no fields to split)")
     if scan.confidence == "low":
         warnings.append(f"interlace/field-order detection is uncertain ({scan.mode}, {scan.field_order}); "
                         f"use --field-order to override if results look wrong")
+    for note in getattr(reader, "notes", []) or []:
+        warnings.append(f"video file: {note}")
     if info.timing_mode != "cfr":
         warnings.append("variable frame timing detected; timestamps taken from the file")
     if info.dropped_frames:
@@ -759,6 +793,38 @@ def _demote_throwbacks(pitches: list[Pitch], rejected: list, missed: list) -> li
             continue
         kept.append(p)
         prev_catch = p.catch.t
+    return _demote_prepitch_junk(kept, rejected, missed)
+
+
+PREPITCH_WINDOW_S = 1.5   # junk this soon before a real pitch's release (wind-up, glove)
+
+
+def _demote_prepitch_junk(pitches: list[Pitch], rejected: list, missed: list) -> list[Pitch]:
+    """Move no-speed tracks that end just before a stronger pitch to the review list.
+
+    The wind-up or the pitcher's glove can produce a short track at the release
+    end right before the real pitch.  Demoted only if it has no measurable
+    speed, never gets far along the path, and the next pitch (which has a
+    speed or a higher confidence) is released within PREPITCH_WINDOW_S.
+    """
+    ps = sorted(pitches, key=lambda q: q.release.t)
+    kept: list[Pitch] = []
+    for i, p in enumerate(ps):
+        nxt = ps[i + 1] if i + 1 < len(ps) else None
+        d = (p.track.diagnostics if p.track else {}) or {}
+        prog_last = d.get("progress_last")
+        if (nxt is not None and p.status == "auto" and p.speed.v_release_mph is None
+                and prog_last is not None and prog_last < THROWBACK_MAX_PROGRESS
+                and 0.0 < nxt.release.t - p.release.t <= PREPITCH_WINDOW_S
+                and (nxt.speed.v_release_mph is not None or nxt.confidence > p.confidence)):
+            tr = p.track
+            tr.status, tr.reject_code = "rejected", "PREPITCH"
+            rejected.append(tr)
+            missed.append({"s_start": tr.points[0].s, "s_end": tr.points[-1].s,
+                           "t_start": tr.points[0].t, "t_end": tr.points[-1].t,
+                           "reason": "probably the wind-up or glove just before the next pitch"})
+            continue
+        kept.append(p)
     return kept
 
 

@@ -453,3 +453,34 @@ def test_undecodable_frames_count_as_timing_gaps():
     q = _auto(400, 430)
     P.make_recompute(_behind_cf(), _scan(conf="high"), _FieldSrc(), undecodable=[205])(q)
     assert "dropped_frame_suspected" in q.flags
+
+
+def test_prepitch_junk_is_demoted():
+    from pitchspeed.pipeline import _demote_throwbacks
+    rejected, missed = [], []
+    junk = _tp(9.0, 0.12)                      # no speed, near the release end
+    real = _tp(10.0, 0.8, 70.0)                # real pitch 1.0 s later
+    kept = _demote_throwbacks([junk, real], rejected, missed)
+    assert kept == [real] and rejected[0].reject_code == "PREPITCH"
+    assert "wind-up" in missed[0]["reason"]
+
+
+def test_stale_event_flags_dropped_after_manual_marks():
+    from pitchspeed.pipeline import _drop_stale_event_flags
+    p = _tp(5.0, 0.8, 70.0)
+    p.flags = ["catch_extrapolated", "catch_not_observed", "release_unconfirmed", "field_order_ambiguous"]
+    p.catch = EventTime(t=5.5, sigma=0.005, method="manual")
+    _drop_stale_event_flags(p)
+    assert p.flags == ["release_unconfirmed", "field_order_ambiguous"]
+    p.release = EventTime(t=5.0, sigma=0.005, method="manual")
+    _drop_stale_event_flags(p)
+    assert p.flags == ["field_order_ambiguous"]
+
+
+def test_single_parity_track_does_not_vote():
+    scan = _scan()
+    tr = _sim_track("interlaced")
+    tr.points = [q for q in tr.points if q.s % 2 == 0]     # only k == 0 fields
+    assert resolve_field_order(scan, [tr], _Src(), 1001 / 30000) == "unknown"
+    tr.diagnostics["field_order_pair"] = {"conflict": True}
+    assert resolve_field_order(_scan(), [tr], _Src(), 1001 / 30000) == "flip"
