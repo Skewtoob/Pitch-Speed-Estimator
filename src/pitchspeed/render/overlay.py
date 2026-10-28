@@ -991,7 +991,8 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
                      size=(960, 720), audio: bool = True, progress=None, *,
                      writer_factory: Optional[Callable[..., Any]] = None,
                      info: Optional[dict] = None, style: str = "radar",
-                     windows: Optional[Sequence[tuple[int, int]]] = None, show_list: bool = True) -> str:
+                     windows: Optional[Sequence[tuple[int, int]]] = None, show_list: bool = True,
+                     only: Optional[Sequence[int]] = None) -> str:
     """Write the annotated video; returns the path actually written.
 
     mode: 'full' (whole video) or 'highlights' (around each pitch).
@@ -1001,6 +1002,8 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     windows: highlights mode only - render these [s0, s1) sample windows
         instead of the ones around every pitch (render/clips.py: one pitch).
     show_list: draw the running list of pitches (top right).
+    only: draw only the pitches with these numbers (render/clips.py: a clip shows its own pitch,
+        not the card or path of a neighbouring one), and no possible-missed hints.
     transforms / transform_samples: per-sample (n, 2, 3) or (n, 3, 3)
         (sample -> reference) stabilization transforms and their sample
         indices (pipeline.load_transforms); None = static camera.
@@ -1033,6 +1036,9 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     fps = output_fps(source)
     out_dt = 1.0 / float(fps)
     marks = build_marks(result, _to_sample_fn(source))
+    if only is not None:
+        keep = {int(x) for x in only}
+        marks = [m for m in marks if m.number in keep]
     timeline = Timeline(marks, round_half_up(HOLD_S / sample_dt))
     if windows is not None:
         if mode != "highlights":
@@ -1050,7 +1056,8 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
     factory = writer_factory or _default_writer
     painter = _make_painter((w, h), style, notes)
     drawer = _FrameDrawer(marks, timeline, TransformLookup(transforms, transform_samples), painter,
-                          bool(getattr(source, "interlaced", False)), missed_windows(result), sample_dt,
+                          bool(getattr(source, "interlaced", False)),
+                          missed_windows(result) if only is None else [], sample_dt,
                           show_list=show_list)
     sar = _sar(source, result)
     highlights_audio = mode == "highlights" and audio_src is not None

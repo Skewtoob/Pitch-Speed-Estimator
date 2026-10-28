@@ -129,3 +129,45 @@ def test_ffmpeg_failure_without_message_still_says_why(tmp_path, monkeypatch, ta
     monkeypatch.setattr(CL.subprocess, "run", lambda *a, **k: R())
     path, status = CL.cut_original(tape, 1.0, 3.0, str(tmp_path / "x.mpg"))
     assert path is None and "exit code 139" in status
+
+
+# ------------------------------------------------- neighbouring pitches
+def _mk(n, r, c):
+    from pitchspeed.render.overlay import PitchMark
+    return PitchMark(number=n, status="manual", s_release=r, s_catch=c, speed=H.speed(70.0, 2.0, "fair"))
+
+
+def test_clip_windows_stop_halfway_to_a_neighbouring_pitch():
+    pre, post = 120, 180                                              # 2 s / 3 s of fields
+    far = CL.clip_windows([_mk(1, 1000, 1030), _mk(2, 3000, 3030)], 10000, pre, post)
+    assert [(a, b) for _, a, b in far] == [(880, 1211), (2880, 3211)]  # the full 2 s / 3 s
+    near = CL.clip_windows([_mk(2, 1300, 1330), _mk(1, 1000, 1030), _mk(3, 1450, 1480)], 10000, pre, post)
+    (m1, a1, b1), (m2, a2, b2), (m3, a3, b3) = near
+    assert [m.number for m in (m1, m2, m3)] == [1, 2, 3]
+    assert a1 == 880 and b1 == (1030 + 1300) // 2 + 1 and a2 == 1300 - pre >= b1     # cut halfway, no overlap
+    assert b2 == (1330 + 1450) // 2 + 1 == a3 and b3 == 1661
+    for (m, a, b), nxt in zip(near, near[1:] + [None]):
+        assert a <= m.s_release and b > m.s_catch                      # always the whole flight
+        if nxt is not None:
+            assert b <= nxt[0].s_release and nxt[1] > m.s_catch        # never the neighbour's flight
+    odd = CL.clip_windows([_mk(1, 1000, 1030), _mk(2, 1020, 1060)], 10000, pre, post)   # overlapping marks
+    assert all(a <= m.s_release and b > m.s_catch for m, a, b in odd)
+
+
+def test_a_clip_shows_only_its_own_pitch(tmp_path):
+    """Pitch 2 is released 2 s after pitch 1's catch: pitch 2's clip must not open with pitch 1's
+    radar card (which the full video still shows until pitch 2 is released)."""
+    from test_render_overlay import RADAR_ROI, _radar_card_visible
+    r = H.rich_result()
+    r.pitches = [H.pitch(1, 60, 88, H.speed(70.0, 1.5, "good")), H.pitch(2, 210, 238, H.speed(72.0, 1.5, "good"))]
+    r.possible_missed = []
+    src = H.FakeSource(600)
+    H.FakeWriter.instances.clear()
+    info = {}
+    CL.render_clips(r, src, str(tmp_path), audio=False, originals=False, writer_factory=H.FakeWriter, info=info)
+    clip1, clip2 = H.FakeWriter.instances
+    assert len(clip1.frames) == (88 + 210) // 2 + 1 and len(clip2.frames) == 238 + 181 - ((88 + 210) // 2 + 1)
+    first2 = (88 + 210) // 2 + 1                                       # sample shown in clip 2's frame 0
+    assert not any(_radar_card_visible(f) for f in clip2.frames[:238 - first2])   # no card before its catch
+    assert _radar_card_visible(clip2.frames[238 - first2 + 20])        # its own card after its catch
+    assert _radar_card_visible(clip1.frames[88 + 20])                  # clip 1: its card after its catch

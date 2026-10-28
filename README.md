@@ -257,13 +257,16 @@ computer-made videos, not real tapes yet.
 
 - `P03_81mph.mp4`: the pitch with the radar-gun display (and the ball path
   if it was tracked), from 2 s before the release to 3 s after the catch,
-  with sound. A rough estimate is named `P02_66mph_rough.mp4`, a pitch that
+  with sound. When pitches come quickly, a clip is cut halfway to the
+  previous or next pitch, so it never shows another pitch's catch or
+  wind-up, and it only ever shows its own pitch's speed. A rough estimate is named `P02_66mph_rough.mp4`, a pitch that
   could not be measured `P05_no_speed.mp4`.
 - `originals\P03.avi` (or `.mpg`, ...): the same moment of your original
   video, copied **without re-encoding**: same quality and same fields, ready
   for your own editing. It starts a little earlier than the clip (usually
   about a second, for some files several seconds), because a copy without
-  re-encoding can only start at certain frames. Each copy is checked; if one
+  re-encoding can only start at certain frames - so it can begin with a bit
+  of the previous pitch; trim that in your editor. Each copy is checked; if one
   cannot cover the whole pitch, the console says so instead of keeping it.
 
 Making the clips again (after review edits) replaces the clips it made

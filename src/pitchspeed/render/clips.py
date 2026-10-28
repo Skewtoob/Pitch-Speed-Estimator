@@ -5,8 +5,9 @@
 writes into ``<out_dir>/clips/``:
 
 * ``P03_81mph.mp4`` - the pitch with the overlay (radar-gun card, ball path;
-  the same drawing as annotated.mp4 without the running list), from
-  PRE_S before the release to POST_S after the catch, with its sound;
+  the same drawing as annotated.mp4, but only this pitch's and without the
+  running list), from PRE_S before the release to POST_S after the catch -
+  cut short halfway to a neighbouring pitch (`clip_windows`) - with its sound;
 * ``originals/P03.<ext>`` - the same stretch of the ORIGINAL file, copied
   without re-encoding (ffmpeg stream copy: same picture quality, both fields,
   same container as the tape capture), for editing.
@@ -55,7 +56,8 @@ from pitchspeed.types import AnalysisResult, SpeedEstimate
 
 log = logging.getLogger(__name__)
 
-__all__ = ["render_clips", "clip_name", "cut_original", "video_span", "CLIPS_DIR", "ORIGINALS_DIR", "MANIFEST"]
+__all__ = ["render_clips", "clip_name", "clip_windows", "cut_original", "video_span", "CLIPS_DIR", "ORIGINALS_DIR",
+           "MANIFEST"]
 
 CLIPS_DIR = "clips"
 ORIGINALS_DIR = "originals"
@@ -194,6 +196,28 @@ def cut_original(src: str, t_start: float, duration: float, out_path: str,
 
 
 # --------------------------------------------------------------- clips
+def clip_windows(marks, n: int, pre: int, post: int) -> list:
+    """[(mark, s0, s1)]: sample window [s0, s1) of each pitch's clip.
+
+    PRE before the release to POST after the catch, but never into a neighbouring pitch: a clip
+    starts no earlier than halfway between the previous pitch's catch and its own release, and
+    ends no later than halfway between its catch and the next pitch's release (so it holds
+    neither the previous catch nor the next wind-up when pitches come quickly)."""
+    ms = sorted(marks, key=lambda m: (m.s_release, m.number))
+    out = []
+    for i, m in enumerate(ms):
+        s0, s1 = max(0, m.s_release - pre), min(n, m.s_catch + post + 1)
+        if i > 0:
+            s0 = max(s0, (ms[i - 1].s_catch + m.s_release) // 2 + 1)
+        if i + 1 < len(ms):
+            s1 = min(s1, (m.s_catch + ms[i + 1].s_release) // 2 + 1)
+        s0 = min(s0, m.s_release)                     # always the whole flight, whatever the neighbours
+        s1 = max(s1, min(n, m.s_catch + 1))
+        if s1 > s0:
+            out.append((m, s0, s1))
+    return out
+
+
 def _kind(rel: str) -> str:
     return "orig" if rel.startswith(ORIGINALS_DIR + "/") else "clip"
 
@@ -225,11 +249,7 @@ def render_clips(result: AnalysisResult, source, out_dir: str, transforms=None, 
     listed = list(previous)                     # previous + everything written so far (kept on disk)
     pre, post = int(round(PRE_S / sample_dt)), int(round(POST_S / sample_dt))
     width = max(2, len(str(max(m.number for m in marks))))
-    jobs = []
-    for m in marks:
-        s0, s1 = max(0, m.s_release - pre), min(n, m.s_catch + post + 1)
-        if s1 > s0:
-            jobs.append((m, s0, s1))
+    jobs = clip_windows(marks, n, pre, post)
     total = sum(s1 - s0 for _, s0, s1 in jobs)
     src_path = _source_path(source, result) if originals else None
     written: list[str] = []
@@ -267,7 +287,8 @@ def render_clips(result: AnalysisResult, source, out_dir: str, transforms=None, 
             out = render_annotated(result, source, os.path.join(folder, name + ".mp4"), mode="highlights",
                                    transforms=transforms, transform_samples=transform_samples, size=size,
                                    audio=audio, progress=sub_progress, writer_factory=writer_factory,
-                                   info=clip_info, style=style, windows=[(s0, s1)], show_list=False)
+                                   info=clip_info, style=style, windows=[(s0, s1)], show_list=False,
+                                   only=[m.number])
         except (OSError, RuntimeError, ValueError) as e:
             notes.append(f"pitch {m.number}: the clip could not be written ({e})")
             out = None
