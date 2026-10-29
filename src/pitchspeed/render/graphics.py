@@ -301,6 +301,76 @@ def radar_card(number: int, sp: Optional[SpeedEstimate], k: float) -> Sprite:
     return p.sprite()
 
 
+# ======================================================= broadcast box (A)
+TV_BG = (16, 30, 62, 235)          # navy panel
+TV_BAND = (200, 30, 40, 255)       # red top band
+TV_TEXT = (255, 255, 255, 255)
+TV_SUB = (190, 205, 230, 255)
+BROADCAST_H = 112
+
+
+def broadcast_size(sp: Optional[SpeedEstimate]) -> tuple:
+    return 190 + 34 * max(0, len(card_digits(sp).strip()) - 2), BROADCAST_H
+
+
+def broadcast_card(number: int, sp: Optional[SpeedEstimate], k: float) -> Sprite:
+    """TV pitch box: red band with the pitch number, big white speed, MPH, the +/- line."""
+    state, line = card_state(sp), card_line(sp)
+    digits = card_digits(sp).strip()
+    W, H = broadcast_size(sp)
+    p = _Pen(W, H, k)
+    d = p.d
+    d.rounded_rectangle(p.S(0, 0, W - 1, H - 1), radius=8 * p.f, fill=TV_BG)
+    d.rounded_rectangle(p.S(0, 0, W - 1, 24), radius=8 * p.f, fill=TV_BAND)
+    d.rectangle(p.S(0, 14, W - 1, 24), fill=TV_BAND)
+    p.text(10, 4, f"PITCH {number}", "bold", 14, TV_TEXT, spacing=0.12)
+    if state == "poor":
+        ew = p.width("ESTIMATE", "bold", 12, spacing=0.1)
+        p.text(W - 10 - ew, 5, "ESTIMATE", "bold", 12, AMBER, spacing=0.1)
+    big = ("~" if state == "poor" else "") + digits
+    x_end = p.text(12, 22, big, "bold", 62, AMBER if state == "poor" else TV_TEXT)
+    p.text(x_end + 8, 54, "MPH", "bold", 20, TV_SUB)
+    col = {"good": TV_SUB, "poor": LINE_POOR, "none": LINE_NONE}[state]
+    px = 14.0
+    while px > 8 and p.width(line, "semibold", px) > W - 20:
+        px -= 0.5
+    p.text(12, 92, line, "semibold", px, col)
+    return p.sprite()
+
+
+# ========================================================= sports bar (C)
+BAR_BG = (12, 12, 14, 225)
+BAR_ACCENT = (230, 120, 20, 255)   # orange block with the pitch number
+BAR_H = 52
+
+
+def bar_size(sp: Optional[SpeedEstimate]) -> tuple:
+    return 420, BAR_H
+
+
+def bar_strip(number: int, sp: Optional[SpeedEstimate], k: float) -> Sprite:
+    """Lower-third strip: orange block 'P3', then '78 MPH' and the +/- line."""
+    state, line = card_state(sp), card_line(sp)
+    digits = card_digits(sp).strip()
+    W, H = bar_size(sp)
+    p = _Pen(W, H, k)
+    d = p.d
+    d.rectangle(p.S(0, 0, W - 1, H - 1), fill=BAR_BG)
+    d.rectangle(p.S(0, 0, 64, H - 1), fill=BAR_ACCENT)
+    d.rectangle(p.S(0, H - 4, W - 1, H - 1), fill=BAR_ACCENT)
+    tw = p.width(f"P{number}", "bold", 24)
+    p.text((64 - tw) / 2, 10, f"P{number}", "bold", 24, TV_TEXT)
+    big = ("~" if state == "poor" else "") + digits
+    x = p.text(78, 4, big, "bold", 38, AMBER if state == "poor" else TV_TEXT)
+    x = p.text(x + 6, 20, "MPH", "bold", 16, TV_SUB)
+    col = {"good": TV_SUB, "poor": LINE_POOR, "none": LINE_NONE}[state]
+    px = 14.0
+    while px > 8 and p.width(line, "semibold", px) > W - x - 30:
+        px -= 0.5
+    p.text(x + 18, 19, line, "semibold", px, col)
+    return p.sprite()
+
+
 # ============================================================ small labels
 def tag_label(text: str, k: float) -> Sprite:
     """White bold label with a dark outline (the 'P3' next to the ball in flight)."""

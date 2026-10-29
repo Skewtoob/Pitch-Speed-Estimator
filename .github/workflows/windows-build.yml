@@ -20,26 +20,37 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install . pyinstaller
-      - name: Build PitchSpeed.exe
+          python -m pip install ".[gui]" pyinstaller
+      - name: Build PitchSpeed.exe and pitchspeed-cli.exe
         working-directory: windows
         run: pyinstaller --noconfirm --distpath ..\dist --workpath ..\build PitchSpeed.spec
       - name: Smoke test
         shell: pwsh
         run: |
-          .\dist\PitchSpeed\PitchSpeed.exe --version
+          .\dist\PitchSpeed\pitchspeed-cli.exe --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\dist\PitchSpeed\PitchSpeed.exe synth --help | Out-Null
+          $p = Start-Process -FilePath .\dist\PitchSpeed\PitchSpeed.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error "PitchSpeed.exe --selftest failed ($($p.ExitCode))"; exit 1 }
       - name: Package
         shell: pwsh
         run: |
           Copy-Item README.md dist\PitchSpeed\README.md
           Copy-Item windows\READ_ME_FIRST.txt dist\PitchSpeed\READ_ME_FIRST.txt
           Compress-Archive -Path dist\PitchSpeed -DestinationPath PitchSpeed-Windows.zip
+          $v = python -c "import pitchspeed; print(pitchspeed.__version__)"
+          "PITCHSPEED_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: PitchSpeed-Windows
-          path: PitchSpeed-Windows.zip
+          path: |
+            PitchSpeed-Windows.zip
+            installer/PitchSpeed-Setup.exe
       - name: Publish download (release "latest-windows")
         uses: softprops/action-gh-release@v2
         with:
@@ -49,7 +60,15 @@ jobs:
           make_latest: true
           target_commitish: ${{ github.sha }}
           body: |
-            Download PitchSpeed-Windows.zip, unzip it anywhere (for example Documents), then drag a
-            video file onto PitchSpeed.exe inside the PitchSpeed folder. No Python needed.
-            Built from ${{ github.sha }}.
-          files: PitchSpeed-Windows.zip
+            **Easiest:** download **PitchSpeed-Setup.exe** and run it. It installs Pitch Speed for
+            your user account (no administrator rights needed) with a Start-menu entry, an optional
+            desktop icon and an uninstaller. Windows may say "Windows protected your PC" because
+            the program is not signed: click **More info**, then **Run anyway**.
+
+            **Without installing:** download PitchSpeed-Windows.zip, unzip it anywhere and open
+            PitchSpeed.exe in the PitchSpeed folder.
+
+            Version ${{ env.PITCHSPEED_VERSION }}, built from ${{ github.sha }}.
+          files: |
+            PitchSpeed-Windows.zip
+            installer/PitchSpeed-Setup.exe

@@ -108,7 +108,9 @@ __all__ = ["render_annotated", "PitchMark", "FrameState", "Timeline", "Transform
            "card_lines", "running_items", "audio_filter_graph", "output_fps", "missed_windows",
            "mux_segment_audio", "can_write", "alternative_path", "move_into_place", "STYLES"]
 
-STYLES = ("radar", "classic")
+STYLES = ("radar", "broadcast", "bar", "classic")
+STYLE_NAMES = {"radar": "Radar gun", "broadcast": "TV broadcast box", "bar": "Sports bar",
+               "classic": "Plain text"}
 HOLD_S = 3.0                 # card hold after the catch
 PRE_S = 2.0                  # highlights: seconds before release
 POST_S = 3.0                 # highlights: seconds after catch
@@ -704,8 +706,11 @@ class RadarPainter(Painter):
         src = pts if len(pts) else line
         return (float(src[-1, 0]), float(src[-1, 1])), (line if len(line) else pts)
 
+    card_fn = staticmethod(G.radar_card)
+    size_fn = staticmethod(G.card_size)
+
     def _card_scale(self, sp: Optional[SpeedEstimate]) -> float:
-        w, _ = G.card_size(sp)
+        w, _ = self.size_fn(sp)
         return min(self.k, (self.w - 2 * self.m) / w)          # never wider than the frame
 
     def _place(self, sp: G.Sprite, path: Optional[np.ndarray]) -> tuple[int, int]:
@@ -725,7 +730,7 @@ class RadarPainter(Painter):
 
     def speed_card(self, img, i, m, opacity=1.0, path=None):
         kk = self._card_scale(m.speed)
-        sp = self.cards.get((i, kk), lambda: G.radar_card(m.number, m.speed, kk))
+        sp = self.cards.get((i, kk), lambda: self.card_fn(m.number, m.speed, kk))
         if i not in self.card_pos:                   # decided once, so the card never jumps
             self.card_pos[i] = self._place(sp, path)
         G.blend(img, sp, *self.card_pos[i], opacity=opacity)
@@ -749,6 +754,33 @@ class RadarPainter(Painter):
         sp = self.lists.get((items, self.k), lambda: G.running_strip(items, self.k, max_w))
         if sp is not None:
             G.blend(img, sp, self.w - self.m - sp.w, self.list_y)
+
+
+class BroadcastPainter(RadarPainter):
+    """Style A: a TV-style pitch box in place of the radar gun (same path, list and tags)."""
+
+    style = "broadcast"
+    card_fn = staticmethod(G.broadcast_card)
+    size_fn = staticmethod(G.broadcast_size)
+
+
+class BarPainter(RadarPainter):
+    """Style C: a sports-bar strip along the bottom, kept off the bottom-right corner where
+    camcorders put the date."""
+
+    style = "bar"
+    card_fn = staticmethod(G.bar_strip)
+    size_fn = staticmethod(G.bar_size)
+
+    def _card_scale(self, sp: Optional[SpeedEstimate]) -> float:
+        w, _ = self.size_fn(sp)
+        return min(self.k, 0.62 * self.w / w)          # at most ~60 % of the width
+
+    def _place(self, sp: G.Sprite, path: Optional[np.ndarray]) -> tuple[int, int]:
+        return self.m, self.h - sp.h - int(round(18 * self.k))
+
+
+PAINTERS = {"radar": RadarPainter, "broadcast": BroadcastPainter, "bar": BarPainter}
 
 
 # ================================================================= frames
@@ -1130,11 +1162,11 @@ def render_annotated(result: AnalysisResult, source, out_path: str, mode: str = 
 
 
 def _make_painter(size: tuple[int, int], style: str, notes: list[str]) -> Painter:
-    if style == "radar":
+    if style in PAINTERS:
         ok, why = G.available()
         if ok:
-            return RadarPainter(size)
-        notes.append(f"the radar-gun graphics could not be loaded ({why}), so the video uses the plain "
+            return PAINTERS[style](size)
+        notes.append(f"the {STYLE_NAMES[style]} graphics could not be loaded ({why}), so the video uses the plain "
                      f"style; installing pitchspeed again (on Windows: windows\\install.bat) fixes this")
         log.warning("%s", notes[-1])
     return Painter(size)

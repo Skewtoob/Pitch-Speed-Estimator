@@ -27,20 +27,40 @@ timing precision compared with counting frames.
 
 ## Install (Windows)
 
-### Easy way: the ready-made program (no Python needed)
+### Easy way: the installer (no Python needed)
 
 1. On the project's GitHub page, open **Releases** (right-hand side) →
    **Pitch Speed for Windows (latest build)** and download
-   **PitchSpeed-Windows.zip**.
-2. Unzip it anywhere, for example in `Documents`. Keep the folder together:
-   `PitchSpeed.exe` needs the `_internal` folder next to it.
-3. Drag a video file onto **PitchSpeed.exe** (or onto a desktop shortcut to it:
-   right-click it → Send to → Desktop). Several videos can be dragged at once.
+   **PitchSpeed-Setup.exe**.
+2. Run it. It installs for your user account only (no administrator rights),
+   with a Start-menu entry, an optional desktop icon and an uninstaller
+   (Windows Settings → Apps). Windows may say "Windows protected your PC"
+   because the program is not signed: click **More info** → **Run anyway**.
+3. Open **Pitch Speed**. To update, run a newer PitchSpeed-Setup.exe; your
+   results (next to your videos) are not touched.
 
-The first time, Windows may say "Windows protected your PC" because the program
-is not signed: click **More info** → **Run anyway**. To update, download the zip
-again and unzip it over the old folder; your results (next to your videos) are
-not touched.
+Prefer no installer? Download **PitchSpeed-Windows.zip** instead, unzip it
+anywhere and open `PitchSpeed.exe` in the `PitchSpeed` folder.
+
+### The Pitch Speed window
+
+- **Add tapes...** (or drag video files onto the window) puts tapes in the
+  list. Each shows its status, the number of pitches, and the typical and
+  fastest speed. The list is remembered.
+- **Settings**: pitching distance (league), the size of the marking window,
+  sound on/off, and the **speed graphic** in the videos it makes:
+  - **Radar gun**: red LED digits, like a radar-gun display;
+  - **TV broadcast box**: a TV-style pitch box;
+  - **Sports bar**: a strip along the bottom (kept off the bottom-right corner,
+    where camcorders put the date);
+  - **Plain text**.
+- **Mark pitches by hand** opens the marking window (keys below); when you
+  close it with **Q**, the clips are made. **Find pitches automatically...**
+  asks where the camera was, then opens the click-the-points window, finds the
+  pitches, and opens the review window.
+- **Check / fix pitches**, **Make clips**, **Make full video** and **Open
+  results folder** work on the tape selected in the list. A progress window
+  shows each step, with the time left where it is known.
 
 ### From source (with Python)
 

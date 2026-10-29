@@ -128,3 +128,19 @@ def test_draw_path_dots_and_opacity():
     off = base.copy()
     G.draw_path(off, np.array([[-500.0, -500.0], [-400.0, -400.0]]), np.zeros((0, 2)), 1.0)   # off screen
     assert np.array_equal(off, base)
+
+
+def test_every_style_draws_a_card_for_good_rough_and_missing_speeds():
+    import numpy as np
+    from types import SimpleNamespace as NS
+    from pitchspeed.render import overlay as O
+    from pitchspeed.types import SpeedEstimate
+    good = SpeedEstimate(v_release_mph=78.4, sigma_mph=4.3, ci90_mph=(71.0, 85.0), label="fair", method="manual_tof")
+    rough = SpeedEstimate(v_release_mph=101.2, sigma_mph=7.0, ci90_mph=(90.0, 112.0), label="poor", method="manual_tof")
+    for style in ("radar", "broadcast", "bar"):
+        for sp in (good, rough, None):
+            img = np.zeros((480, 640, 3), np.uint8)
+            O.PAINTERS[style]((640, 480)).speed_card(img, 0, NS(number=12, speed=sp), 1.0, None)
+            ys, xs = np.nonzero(img.max(axis=2))
+            assert len(xs) > 500 and xs.max() < 640 and ys.max() < 480, (style, sp)
+    assert O.STYLES == ("radar", "broadcast", "bar", "classic")

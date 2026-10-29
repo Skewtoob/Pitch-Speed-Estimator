@@ -1,6 +1,6 @@
-"""Entry point of the stand-alone Windows program (PitchSpeed.exe, built with PyInstaller).
+"""Entry point of the console program (pitchspeed-cli.exe in the Windows build; the main window runs it).
 
-Drag one or more video files onto PitchSpeed.exe (or a shortcut to it): each is
+Drag one or more video files onto pitchspeed-cli.exe: each is
 run through the guided `pitchspeed run`.  Started with other arguments it behaves
 like the `pitchspeed` command (e.g. `PitchSpeed.exe render video.avi --mode clips`).
 The console stays open at the end so the results can be read.
@@ -17,6 +17,11 @@ def _pause() -> None:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):    # show output as it happens when run by the main window
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
     import multiprocessing
     multiprocessing.freeze_support()
     import cv2  # noqa: F401  (load OpenCV before PyAV: see pitchspeed.ui.gui)
@@ -24,8 +29,8 @@ def main() -> int:
 
     args = sys.argv[1:]
     if not args:
-        print("Pitch Speed\n\nDrag a video file onto PitchSpeed.exe (or onto the 'Pitch Speed'"
-              " shortcut) to measure its pitches.\nSeveral files can be dragged at once.")
+        print("Pitch Speed (command line)\n\nThis is the program the Pitch Speed window runs in the"
+              " background.\nOpen 'Pitch Speed' (PitchSpeed.exe) instead, or drag a video file onto this one.")
         _pause()
         return 0
     if all(os.path.isfile(a) for a in args):

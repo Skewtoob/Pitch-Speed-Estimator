@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pitchspeed"
-version = "0.1.0"
+version = "0.2.0"
 description = "Estimate baseball pitch speeds from (old, interlaced, low-quality) video"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,15 +20,20 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+gui = ["PySide6>=6.6"]
 
 [project.scripts]
 pitchspeed = "pitchspeed.cli:main"
+
+[project.gui-scripts]
+pitchspeed-gui = "pitchspeed.app.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 "pitchspeed.render" = ["fonts/*.otf", "fonts/*.txt"]
+"pitchspeed.app" = ["icon.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

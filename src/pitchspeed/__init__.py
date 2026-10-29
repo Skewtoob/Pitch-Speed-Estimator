@@ -1,6 +1,6 @@
 """pitchspeed: estimate baseball pitch speeds from video."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Import OpenCV before PyAV.  On Linux both wheels bundle X11 libraries with
 # identical names; if PyAV's copies load first, OpenCV's Qt windows hang.

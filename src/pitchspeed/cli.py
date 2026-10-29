@@ -931,8 +931,9 @@ def build_parser() -> argparse.ArgumentParser:
     common(p, calib=False)
     p.add_argument("--mode", choices=["full", "highlights", "clips"], default="full",
                    help="full video, only the pitches, or one clip per pitch (in <out>/clips)")
-    p.add_argument("--style", choices=["radar", "classic"], default="radar",
-                   help="radar: radar-gun speed display and ball path (default); classic: plain text")
+    p.add_argument("--style", choices=["radar", "broadcast", "bar", "classic"], default="radar",
+                   help="speed graphic: radar (radar gun, default), broadcast (TV box), bar (sports bar "
+                        "along the bottom), classic (plain text)")
     p.add_argument("--no-originals", action="store_true",
                    help="clips mode: no untouched copies of the original video")
     p.add_argument("--no-audio", action="store_true")
