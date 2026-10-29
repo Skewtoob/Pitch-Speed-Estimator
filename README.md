@@ -27,6 +27,23 @@ timing precision compared with counting frames.
 
 ## Install (Windows)
 
+### Easy way: the ready-made program (no Python needed)
+
+1. On the project's GitHub page, open **Releases** (right-hand side) →
+   **Pitch Speed for Windows (latest build)** and download
+   **PitchSpeed-Windows.zip**.
+2. Unzip it anywhere, for example in `Documents`. Keep the folder together:
+   `PitchSpeed.exe` needs the `_internal` folder next to it.
+3. Drag a video file onto **PitchSpeed.exe** (or onto a desktop shortcut to it:
+   right-click it → Send to → Desktop). Several videos can be dragged at once.
+
+The first time, Windows may say "Windows protected your PC" because the program
+is not signed: click **More info** → **Run anyway**. To update, download the zip
+again and unzip it over the old folder; your results (next to your videos) are
+not touched.
+
+### From source (with Python)
+
 1. Install **Python 3.10 or newer (64-bit)** from
    [python.org](https://www.python.org/downloads/). The default options are fine.
 2. Download this project (green **Code** button → **Download ZIP**) and unzip
