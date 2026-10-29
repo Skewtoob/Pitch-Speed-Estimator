@@ -45,9 +45,16 @@ anywhere and open `PitchSpeed.exe` in the `PitchSpeed` folder.
 ### The Pitch Speed window
 
 - **Add tapes...** (or drag video files onto the window) puts tapes in the
-  list. Each shows its status, the number of pitches, and the typical and
-  fastest speed. The list is remembered.
-- **Settings**: pitching distance (league), the size of the marking window,
+  list. Each shows its status, the number of pitches, the **fastball
+  average** (with its ± and how many pitches it is based on) and the fastest
+  speed. The list is remembered. The fastball average uses the fast group
+  when a tape's speeds split into slow and fast pitches (curveballs and
+  changeups are left out), else all pitches; averaging many pitches is far
+  more precise than any single one.
+- **Settings**: pitching distance (league), **how you mark the catch** (when
+  the ball reaches the glove, or at the catcher's squeeze: the squeeze comes
+  about 25 ms later, so the tool corrects for it; this correction was
+  measured on one radar video only), the size of the marking window,
   sound on/off, and the **speed graphic** in the videos it makes:
   - **Radar gun**: red LED digits, like a radar-gun display;
   - **TV broadcast box**: a TV-style pitch box;
@@ -55,8 +62,9 @@ anywhere and open `PitchSpeed.exe` in the `PitchSpeed` folder.
     where camcorders put the date);
   - **Plain text**.
 - **Mark pitches by hand** opens the marking window (keys below); when you
-  close it with **Q**, the clips are made. **Find pitches automatically...**
-  asks where the camera was, then opens the click-the-points window, finds the
+  close it with **Q**, the clips are made. **Find pitches automatically
+  (experimental)...** has only been tested on computer-made videos so far:
+  check the pitches it finds. It asks where the camera was, then opens the click-the-points window, finds the
   pitches, and opens the review window.
 - **Check / fix pitches**, **Make clips**, **Make full video** and **Open
   results folder** work on the tape selected in the list. A progress window
@@ -313,7 +321,9 @@ just before the arm whips down across the body.
 **Careful with the catch.** The catcher squeezes the glove a little after
 the ball gets there. Mark the first picture where the ball **reaches** the
 glove (it disappears into it, or the glove gets knocked back), not the
-squeeze. Each picture late makes the speed read about 2-5 mph too low.
+squeeze. Each picture late makes the speed read about 2-5 mph too low. If
+you prefer the squeeze, choose it under Settings (or `--catch-cue squeeze`)
+and the tool corrects for it.
 
 **How accurate is it?** In a simulation where a quarter of the marks were
 one field off, hand-marked speeds were typically within about 2-3 mph

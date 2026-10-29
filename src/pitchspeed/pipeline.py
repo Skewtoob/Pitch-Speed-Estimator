@@ -13,6 +13,12 @@ Excel) is reported, never fatal (`save_results`).
 """
 from __future__ import annotations
 
+from pitchspeed import constants as C
+
+import math
+
+import dataclasses
+
 import copy
 import datetime as _dt
 import json
@@ -365,8 +371,17 @@ def estimate_for(calib: Calibration, scan: ScanInfo, sample_dt: float, pitch: Pi
             # Track-less (hand-marked) pitch: a point-less stand-in carries the
             # capture-glitch flags to the estimator (same result as track=None otherwise).
             track = PitchTrack(track_id=-1, points=[], flags=glitch)
-    return estimate_speed(calib, scan, sample_dt, pitch.release, pitch.catch,
-                          track=track, manual=manual)
+    catch, squeeze = pitch.catch, False
+    if (catch is not None and catch.method == "manual" and getattr(catch, "point", None) != "contact"
+            and getattr(calib.settings, "catch_cue", "arrival") == "squeeze"):
+        # marked at the catcher's squeeze: the ball reached the glove a little earlier
+        catch = dataclasses.replace(catch, t=catch.t - C.SQUEEZE_DELAY_S,
+                                    sigma=math.hypot(catch.sigma, C.SQUEEZE_DELAY_SIGMA_S))
+        squeeze = True
+    sp = estimate_speed(calib, scan, sample_dt, pitch.release, catch, track=track, manual=manual)
+    if squeeze and sp is not None:
+        sp.flags = list(sp.flags or []) + ["squeeze_corrected"]
+    return sp
 
 
 def _event_sample(source, ev: Optional[EventTime]) -> Optional[int]:
@@ -974,7 +989,7 @@ def _norm_json(x):
 SETTING_LABELS = {"distance_ft": "distance (ft)", "level": "level", "sport": "sport",
                   "extension_ft": "extension (ft)", "pitcher_throws": "throws", "altitude_ft": "altitude (ft)",
                   "temp_f": "temperature (F)", "sar": "pixel aspect", "release_height_ft": "release height (ft)",
-                  "catch_behind_ft": "catch behind plate (ft)"}
+                  "catch_behind_ft": "catch behind plate (ft)", "catch_cue": "catch marked at"}
 
 
 def settings_changes(old: dict, new: dict) -> list[str]:

@@ -56,7 +56,7 @@ def resource(name: str) -> str:
 def load_settings(qs: QSettings) -> J.Settings:
     s = J.Settings(level=str(qs.value("level", "hs")), style=str(qs.value("style", "radar")),
                    audio=str(qs.value("audio", "true")).lower() in ("true", "1"),
-                   ui_scale=float(qs.value("ui_scale", 1.0)))
+                   ui_scale=float(qs.value("ui_scale", 1.0)), catch_cue=str(qs.value("catch_cue", "arrival")))
     return s.validated()
 
 
@@ -65,6 +65,7 @@ def save_settings(qs: QSettings, s: J.Settings) -> None:
     qs.setValue("style", s.style)
     qs.setValue("audio", "true" if s.audio else "false")
     qs.setValue("ui_scale", s.ui_scale)
+    qs.setValue("catch_cue", s.catch_cue)
 
 
 def style_preview(style: str, w: int = 300, h: int = 170) -> QPixmap:
@@ -115,6 +116,11 @@ class SettingsDialog(QDialog):
             self.scale.addItem(name, v)
         self.scale.setCurrentIndex(min(range(len(UI_SCALES)), key=lambda i: abs(UI_SCALES[i][1] - s.ui_scale)))
         form.addRow("Marking window size:", self.scale)
+        self.cue = QComboBox()
+        self.cue.addItem("When the ball reaches the glove (recommended)", "arrival")
+        self.cue.addItem("When the catcher squeezes the glove (corrected by about 25 ms)", "squeeze")
+        self.cue.setCurrentIndex(max(0, self.cue.findData(s.catch_cue)))
+        form.addRow("I mark the catch:", self.cue)
         self.audio = QCheckBox("Keep the sound in the videos it makes")
         self.audio.setChecked(s.audio)
         form.addRow("", self.audio)
@@ -144,7 +150,8 @@ class SettingsDialog(QDialog):
     def result_settings(self) -> J.Settings:
         b = self.styles.checkedButton()
         return J.Settings(level=self.level.currentData(), style=b.property("style_key") if b else "radar",
-                          audio=self.audio.isChecked(), ui_scale=float(self.scale.currentData())).validated()
+                          audio=self.audio.isChecked(), ui_scale=float(self.scale.currentData()),
+                          catch_cue=self.cue.currentData()).validated()
 
 
 class AutoDialog(QDialog):
@@ -152,8 +159,10 @@ class AutoDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Find pitches automatically")
+        self.setWindowTitle("Find pitches automatically (experimental)")
         lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("<b>Experimental:</b> the automatic search has only been tested on computer-made "
+                             "videos, not on real tapes yet.<br>Check each pitch it finds in the review window."))
         lay.addWidget(QLabel("Automatic works best with a camera on a tripod that doesn't zoom.\n"
                              "You click a few points on the picture once (again if the camera moves).\n"
                              "If the camera moved or zoomed a lot, 'Mark pitches by hand' is more reliable."))
@@ -295,9 +304,16 @@ class JobDialog(QDialog):
         super().closeEvent(e)
 
 
+def _fastball_text(ti) -> str:
+    if ti.fastball is None:
+        return "-"
+    pm = f" ± {ti.fastball_pm:.0f}" if ti.fastball_pm is not None else ""
+    return f"{ti.fastball:.0f}{pm} mph ({ti.fastball_n})"
+
+
 # ----------------------------------------------------------- main window --
 class MainWindow(QMainWindow):
-    COLS = ["Tape", "Status", "Pitches", "Typical", "Fastest"]
+    COLS = ["Tape", "Status", "Pitches", "Fastball average", "Fastest"]
 
     def __init__(self, qsettings: Optional[QSettings] = None):
         super().__init__()
@@ -350,7 +366,8 @@ class MainWindow(QMainWindow):
         self.b_mark.setObjectName("primary")
         self.b_mark.setToolTip("Any camera angle: you mark each pitch's release and catch.")
         self.b_mark.clicked.connect(self.run_mark)
-        self.b_auto = QPushButton("Find pitches automatically...")
+        self.b_auto = QPushButton("Find pitches automatically (experimental)...")
+        self.b_auto.setToolTip("Not yet proven on real tapes: check its results, or mark by hand.")
         self.b_auto.clicked.connect(self.run_auto)
         self.b_review = QPushButton("Check / fix pitches")
         self.b_review.clicked.connect(self.run_review)
@@ -426,7 +443,7 @@ class MainWindow(QMainWindow):
             name.setData(Qt.ItemDataRole.UserRole, v)
             name.setToolTip(v)
             cells = [name, QTableWidgetItem(ti.status), QTableWidgetItem(str(ti.pitches) if ti.pitches else "-"),
-                     QTableWidgetItem(f"{ti.typical:.0f} mph" if ti.typical else "-"),
+                     QTableWidgetItem(_fastball_text(ti)),
                      QTableWidgetItem(f"{ti.fastest:.0f} mph" if ti.fastest else "-")]
             for c, it in enumerate(cells):
                 self.table.setItem(r, c, it)

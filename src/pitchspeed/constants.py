@@ -36,6 +36,13 @@ class Level:
     sport: str                # 'baseball' | 'softball'
 
 
+# Hand-marked catch at the catcher's SQUEEZE instead of the ball reaching the glove: the
+# squeeze comes about this much later.  Measured once: 16 radar-timed pitches marked this way
+# read ~4 mph low at 30 frames/s (about 0.75 frame); the sigma covers how rough that is.
+CATCH_CUES = ("arrival", "squeeze")
+SQUEEZE_DELAY_S = 0.025
+SQUEEZE_DELAY_SIGMA_S = 0.012
+
 LEVELS: dict[str, Level] = {
     lv.key: lv
     for lv in [

@@ -30,3 +30,25 @@ def test_a_bad_new_copy_never_replaces_a_good_original(tmp_path, monkeypatch):
     path, status = clips.cut_original("src.mp4", 5.0, 2.0, str(out), ffmpeg_exe="ffmpeg")
     assert path is None and out.read_bytes() == b"old good copy"
     assert not any(n.endswith(".part.mp4") for n in os.listdir(tmp_path))
+
+
+def test_squeeze_cue_moves_hand_marked_catches_earlier_but_not_bat_contact():
+    import copy
+    from pitchspeed.calib.model import Settings, manual_calibration
+    from pitchspeed import pipeline as P
+    st, src, res, rec = make_mark()
+    st.goto(1000); keys(st, "n")
+    st.goto(1032); keys(st, "c")
+    st.goto(2000); keys(st, "n")
+    st.goto(2030); keys(st, "b")
+    glove, hit = sorted(res.pitches, key=lambda p: p.release.s)
+    cal = manual_calibration(Settings(distance_ft=60.5, level="hs")).segment_calibs()[0]
+    cal_sq = copy.deepcopy(cal)
+    cal_sq.settings.catch_cue = "squeeze"
+    a = P.estimate_for(cal, src.scan, src.sample_dt, glove)
+    b = P.estimate_for(cal_sq, src.scan, src.sample_dt, glove)
+    assert 1.5 < b.v_release_mph - a.v_release_mph < 6 and "squeeze_corrected" in b.flags
+    assert b.sigma_mph > a.sigma_mph
+    c = P.estimate_for(cal, src.scan, src.sample_dt, hit)
+    d = P.estimate_for(cal_sq, src.scan, src.sample_dt, hit)
+    assert c.v_release_mph == d.v_release_mph and "squeeze_corrected" not in (d.flags or [])

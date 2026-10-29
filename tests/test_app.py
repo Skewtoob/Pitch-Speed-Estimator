@@ -12,14 +12,17 @@ from pitchspeed.app.tapes import tape_info
 def test_buttons_run_commands_that_ask_no_questions():
     s = J.Settings(level="50", style="bar", audio=False, ui_scale=1.5)
     m = J.mark_job("t.avi", s)
-    assert m.steps[0].args == ["mark", "t.avi", "--level", "50", "--render", "none", "--ui-scale", "1.5"]
+    assert m.steps[0].args == ["mark", "t.avi", "--level", "50", "--catch-cue", "arrival", "--render", "none",
+                               "--ui-scale", "1.5"]
     assert m.steps[1].args == ["render", "t.avi", "--mode", "clips", "--style", "bar", "--no-audio"]
     a = J.auto_job("t.avi", "side", s, "L")
     assert a.steps[0].args[:6] == ["calibrate", "t.avi", "--view", "side", "--level", "50"]
     assert "--throws" in a.steps[0].args and [st.args[0] for st in a.steps] == ["calibrate", "analyze", "review", "render"]
     assert J.video_job("t.avi", "full", J.Settings()).steps[0].args == ["render", "t.avi", "--mode", "full",
                                                                        "--style", "radar"]
-    assert J.Settings(level="zzz", style="neon", ui_scale=9).validated() == J.Settings("hs", "radar", True, 3.0)
+    assert J.Settings(level="zzz", style="neon", ui_scale=9, catch_cue="x").validated() == \
+        J.Settings("hs", "radar", True, 3.0, "arrival")
+    assert "--catch-cue" in J.mark_job("t.avi", J.Settings(catch_cue="squeeze")).steps[0].args
     with pytest.raises(ValueError):
         J.auto_job("t.avi", "top", s)
 
@@ -124,3 +127,14 @@ def test_job_dialog_runs_steps_and_shows_progress(qapp, tmp_path):
     p2.start(50)
     loop2.exec()
     assert not bad.ok and "step b" not in bad.log.toPlainText()     # stops at the failed step
+
+
+def test_fastball_average_takes_the_fast_group():
+    from pitchspeed.app.tapes import fastball_average
+    slow = [51, 58, 61, 61, 61, 61, 64, 64, 64, 64, 64, 64, 68, 68]
+    fast = [72] * 21 + [76] * 15 + [81] * 5 + [87]
+    m, pm, n = fastball_average(slow + fast)
+    assert n == 42 and abs(m - 74.86) < 0.1 and 0.5 < pm < 1.5
+    m, pm, n = fastball_average([80, 81, 79, 82])            # one group: all of them
+    assert n == 4 and abs(m - 80.5) < 1e-9
+    assert fastball_average([]) == (None, None, 0) and fastball_average([80])[1] is None

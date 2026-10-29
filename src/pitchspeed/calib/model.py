@@ -145,6 +145,7 @@ class Settings:
     altitude_ft: float = 0.0
     temp_f: Optional[float] = None
     sar: float = 1.0                         # stored pixel aspect ratio used for the clicks
+    catch_cue: str = "arrival"               # hand-marked catches: 'arrival' (ball reaches the glove) | 'squeeze'
 
 
 @dataclass

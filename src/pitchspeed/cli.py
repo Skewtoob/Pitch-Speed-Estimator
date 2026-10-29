@@ -34,7 +34,7 @@ from pitchspeed import constants as C
 from pitchspeed.pipeline import AnalyzeOptions, out_paths
 
 SPORTS = ("baseball", "softball")
-SETTINGS_FLAGS = ("level", "distance", "sport", "extension", "throws", "altitude", "temp")
+SETTINGS_FLAGS = ("level", "distance", "sport", "extension", "throws", "altitude", "temp", "catch_cue")
 try:                                   # plausible range of a typed pitching distance (feet)
     from pitchspeed.calib.model import DISTANCE_RANGE_FT
 except ImportError:                    # pragma: no cover - older calib.model
@@ -165,6 +165,8 @@ def _settings_from_args(args, base=None):
         st.altitude_ft = args.altitude
     if getattr(args, "temp", None) is not None:
         st.temp_f = args.temp
+    if getattr(args, "catch_cue", None):
+        st.catch_cue = args.catch_cue
     _check_settings(st, args)
     return st
 
@@ -627,7 +629,7 @@ def cmd_review(args) -> int:
 def _ask_method() -> str:
     """'auto' or 'mark': how to find the pitches of a video that has no setup yet."""
     print("\nHow should the pitches be found?")
-    print("  1) automatically - you click the pitching rubber and home plate once (again if the camera")
+    print("  1) automatically (experimental) - you click the pitching rubber and home plate once (again if the camera")
     print("     moves or zooms). Best for a camera on a tripod.")
     print("  2) by hand - you press a key at each pitch's release and at the catch. Any camera angle;")
     print("     the camera may move and zoom. Speeds are typically within about 2-3 mph.")
@@ -894,6 +896,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--throws", choices=["R", "L", "r", "l"], help="pitcher's throwing hand (side view)")
         p.add_argument("--altitude", type=float, help="field altitude in feet (air density)")
         p.add_argument("--temp", type=float, help="air temperature in F (air density)")
+        p.add_argument("--catch-cue", choices=list(C.CATCH_CUES),
+                       help="hand-marked catches: arrival = marked when the ball reaches the glove (default); "
+                            "squeeze = marked at the catcher's squeeze (about 25 ms later; corrected)")
 
     def analyze_args(p):
         p.add_argument("--start", type=float, help="only analyze from this time (seconds)")

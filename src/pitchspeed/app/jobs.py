@@ -24,12 +24,14 @@ class Settings:
     style: str = "radar"
     audio: bool = True
     ui_scale: float = 1.0
+    catch_cue: str = "arrival"
 
     def validated(self) -> "Settings":
         lv = self.level if self.level in C.LEVELS else "hs"
         st = self.style if self.style in STYLES else "radar"
         sc = min(3.0, max(0.5, float(self.ui_scale or 1.0)))
-        return Settings(lv, st, bool(self.audio), sc)
+        cue = self.catch_cue if self.catch_cue in C.CATCH_CUES else "arrival"
+        return Settings(lv, st, bool(self.audio), sc, cue)
 
 
 @dataclass
@@ -69,7 +71,8 @@ def mark_job(video: str, s: Settings) -> Job:
     s = s.validated()
     return Job("Mark pitches by hand", video, [
         Step("Marking: the marking window opens (Q there saves and closes it)",
-             ["mark", video, "--level", s.level, "--render", "none"] + _scale(s), opens_window=True),
+             ["mark", video, "--level", s.level, "--catch-cue", s.catch_cue, "--render", "none"] + _scale(s),
+             opens_window=True),
         _video_step(video, "clips", s)])
 
 
@@ -80,7 +83,7 @@ def auto_job(video: str, view: str, s: Settings, throws: Optional[str] = None) -
     cal = ["calibrate", video, "--view", view, "--level", s.level] + _scale(s)
     if view == "side" and throws in ("R", "L"):
         cal += ["--throws", throws]
-    return Job("Find pitches automatically", video, [
+    return Job("Find pitches automatically (experimental)", video, [
         Step("Calibration: click the points in the window that opens, then Enter twice", cal,
              opens_window=True),
         Step("Finding the pitches and their speeds", ["analyze", video, "--render", "none"]),
