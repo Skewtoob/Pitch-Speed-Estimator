@@ -79,13 +79,18 @@ long tape).  The same keys and rules, plus:
 
 SIDE BY SIDE (G, both modes): the picture area shows STRIP_N consecutive
 fields (frames for progressive video, or in the full-frame view) next to
-each other, magnified around one spot (the mouse when G was pressed;
-right-click a picture to move it, + / - zoom), so the first field with the
-ball out of the hand or in the glove can be picked by comparing them.  The
+each other, magnified around one spot (the mouse when G was pressed, else
+the spot used last time), so the first field with the ball out of the hand
+or in the glove can be picked by comparing them.  With no spot yet the
+pictures are shown whole and small ("zoom" STRIP_WHOLE, also reached with -):
+a right-click on one magnifies there; in a magnified view a right-click
+moves the spot a little.  The
 shown field is the one with the yellow border: A/D (or a click on a
 picture) pick another, and every marking key acts on it exactly as in the
 normal view.  The set of pictures only slides when the pick leaves it.
-G or Esc closes it; Space closes it and plays.
+G or Esc closes it (an Esc right after that does not also quit); Space
+closes it and plays.  F and jumps longer than one picture start the set
+afresh around the shown field.
 """
 from __future__ import annotations
 
@@ -110,8 +115,9 @@ MARK_START = ("MARK PITCHES: Space plays/pauses (+ - speed), J/L = 1 second, cli
               "At each pitch: pause, step with A/D (G = side by side), N at the release, C at the glove (B if hit)")
 STRIP_N = 8                # pictures side by side (G)
 STRIP_BEFORE = 3           # of them before the shown field when G opens the view
-STRIP_ZOOMS = (1.5, 2.0, 3.0, 4.0, 6.0, 8.0)     # magnification vs. the normal view
-STRIP_ZOOM_START = 2       # index into STRIP_ZOOMS (3x)
+STRIP_WHOLE = 0.0          # "zoom" that shows each whole picture, small (to pick a spot)
+STRIP_ZOOMS = (STRIP_WHOLE, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)   # magnification vs. the normal view
+STRIP_ZOOM_START = 3       # index into STRIP_ZOOMS (3x): where a chosen spot is shown first
 PITCH_MARGIN = 60          # fields shown before the release / after the catch (io_ux.md 4)
 WINDOW_MARGIN = 30         # fields around a possible-missed window or rejected track
 POINT_TOLERANCE = 3        # ball points may be added this many fields outside R..C
@@ -183,7 +189,8 @@ HELP_TEXT: dict[str, str] = {
     "track": "show / hide the ball track",
     "loupe": "8x loupe at the mouse",
     "strip": "side by side: the 8 fields around this one, magnified at the mouse, to pick the exact "
-             "field (A/D or click picks, right-click re-centres, + - zoom, G or Esc closes)",
+             "field (A/D or a click picks; - down to whole pictures, then right-click a spot to magnify "
+             "it; G or Esc closes)",
     "toggle_view": "bobbed field / full frame view (marks only in the field view)",
     "flip_order": "marking by hand: switch the field order (if motion jumps back and forth when you "
                   "step field by field)",
@@ -427,6 +434,7 @@ class ReviewState:
         self.strip_first = 0               # first sample shown side by side
         self.strip_focus: Optional[tuple[float, float]] = None   # frame px to magnify (None: centre)
         self.strip_zoom_i = STRIP_ZOOM_START
+        self._esc_closed_strip = False     # the last Esc closed side by side (the next one must not quit)
         self.pointer: Optional[tuple[float, float]] = None       # mouse in frame px (set by the shell)
         self.view_mode = "field" if getattr(timeline, "interlaced", False) else "frame"
         self.undo_stack: list[_Undo] = []
@@ -655,6 +663,8 @@ class ReviewState:
     def on_action(self, action: str) -> None:
         """Run one action from BINDINGS (messages persist until replaced)."""
         self._error_said = False
+        if action != "escape":
+            self._esc_closed_strip = False
         if self.quit_armed and action != "quit":
             self.quit_armed = False
             self._say("quit aborted")
@@ -665,6 +675,8 @@ class ReviewState:
     def _step(self, n: int) -> None:
         self.s = self._clamp(self.s + n)
         self.playing = False
+        if self.strip and abs(n) > self._field_step():      # W/S, J/L: more than one picture
+            self._recentre_strip()
 
     def goto(self, s: int) -> None:
         """Jump to sample s (e.g. a click on the timeline bar)."""
@@ -880,21 +892,46 @@ class ReviewState:
         self.playing = False
         if self.pointer is not None:
             self.strip_focus = (float(self.pointer[0]), float(self.pointer[1]))
-        self.strip_first = self.s - STRIP_BEFORE * self._field_step()
-        self.strip_samples()
-        unit = "fields" if self._field_step() == 1 and getattr(self.tl, "interlaced", False) else "frames"
-        where = ("at the mouse (right-click a picture to move it)" if self.strip_focus is not None else
-                 "at the centre: right-click the pitcher's hand or the glove to magnify there")
-        self._say(f"SIDE BY SIDE {self.strip_zoom:g}x {where}. The yellow {unit[:-1]} is the one shown: A/D or "
-                  f"a click picks another, then mark it as usual. + - zoom, G closes", "ok")
+            if self.strip_zoom == STRIP_WHOLE:
+                self.strip_zoom_i = STRIP_ZOOM_START
+            where = "at the mouse"
+        elif self.strip_focus is not None and self.strip_zoom != STRIP_WHOLE:
+            where = "at the same spot as last time"
+        else:
+            self.strip_zoom_i = 0
+            where = None
+        self._recentre_strip()
+        self._say(self._strip_intro(where), "ok")
+
+    def _strip_unit(self) -> str:
+        return "field" if self._field_step() == 1 and getattr(self.tl, "interlaced", False) else "frame"
+
+    def _strip_intro(self, where: Optional[str]) -> str:
+        pick = (f"Yellow = the {self._strip_unit()} shown; A/D or a click picks another, then "
+                + ("press F to mark (marks need single fields)" if self.woven() else "mark it"))
+        if where is None:
+            return (f"SIDE BY SIDE, whole pictures: right-click the pitcher's hand or the glove to magnify "
+                    f"there. {pick}. G closes")
+        return (f"SIDE BY SIDE {self.strip_zoom:g}x {where}. {pick}. Wrong spot: press - until the whole "
+                f"pictures show, then right-click. G closes")
 
     @property
     def strip_zoom(self) -> float:
+        """Magnification of the pictures side by side (STRIP_WHOLE = each whole picture, small)."""
         return STRIP_ZOOMS[self.strip_zoom_i]
 
     def _zoom(self, step: int) -> None:
         self.strip_zoom_i = min(len(STRIP_ZOOMS) - 1, max(0, self.strip_zoom_i + step))
-        self._say(f"side by side: {self.strip_zoom:g}x")
+        if self.strip_zoom == STRIP_WHOLE:
+            self._say("side by side: whole pictures - right-click the pitcher's hand or the glove to magnify there")
+        else:
+            where = "" if self.strip_focus is not None else " at the centre (right-click a spot after - to choose one)"
+            self._say(f"side by side: {self.strip_zoom:g}x{where}")
+
+    def _recentre_strip(self) -> None:
+        """Start the set afresh with the shown field STRIP_BEFORE pictures from its start."""
+        self.strip_first = self.s - STRIP_BEFORE * self._field_step()
+        self.strip_samples()
 
     def strip_samples(self) -> list[int]:
         """Samples shown side by side (empty when closed).  Keeps the shown field inside: a
@@ -921,14 +958,19 @@ class ReviewState:
             self.goto(s)
 
     def strip_refocus(self, x: float, y: float) -> None:
-        """A right-click on a picture side by side: magnify around that spot (frame px)."""
+        """A right-click on a picture side by side: magnify around that spot (frame px); from the
+        whole pictures this zooms in to STRIP_ZOOM_START."""
         self._error_said = False
         self.strip_focus = (float(x), float(y))
+        if self.strip_zoom == STRIP_WHOLE:
+            self.strip_zoom_i = STRIP_ZOOM_START
+            self._say(f"side by side: {self.strip_zoom:g}x there (- goes back to whole pictures)", "ok")
 
-    def strip_tags(self, t: int) -> list[str]:
+    def strip_tags(self, t: int, mk: Optional[dict] = None) -> list[str]:
         """Marks of the current pitch (or the half-made one) on the picture of sample t:
-        'R', 'C', 'B' (bat contact) and 'new R' (a pitch being added)."""
-        mk = self.markers()
+        'R', 'C', 'B' (bat contact) and 'new R' (a pitch being added).  `mk`: markers(), if the
+        caller already has it (it walks every pitch in mark mode)."""
+        mk = self.markers() if mk is None else mk
         tags = []
         if self._same_picture(mk.get("draft"), t):
             tags.append("new R")
@@ -973,6 +1015,8 @@ class ReviewState:
             self._say("progressive video: field and frame view are the same")
             return
         self.view_mode = "frame" if self.view_mode == "field" else "field"
+        if self.strip:
+            self._recentre_strip()
         if self.view_mode == "frame":
             self._say("full frame (two fields woven): Left/Right step one frame; marks need the field view "
                       "(F again)")
@@ -1070,7 +1114,7 @@ class ReviewState:
 
         self._edit(e, "set_" + kind, mutate, from_s=old, to_s=s)
         self.marker = "R" if kind == "release" else "C"
-        p = self.current_pitch()
+        p = e.pitch                 # the edited pitch (a nudge can move it out of "current")
         if point == "contact":
             self._say(f"bat contact set to field {s}: {speed_text(p.speed if p else None)}", "ok")
             return
@@ -1133,18 +1177,19 @@ class ReviewState:
             self.draft["s_release"] = self._clamp(self.draft["s_release"] + step)
             self.s = self.draft["s_release"]
             return
-        p = self.current_pitch()
-        if p is None:
+        e = self.current_entry()
+        if e is None:
             self._say("no pitch selected", "warn")
             return
         kind = "release" if self.marker == "R" else "catch"
-        cur = self.ev_s(p.release if kind == "release" else p.catch)
+        cur = self.ev_s(e.pitch.release if kind == "release" else e.pitch.catch)
         if cur is None:
             return
         target = self._clamp(cur + step)
         before_s = self.s
         self._set_event(kind, target)
-        moved = self.ev_s(self.current_pitch().release if kind == "release" else self.current_pitch().catch)
+        # e, not current_pitch(): the shown field may now be just over PITCH_MARGIN from the pitch
+        moved = self.ev_s(e.pitch.release if kind == "release" else e.pitch.catch)
         self.s = moved if moved is not None else before_s
 
     def _do_nudge_back(self) -> None:
@@ -1558,12 +1603,16 @@ class ReviewState:
             return
         if self.strip:
             self.strip = False
+            self._esc_closed_strip = True
             self._say("side by side closed")
             return
         if self.draft is not None:
             self._push([], "cancel_draft")
             self.draft = None
             self._say("manual pitch cancelled (U brings it back)")
+            return
+        if self._esc_closed_strip:          # Esc pressed twice (or held) to close side by side
+            self._say("side by side is closed. Q saves and quits", "warn")
             return
         self._do_quit()
 
@@ -1659,7 +1708,7 @@ class ReviewState:
                 rel += f" C{self.s - c:+d}"
         play = f" | PLAY {self.speed_labels[self.speed_i]}" if self.playing else ""
         if self.strip:
-            play += f" | SIDE BY SIDE {self.strip_zoom:g}x"
+            play += " | SIDE BY SIDE " + ("whole" if self.strip_zoom == STRIP_WHOLE else f"{self.strip_zoom:g}x")
         if self.marking:
             n = sum(1 for e in self.entries if e.pitch.status != "rejected")
             return (f"MARK | {n} marked | {where} | {format_time(self.tl.sample_time(self.s))} / "
@@ -1721,8 +1770,9 @@ class ReviewState:
 
     def hint_text(self) -> str:
         if self.strip:
-            return ("SIDE BY SIDE: A/D or click = pick the picture (yellow) | mark it as usual | right-click = "
-                    "magnify there | + - zoom | G/Esc close")
+            mark = "F, then mark it" if self.woven() else "mark it as usual"
+            return (f"SIDE BY SIDE: A/D or click = pick the picture (yellow) | {mark} | right-click = "
+                    f"magnify there | + - zoom | G/Esc close")
         p = self.current_pitch()
         if self.marking and self.draft is None and p is None:
             return "Space play | + - speed | J/L 1 s | W/S 10 fields | A/D 1 field | N new pitch | PgUp/PgDn marked pitches"

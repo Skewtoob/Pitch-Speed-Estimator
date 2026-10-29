@@ -334,3 +334,21 @@ def test_k_still_works_after_rejecting_a_hand_marked_pitch():
     assert st.pending == ("flip_order", None)
     st.run_pending()
     assert sorted(p.release.s for p in res.pitches) == [1001, 2001]   # the rejected one is converted too
+
+
+def test_nudging_a_mark_from_exactly_one_second_away_does_not_crash():
+    """',' / '.' when the shown field is exactly PITCH_MARGIN from the mark (C then L on NTSC
+    fields) used to raise AttributeError and close the window."""
+    st, src, res, rec = make_mark()
+    st.goto(1000)
+    keys(st, "n")
+    st.goto(1030)
+    keys(st, "c")
+    st.goto(1030 + PITCH_MARGIN)
+    assert st.current_pitch() is not None and st.marker == "C"
+    keys(st, ",")
+    p = res.pitches[0]
+    assert p.catch.s == 1029 and st.s == 1029 and "catch set to field 1029" in st.message.text
+    st.goto(1000 - PITCH_MARGIN)
+    keys(st, "tab", ".")                              # the mirror case: R from 60 fields before it
+    assert p.release.s == 1001 and st.s == 1001

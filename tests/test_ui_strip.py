@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 
 from pitchspeed.review import ui
-from pitchspeed.review.state import STRIP_BEFORE, STRIP_N, STRIP_ZOOMS, STRIP_ZOOM_START, ReviewState
+from pitchspeed.review.state import (STRIP_BEFORE, STRIP_N, STRIP_WHOLE, STRIP_ZOOMS, STRIP_ZOOM_START,
+                                     ReviewState)
 from pitchspeed.ui import canvas as cv
 from pitchspeed.ui.frames import FrameStore
 from test_ui_mark_mode import make_mark
@@ -36,15 +37,44 @@ def test_g_shows_the_fields_around_the_shown_one_and_closes_again():
     keys(st, "g")
     assert not st.strip and st.strip_samples() == []
     _open(st, 2000)                                   # no mouse on the picture: keeps the old spot
-    assert st.strip_focus == DOT
+    assert st.strip_focus == DOT and st.strip_zoom == STRIP_ZOOMS[STRIP_ZOOM_START]
+    assert "same spot as last time" in st.message.text and "at the mouse" not in st.message.text
     keys(st, "esc")                                   # Esc closes it, nothing else
     assert not st.strip and not st.done
 
 
-def test_without_a_spot_it_says_how_to_choose_one():
+def test_a_second_esc_after_closing_does_not_quit_but_q_does():
     st, *_ = make_mark()
+    _open(st, 1000, pointer=DOT)
+    keys(st, "esc", "esc", "esc")                     # pressed twice (or held): still open for marking
+    assert not st.strip and not st.done and "Q saves and quits" in st.message.text
+    keys(st, "d", "esc")                              # any other key first: Esc quits as before
+    assert st.done
+    st2, *_ = make_mark()
+    keys(st2, "esc")                                  # never opened: unchanged
+    assert st2.done
+
+
+def test_without_a_spot_it_shows_whole_pictures_and_a_right_click_magnifies():
+    st, src, res, _ = make_mark()
+    canvas = _canvas()
     _open(st, 500)
-    assert st.strip_focus is None and "right-click" in st.message.text and "centre" in st.message.text
+    assert st.strip_focus is None and st.strip_zoom == STRIP_WHOLE
+    assert "whole pictures" in st.message.text and "right-click" in st.message.text
+    assert "SIDE BY SIDE whole" in st.top_text()
+    tile = ui.strip_tiles(canvas)[2]
+    x0, y0, tw, th = tile
+    tl = ui.tile_to_frame(st, canvas, tile, x0, y0 + (th - 1) / 2)          # left edge, middle
+    br = ui.tile_to_frame(st, canvas, tile, x0 + tw - 1, y0 + (th - 1) / 2)
+    assert tl[0] < 5 and br[0] > 715                                     # the whole width is in the tile
+    centre = (x0 + (tw - 1) / 2.0, y0 + (th - 1) / 2.0)
+    u, v = centre[0] + 20, centre[1] - 10                                 # right-click off-centre
+    want = ui.tile_to_frame(st, canvas, tile, u, v)
+    ui._feed_mouse(st, canvas, "rdown", int(u), int(v))
+    assert st.strip_zoom == STRIP_ZOOMS[STRIP_ZOOM_START]
+    assert abs(st.strip_focus[0] - want[0]) < 6 and abs(st.strip_focus[1] - want[1]) < 6
+    keys(st, *"---")                                  # 3x -> 2x -> 1.5x -> whole again
+    assert st.strip_zoom == STRIP_WHOLE and "whole pictures" in st.message.text
 
 
 def test_the_set_slides_only_when_the_pick_leaves_it_and_long_jumps_start_afresh():
@@ -60,6 +90,12 @@ def test_the_set_slides_only_when_the_pick_leaves_it_and_long_jumps_start_afresh
     keys(st, "s")                                     # 10 fields on: starts afresh around it
     assert st.strip_samples()[STRIP_BEFORE] == st.s == 1007
     st.goto(4000)                                     # far away (bar click)
+    assert st.strip_samples()[STRIP_BEFORE] == st.s
+    keys(st, "f")                                     # full frame: frames around it, s 4th again
+    assert st.strip_samples()[STRIP_BEFORE] == st.s
+    keys(st, "s")                                     # 10 fields = 5 frames: afresh, not at the edge
+    assert st.strip_samples()[STRIP_BEFORE] == st.s
+    keys(st, "f")
     assert st.strip_samples()[STRIP_BEFORE] == st.s
 
 
@@ -95,12 +131,12 @@ def test_marks_made_side_by_side_land_on_the_picked_field_and_show_on_it():
 
 def test_plus_minus_zoom_while_open_and_space_closes_and_plays():
     st, *_ = make_mark()
-    _open(st, 1000)
+    _open(st, 1000, pointer=DOT)
     speed = st.play_speed
     keys(st, "+")
     assert st.strip_zoom == STRIP_ZOOMS[STRIP_ZOOM_START + 1] and st.play_speed == speed
-    keys(st, *"-------")
-    assert st.strip_zoom == STRIP_ZOOMS[0] and st.play_speed == speed
+    keys(st, *"---------")
+    assert st.strip_zoom == STRIP_WHOLE and st.play_speed == speed
     keys(st, "space")
     assert not st.strip and st.playing
     keys(st, "space", "g")                            # G pauses nothing: playback was stopped
@@ -154,8 +190,12 @@ def test_every_tile_magnifies_the_same_spot_of_the_frame():
     for tile, t in zip(ui.strip_tiles(canvas), st.strip_samples()):
         x0, y0, tw, th = tile
         cx, cy = x0 + (tw - 1) / 2.0, y0 + (th - 1) / 2.0
-        patch = img[int(cy) - 3:int(cy) + 5, int(cx) - 3:int(cx) + 5, 1]
-        assert patch.max() > 230, t                       # the dot, magnified
+        r = 20
+        win = img[int(cy) - r:int(cy) + r + 1, int(cx) - r:int(cx) + r + 1, 1].astype(float)
+        ys, xs = np.nonzero(win > 230)                    # the dot, magnified (background < 200 here)
+        assert len(xs) > 10, t
+        # a wrong or missing bob parity puts it 1 frame row (3.4 display px at 3x) off centre
+        assert abs(xs.mean() - r - (cx - int(cx))) < 1.5 and abs(ys.mean() - r - (cy - int(cy))) < 1.5, t
         far = img[y0 + 30:y0 + 40, x0 + 10:x0 + 20, 1]
         assert far.max() < 225                            # not everywhere
     # the shown field has the yellow border
@@ -170,10 +210,18 @@ def test_zoom_changes_the_magnification():
     canvas = _canvas()
     _open(st, 1000, pointer=DOT)
     tile = ui.strip_tiles(canvas)[0]
-    a = ui.tile_to_frame(st, canvas, tile, tile[0] + tile[2] - 1, tile[1])
+    store = FrameStore(src)
+    x0, y0, tw, th = tile
+
+    def dot_pixels():                                 # around the tile centre (not the white label)
+        img = ui.render(st, store, canvas)
+        cx, cy = x0 + tw // 2, y0 + th // 2
+        return int((img[cy - 40:cy + 40, cx - 40:cx + 40, 1] > 230).sum())
+    a, n_a = ui.tile_to_frame(st, canvas, tile, tile[0] + tile[2] - 1, tile[1]), dot_pixels()
     keys(st, "+")
-    b = ui.tile_to_frame(st, canvas, tile, tile[0] + tile[2] - 1, tile[1])
+    b, n_b = ui.tile_to_frame(st, canvas, tile, tile[0] + tile[2] - 1, tile[1]), dot_pixels()
     assert abs(b[0] - DOT[0]) < abs(a[0] - DOT[0])         # closer to the spot = more magnified
+    assert n_b > 1.3 * n_a                                # and the drawn dot really is bigger
 
 
 def test_clicks_pick_a_tile_and_right_clicks_move_the_spot():
@@ -241,3 +289,28 @@ def test_undecodable_fields_are_tried_once_not_on_every_redraw():
     assert calls.count(402) == 1 and calls.count(403) == 1 and store.known(402)
     assert src.iter_calls == 1                         # one sequential read, not one per redraw
     assert store.errors
+
+
+def test_the_loupe_is_not_drawn_over_the_pictures_side_by_side():
+    st, src, res, _ = make_mark()
+    canvas, store = _canvas(), FrameStore(src)
+    keys(st, "z")
+    _open(st, 1000, pointer=DOT)
+    tile = ui.strip_tiles(canvas)[5]
+    mouse = (tile[0] + 20, tile[1] + 20)
+    np.testing.assert_array_equal(ui.render(st, store, canvas, mouse), ui.render(st, store, canvas, None))
+    keys(st, "g")                                     # back in the normal view the loupe is still on
+    assert st.loupe
+
+
+def test_an_undecodable_field_says_so_on_its_picture():
+    src = FakeSource(n_frames=400, fail_frames={201})
+    st = ReviewState(make_result(src, windows=(), missed=()), src, lambda p: p, lambda r: None, mode="mark")
+    canvas = _canvas()
+    _open(st, 400, pointer=DOT)
+    img = ui.render(st, FrameStore(src), canvas)
+    red = (img[..., 2] > 200) & (img[..., 1] < 120) & (img[..., 0] < 120)
+    for tile, t in zip(ui.strip_tiles(canvas), st.strip_samples()):
+        x0, y0, tw, th = tile
+        n = int(red[y0:y0 + th, x0:x0 + tw].sum())
+        assert (n > 30) == (t in (402, 403)), (t, n)

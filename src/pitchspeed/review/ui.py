@@ -52,7 +52,7 @@ import numpy as np
 
 from pitchspeed.calib.model import CalibrationFile, is_manual
 from pitchspeed.io.display import display_transform
-from pitchspeed.review.state import STRIP_N, ReviewState, StabilizeMap
+from pitchspeed.review.state import STRIP_N, STRIP_WHOLE, ReviewState, StabilizeMap
 from pitchspeed.types import AnalysisResult, Pitch, PitchTrack
 from pitchspeed.ui import canvas as cv
 from pitchspeed.ui.frames import FrameStore
@@ -121,7 +121,7 @@ def render(state: ReviewState, store: FrameStore, canvas: cv.Canvas,
         if state.show_track:
             _draw_track(img, state, canvas)
         _draw_event_badge(img, state, vw)
-    if state.loupe and mouse_uv is not None and canvas.in_video(*mouse_uv):
+    if state.loupe and not state.strip and mouse_uv is not None and canvas.in_video(*mouse_uv):
         pts = []
         for x, y, manual, inlier, here in state.overlay_points():
             if here:
@@ -190,6 +190,16 @@ def strip_tiles(canvas: cv.Canvas) -> list[tuple[int, int, int, int]]:
             for r in range(STRIP_ROWS) for c in range(STRIP_COLS)]
 
 
+def strip_view(state: ReviewState, canvas: cv.Canvas) -> tuple[tuple[float, float], float]:
+    """(display point at every tile's centre, magnification): the chosen spot at strip_zoom,
+    or for STRIP_WHOLE the picture centre at the scale that fits the whole picture in a tile."""
+    if state.strip_zoom == STRIP_WHOLE:
+        vw, vh = canvas.video_size
+        _, _, tw, th = strip_tiles(canvas)[0]
+        return ((vw - 1) / 2.0, (vh - 1) / 2.0), min(tw / vw, th / vh)
+    return strip_focus_uv(state, canvas), state.strip_zoom
+
+
 def strip_focus_uv(state: ReviewState, canvas: cv.Canvas) -> tuple[float, float]:
     """Display point magnified in every tile (the chosen spot, else the picture centre)."""
     if state.strip_focus is not None:
@@ -211,7 +221,7 @@ def _tile_zoom(tile, focus_uv, zoom: float) -> np.ndarray:
 
 def tile_to_frame(state: ReviewState, canvas: cv.Canvas, tile, u: float, v: float) -> tuple[float, float]:
     """Window point (u, v) inside `tile` -> frame px of the picture it shows."""
-    T = _tile_zoom(tile, strip_focus_uv(state, canvas), state.strip_zoom)
+    T = _tile_zoom(tile, *strip_view(state, canvas))
     du, dv = np.linalg.solve(T, [u - tile[0], v - tile[1], 1.0])[:2]
     x, y = canvas.to_frame([(du, dv)])[0]
     return float(x), float(y)
@@ -240,8 +250,8 @@ def _draw_side_by_side(img: np.ndarray, state: ReviewState, store: FrameStore, c
     if missing:                                    # one sequential decode instead of 8+ seeks
         store.prefetch(missing[0], missing[-1] + 1)
     src = store.source
-    focus = strip_focus_uv(state, canvas)
-    z = state.strip_zoom
+    focus, z = strip_view(state, canvas)
+    mk = state.markers()
     to_disp = np.vstack([canvas.A, [0.0, 0.0, 1.0]])
     for tile, t in zip(strip_tiles(canvas), samples):
         x0, y0, tw, th = tile
@@ -252,6 +262,10 @@ def _draw_side_by_side(img: np.ndarray, state: ReviewState, store: FrameStore, c
                              borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 40, 40))
         if out.ndim == 2:
             out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+        fields = ((src.sample_of(int(src.locate(t)[0]), 0), src.sample_of(int(src.locate(t)[0]), 1))
+                  if state.woven() else (t,))
+        if any(store.failed(f) for f in fields):     # the placeholder's own text is usually cropped away
+            cv.draw_text(out, "could not decode", (6, th // 2), 0.5, cv.RED)
         if state.show_track:
             for x, y, manual, inlier in state.strip_points(t):
                 u, v = (T @ to_disp @ [x, y, 1.0])[:2]
@@ -264,7 +278,7 @@ def _draw_side_by_side(img: np.ndarray, state: ReviewState, store: FrameStore, c
         label = f"field {t}" if getattr(src, "interlaced", False) and not state.woven() else f"frame {frame}"
         cv.draw_text(out, label, (6, th - 8), 0.5, cv.YELLOW if t == state.s else cv.WHITE)
         tx = tw - 8
-        for tag in reversed(state.strip_tags(t)):
+        for tag in reversed(state.strip_tags(t, mk)):
             tx -= cv.text_size(tag, 0.8, 2)[0]
             cv.draw_text(out, tag, (tx, 56), 0.8, TAG_COLORS.get(tag, cv.WHITE), thickness=2)
             tx -= 10

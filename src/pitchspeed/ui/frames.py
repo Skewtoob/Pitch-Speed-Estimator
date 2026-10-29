@@ -60,6 +60,10 @@ class FrameStore:
     def cached(self, s: int) -> bool:
         return int(s) in self._cache
 
+    def failed(self, s: int) -> bool:
+        """True if sample s could not be decoded (a placeholder is shown for it)."""
+        return int(s) in self._bad
+
     def known(self, s: int) -> bool:
         """Decoded, or already known not to decode (no point in trying again)."""
         return int(s) in self._cache or int(s) in self._bad

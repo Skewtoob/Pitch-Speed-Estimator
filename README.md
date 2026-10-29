@@ -255,20 +255,24 @@ be a field or two early or late. **G** helps:
 2. Compare them: the arm comes forward, the ball leaves the hand. Press
    **A**/**D** or **click a picture** to move the yellow border to the
    **first field with the ball out of the hand**, then press **N**.
-3. Step on to the glove (**D**, or **S** for 10 fields; the pictures follow),
-   **right-click the glove** so it is the magnified spot, put the yellow
-   border on the **first field with the ball in the glove** and press **C**
-   (or **B** at the bat).
+3. Step on to the glove (**D**, or **S** for 10 fields; the pictures
+   follow). To magnify the glove: press **G**, point the mouse at the glove,
+   press **G** again. Put the yellow border on the **first field with the
+   ball in the glove** and press **C** (or **B** at the bat).
 
-**Right-click** a picture to magnify somewhere else, **+** / **-** zoom in
-and out (1.5x to 8x), **G** or **Esc** goes back to the normal view. Marks
-you've made show on the pictures (R, C, B). G works in `pitchspeed review`
-too.
+**Wrong spot magnified?** Press **-** until you see the whole pictures
+(small), then **right-click** the hand or the glove on any of them: that
+spot is magnified 3x. **+** / **-** zoom in and out (whole pictures, 1.5x
+to 8x). **G** or **Esc** goes back to the normal view. Marks you've made
+show on the pictures (R, C, B). G works in `pitchspeed review` too.
 
-If you can't see the ball leave the hand at all, a rough guide is the arm:
-the ball leaves when the hand is out in front of the head, just before the
-arm whips down across the body. It is only a guide; the ball itself, where
-you can see it, is better.
+**Tip: work backwards from the ball.** The release comes later than it
+looks: while the arm is cocked back and coming over the top, the ball is
+still in the hand. Find the ball in the air a few pictures later, then step
+back with **A** while it is still clear of the hand. The earliest picture
+where it is clear of the hand is the release. If you can't see the ball
+near the hand at all, a rough guide: it leaves when the hand is out in
+front of the head, just before the arm whips down across the body.
 
 **How accurate is it?** In a simulation where a quarter of the marks were
 one field off, hand-marked speeds were typically within about 2-3 mph
