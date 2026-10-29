@@ -3,7 +3,7 @@
 * `iter_fields(path, field_order)`: PyAV decode + field split (no dependency
   on pitchspeed.io).
 * `proto_calibration(gt_path)`: a CalibrationFile for a *prototype*-format
-  synthetic clip (scratchpad gen/), built by projecting world points with
+  synthetic clip ($PITCHSPEED_SCRATCH/gen), built by projecting world points with
   the GT camera of the reference frame.
 * `proto_gt_tracks(gt_path, ref_frame)`: per-pitch GT ball positions mapped
   into reference-frame coordinates with the exact rotation homography.
@@ -24,9 +24,7 @@ from pitchspeed.calib.model import CalibrationFile, Segment, Settings
 from pitchspeed.constants import NTSC_FRAME_DT
 from pitchspeed.types import Sample, ScanInfo
 
-SCRATCH = os.environ.get(
-    "PITCHSPEED_SCRATCH",
-    "/tmp/claude-0/-home-user-Pitch-Speed-Estimator/ba0610af-cbc9-58f8-8e1d-080fc4558d52/scratchpad")
+SCRATCH = os.environ.get("PITCHSPEED_SCRATCH", os.path.join(os.path.dirname(__file__), "_media"))
 GEN_DIR = os.path.join(SCRATCH, "gen")
 SYNTH_DIR = os.path.join(SCRATCH, "impl-synth")
 VISION_SCRATCH = os.path.join(SCRATCH, "impl-vision")

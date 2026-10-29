@@ -5,7 +5,7 @@ Confidence tags:
 - **M**: a reputable secondary source, or a fact seen only in a search-engine excerpt.
 - **L**: a forum post, a vendor claim or a single source.
 - **[calc]**: my own arithmetic.
-- **[sandbox]**: I tested it with ffmpeg 6.1.1 in `/tmp/claude-design-research/` (`phys.py` holds the drag model, `gen.py` the synthetic clips).
+- **[sandbox]**: I tested it with ffmpeg 6.1.1 in throwaway prototype scripts (not in the repository).
 - **[est]**: my estimate, with no source behind it.
 
 The network allowlist blocked mlb.com and fangraphs.com, so facts from those sites come from search excerpts and rate M at best.

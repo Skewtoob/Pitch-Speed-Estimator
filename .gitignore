@@ -18,3 +18,4 @@ dist/
 *.wmv
 *.npz
 !tests/data/*.json
+tests/_media/

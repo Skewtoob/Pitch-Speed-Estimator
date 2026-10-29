@@ -253,7 +253,7 @@ Output folder `<video stem>_pitchspeed/`: `calibration.json`,
 * GUI tests: `xvfb-run -a /home/user/venv-ps/bin/python -m pytest -m gui`.
   Never open a cv2 window without a display: Qt aborts the process.
 * Prototype synthetic clips with ground truth (prototype format) exist in
-  the session scratchpad `gen/` directory (`ll_side_bff.mkv`,
+  the `$PITCHSPEED_SCRATCH/gen` directory (`ll_side_bff.mkv`,
   `ll_behind_tff.mkv`, ... + `.gt.json`).
 
 

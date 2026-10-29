@@ -1,6 +1,6 @@
 # Synthetic Test-Video Generator: Spec v0.1 (prototyped and checked)
 
-Prototype: `/tmp/claude-0/-home-user-Pitch-Speed-Estimator/ba0610af-cbc9-58f8-8e1d-080fc4558d52/scratchpad/gen/synthgen.py` (about 750 lines). The tests are in the same folder: `test_timing.py`, `test_flux2.py`, `test_codecs.py`, `test_stamp.py`, `test_physics.py`, `perf.py`. I used the session scratchpad, not `/tmp/claude-design-*`. Nothing was written to the repo.
+The prototype generator and its tests were throwaway scripts; the generator that shipped is `src/pitchspeed/synth/`.
 
 ## 1. Conventions (shared by the generator and the analyzer)
 

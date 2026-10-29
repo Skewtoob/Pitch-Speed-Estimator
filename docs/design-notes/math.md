@@ -1,6 +1,6 @@
 # Speed-estimation math and error budget (design spec)
 
-**Tags:** **[SIM]** means I simulated it in this study. **[DER]** means it follows from algebra. **[ASSUMED]** means it is an assumption or something I recall, not checked here. All sim code is in `/tmp/claude-0/-home-user-Pitch-Speed-Estimator/ba0610af-cbc9-58f8-8e1d-080fc4558d52/scratchpad/speedmath/` (`physics.py`, `camera.py`, `sim1*.py`–`sim5_catch.py`, `budget.py`, `diag_side.py`; raw outputs in `*.txt`). Nothing was written to the repo.
+**Tags:** **[SIM]** means I simulated it in this study. **[DER]** means it follows from algebra. **[ASSUMED]** means it is an assumption or something I recall, not checked here. The simulation scripts were throwaway prototypes and are not in the repository.
 
 **Sim setup.** Full 3-D RK4 flight with drag, Magnus and gravity. Each pitch type has 40 random trajectories:
 - Cd ~ N(0.33, 0.05)

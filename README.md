@@ -1,27 +1,46 @@
-# pitchspeed
+# Pitch Speed
 
-Estimate the speed of every pitch in a baseball (or softball) video, even on
-old, low-quality camcorder tapes. You click a few landmarks once, and the tool:
+Estimate the speed of baseball (or softball) pitches from video, including
+old camcorder tapes digitized to a file. Free, for Windows.
 
-1. finds each pitch in the video,
-2. estimates its **release speed** (the number a radar gun shows) with an
-   honest **± range**,
-3. writes a table (`results.csv`, opens in Excel) with pitch number, time in
-   the video and frame numbers, so you can tell which pitch is which,
-4. writes an **annotated copy of the video** with each pitch's speed shown on
-   screen,
-5. lets you **review** every pitch, fix anything it got wrong, and add pitches
-   it missed by hand.
+![The Pitch Speed window (example tapes)](docs/images/main.png)
 
-It was built for early-2000s tape footage (MiniDV, Digital8, Hi8, VHS-C)
-digitized to a file. That footage is *interlaced*: every frame holds two
-half-pictures taken 1/60 s apart. The tool splits them, which doubles the
-timing precision compared with counting frames.
+**How it works:** you step through the video and mark two moments per pitch,
+when the ball leaves the hand and when it reaches the glove (or the bat).
+From the time between them and the pitching distance, Pitch Speed works out
+the **release speed** (what a radar gun shows), with an honest **± range**.
+It works with any camera angle, even when the camera moves or zooms.
 
-> **Status:** tested only on computer-generated videos with known speeds
-> (see [Accuracy](#accuracy)). Real tapes will be messier. Please check
-> results in the review window, and expect some tuning once real footage is
-> tried.
+You get:
+- a table of every pitch (`results.csv`, opens in Excel) and a **fastball
+  average** per tape;
+- **one video clip per pitch** with the speed on screen, in one of four
+  styles (radar gun, TV broadcast box, sports bar, plain text), plus an
+  untouched copy of each pitch for your own editing;
+- optionally the whole tape with the speeds shown.
+
+![Speed graphics](docs/images/styles.png)
+
+**How accurate?** It depends mostly on the video's frame rate:
+- On ordinary 30-frames-per-second video, a single pitch is good to about
+  **±5 mph**, because the release and the catch each fall somewhere inside
+  a 1/30 s frame. Averages over many pitches are much tighter (±1–2 mph for
+  20 or more).
+- Video that keeps both half-pictures of each tape frame (60 per second)
+  halves that.
+- Checked against a Pocket Radar on one YouTube video: 14 of 16 hand-marked
+  pitches were inside the tool's range. See [Accuracy](#accuracy).
+
+There is also an **experimental automatic mode** that finds the pitches by
+itself on a fixed camera. It has only been tested on computer-made videos so
+far; check its results.
+
+**Download:** [latest Windows installer](https://github.com/Skewtoob/Pitch-Speed-Estimator/releases/tag/latest-windows)
+(**PitchSpeed-Setup.exe**). It is not code-signed, so Windows will warn the first time:
+click **More info**, then **Run anyway**.
+
+Problems, questions or results you'd like to share:
+[open an issue](https://github.com/Skewtoob/Pitch-Speed-Estimator/issues).
 
 ---
 
@@ -409,9 +428,27 @@ Details and caveats are in [docs/ACCURACY.md](docs/ACCURACY.md). In short:
     file** (DV-AVI or MPEG-2 from the capture device) whenever possible.
   - Deinterlaced or 30p files lose the half-frame timing. The tool detects
     this and widens the ±.
-- **Not yet tested on real tapes or on a Windows PC.** Simulated videos
-  can't prove accuracy on real footage; that needs real clips, ideally with
-  radar readings.
+- **Automatic mode** has only been tested on computer-made videos.
+
+### On real footage (marking by hand)
+
+The numbers above are from computer-made videos. On real video so far:
+
+- **Radar check:** a high-school pitcher filmed with a Pocket Radar reading on
+  screen (30 frames per second, from behind the plate), 16 pitches marked by
+  hand: 14 of 16 inside the tool's 90 % range. Fastballs read about 4 mph
+  low on average. That came mostly from marking the catch at the catcher's
+  squeeze, which comes a little after the ball arrives; the **"I mark the
+  catch"** setting corrects for it.
+- **A 2001 Hi8 tape** captured to 30 frames per second, 75 pitches by one
+  pitcher: the fastball average came out where the pitcher remembered.
+- **Many YouTube "radar" highlight videos can't be used to check speeds**:
+  they repeat frames (slow-motion edits, frame-rate conversion), so counting
+  frames no longer measures time. Before trusting one, step through a pitch
+  and make sure the picture changes on every frame.
+- What makes the biggest difference: marking consistently (the same cue every
+  pitch), the side-by-side view (**G**) for picking the exact frame, and
+  averaging many pitches.
 
 ## Settings you may want
 
@@ -450,6 +487,10 @@ edits stay). Changing the camera view needs new clicks
   the CSV again (or quit `pitchspeed review` later, which rewrites it).
 - **annotated.mp4 is open in a video player**: close the player and press
   Enter, or let the tool write `annotated-1.mp4` instead.
+
+## License
+
+Pitch Speed is free software under the MIT license (see [LICENSE](LICENSE)).
 
 ## Credits
 

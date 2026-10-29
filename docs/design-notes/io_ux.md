@@ -1,4 +1,4 @@
-Spec (≤2000 words). Experiment scripts are in `/tmp/claude-0/-home-user-Pitch-Speed-Estimator/ba0610af-cbc9-58f8-8e1d-080fc4558d52/scratchpad/io/` (`gen.py`, `fieldorder.py`, `seek.py`, `writer_test.py`, `sync_check.py`). Nothing was written to the repo.
+Spec (≤2000 words), written before the code; the experiment scripts it mentions were throwaway prototypes and are not in the repository.
 
 # Study: video I/O, interlacing, output video, UI, packaging
 

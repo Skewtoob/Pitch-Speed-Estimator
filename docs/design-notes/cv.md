@@ -1,6 +1,6 @@
 # Spec: ball detection, tracking, pitch segmentation (SD interlaced)
 
-Prototype scripts are in `/tmp/claude-design-detection/` (synth.py, detect.py, tbd.py, fieldorder.py). This file is also saved at `/tmp/claude-design-detection/spec.md` (1,993 words). All numbers below come from synthetic clips. They are sanity checks, not claims about how real tapes will behave.
+All numbers below come from synthetic clips. They are sanity checks, not claims about how real tapes will behave.
 
 ## 0. Experiments
 
