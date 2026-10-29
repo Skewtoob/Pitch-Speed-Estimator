@@ -51,6 +51,22 @@ jobs:
           path: |
             PitchSpeed-Windows.zip
             installer/PitchSpeed-Setup.exe
+      - name: Publish numbered release (v<version>)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.PITCHSPEED_VERSION }}
+          name: Pitch Speed ${{ env.PITCHSPEED_VERSION }}
+          prerelease: false
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          body: |
+            Pitch Speed ${{ env.PITCHSPEED_VERSION }} for Windows. Download **PitchSpeed-Setup.exe** and
+            run it (no administrator rights needed). It is not code-signed: if Windows says
+            "Windows protected your PC", click **More info**, then **Run anyway**.
+            Or download PitchSpeed-Windows.zip, unzip it and open PitchSpeed.exe.
+          files: |
+            PitchSpeed-Windows.zip
+            installer/PitchSpeed-Setup.exe
       - name: Publish download (release "latest-windows")
         uses: softprops/action-gh-release@v2
         with:

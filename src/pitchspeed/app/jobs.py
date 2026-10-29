@@ -105,6 +105,14 @@ def video_job(video: str, mode: str, s: Settings) -> Job:
     return Job(names[mode], video, [_video_step(video, mode, s)])
 
 
+def practice_job(out_dir: str, s: Settings, new: bool = False) -> Job:
+    s = s.validated()
+    a = ["practice", "--out", out_dir, "--catch-cue", s.catch_cue] + (["--new"] if new else []) + _scale(s)
+    return Job("Practice with known speeds", os.path.join(out_dir, "practice.mp4"), [
+        Step("Practice: mark the pitches in the window that opens (Q saves and closes it); then you get "
+             "your score", a, opens_window=True)])
+
+
 PROGRESS_RE = re.compile(r"^\s*([A-Za-z][\w ]*?):\s+([\d.]+)%.*?eta\s+(\d+)s")
 
 

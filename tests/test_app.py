@@ -152,3 +152,10 @@ def test_text_stays_dark_even_when_the_system_uses_dark_mode(qapp):
     for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
         assert pal.color(role).lightness() < 80
     assert pal.color(QPalette.ColorRole.Base).lightness() > 200
+
+
+def test_practice_button_runs_the_practice_command():
+    j = J.practice_job("C:/p", J.Settings(catch_cue="squeeze"), new=True)
+    assert j.steps[0].args == ["practice", "--out", "C:/p", "--catch-cue", "squeeze", "--new"]
+    from pitchspeed.cli import build_parser
+    build_parser().parse_args(j.steps[0].args)

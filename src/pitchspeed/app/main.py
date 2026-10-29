@@ -338,6 +338,24 @@ def _fastball_text(ti) -> str:
     return f"{ti.fastball:.0f}{pm} mph ({ti.fastball_n})"
 
 
+class ScoreDialog(QDialog):
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Your practice score")
+        self.resize(640, 520)
+        lay = QVBoxLayout(self)
+        box = QPlainTextEdit(text)
+        box.setReadOnly(True)
+        f = QFont("Consolas")
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        box.setFont(f)
+        lay.addWidget(box)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        bb.accepted.connect(self.accept)
+        lay.addWidget(bb)
+
+
 # ----------------------------------------------------------- main window --
 class MainWindow(QMainWindow):
     COLS = ["Tape", "Status", "Pitches", "Fastball average", "Fastest"]
@@ -367,11 +385,14 @@ class MainWindow(QMainWindow):
         add = QPushButton("Add tapes...")
         add.setObjectName("primary")
         add.clicked.connect(self.add_dialog)
+        prac = QPushButton("Practice")
+        prac.setToolTip("Mark a practice video with known speeds and see how close you get")
+        prac.clicked.connect(self.run_practice)
         sett = QPushButton("Settings")
         sett.clicked.connect(self.edit_settings)
         hlp = QPushButton("Help")
         hlp.clicked.connect(self.show_help)
-        for b in (add, sett, hlp):
+        for b in (add, prac, sett, hlp):
             head.addWidget(b)
         lay.addLayout(head)
         body = QHBoxLayout()
@@ -526,6 +547,34 @@ class MainWindow(QMainWindow):
         v = self.selected()
         if v:
             self._run(J.video_job(v, mode, self.settings))
+
+    def run_practice(self) -> None:
+        from pitchspeed import practice as PR
+        from pitchspeed.cli import default_practice_dir
+        out = default_practice_dir()
+        new = False
+        if os.path.isfile(os.path.join(out, PR.PRACTICE_NAME)):
+            box = QMessageBox(self)
+            box.setWindowTitle("Practice")
+            box.setText("Practice again with the same video, or make a new one with other pitches?")
+            same = box.addButton("Same video", QMessageBox.ButtonRole.AcceptRole)
+            fresh = box.addButton("New video", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() not in (same, fresh):
+                return
+            new = box.clickedButton() is fresh
+        else:
+            QMessageBox.information(self, "Practice", "Pitch Speed makes a practice video with 8 pitches whose "
+                                    "speeds are known exactly (about two minutes, only the first time).\n\n"
+                                    "Mark them as you would a real tape, then press Q: you get a score showing "
+                                    "how close you got and whether you tend to mark early or late.")
+        job = J.practice_job(out, self.settings, new)
+        if self._run(job):
+            from pitchspeed import pipeline as P
+            path = os.path.join(P.default_out_dir(job.video), PR.SCORE_NAME)
+            if os.path.isfile(path):
+                ScoreDialog(open(path, encoding="utf-8").read(), self).exec()
 
     def open_folder(self) -> None:
         v = self.selected()

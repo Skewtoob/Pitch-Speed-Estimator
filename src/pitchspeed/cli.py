@@ -722,6 +722,42 @@ def cmd_mark(args) -> int:
     return _mark_flow(args, out_dir)
 
 
+def default_practice_dir() -> str:
+    docs = os.path.join(os.path.expanduser("~"), "Documents")
+    return os.path.join(docs if os.path.isdir(docs) else os.path.expanduser("~"), "Pitch Speed practice")
+
+
+def cmd_practice(args) -> int:
+    """Make (once) a practice video with known speeds, mark it by hand, and score the marks."""
+    import shutil
+    from pitchspeed import pipeline as P
+    from pitchspeed import practice as PR
+    out = args.out or default_practice_dir()
+    video = os.path.join(out, PR.PRACTICE_NAME)
+    if args.new or not os.path.isfile(video):
+        print("Making the practice video (about two minutes, only the first time) ...", flush=True)
+        seed = int(args.seed) if args.seed is not None else int.from_bytes(os.urandom(2), "little")
+        if args.new and os.path.isdir(P.default_out_dir(video)):
+            shutil.rmtree(P.default_out_dir(video), ignore_errors=True)   # old marks do not fit the new video
+        PR.make_practice_video(out, seed=seed, force=True)
+    print(f"Practice video: {video}\n"
+          f"Mark each pitch as usual: N at the first frame with the ball out of the hand, C at the first\n"
+          f"frame with the ball in the glove. Q saves and closes; then you get your score.", flush=True)
+    mark = ["mark", video, "--level", "hs", "--render", "none"] + (["--catch-cue", args.catch_cue] if args.catch_cue else [])
+    if args.ui_scale:
+        mark += ["--ui-scale", f"{args.ui_scale:g}"]
+    code = main(mark)
+    if code:
+        return code
+    try:
+        text = PR.score_folder(video)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"\nNo score: {e}")
+        return 1
+    print("\n" + text)
+    return 0
+
+
 def cmd_render(args) -> int:
     _check_video(args.video)
     out_dir = _out_dir(args)
@@ -959,6 +995,14 @@ def build_parser() -> argparse.ArgumentParser:
     settings_args(p)
     analyze_args(p)
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("practice", help="mark a practice video with known speeds and see how close you get")
+    p.add_argument("--out", help="folder for the practice video (default: Documents/Pitch Speed practice)")
+    p.add_argument("--new", action="store_true", help="make a new practice video (other pitches and speeds)")
+    p.add_argument("--seed", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--catch-cue", choices=list(C.CATCH_CUES), help="how you mark the catch (see mark --help)")
+    p.add_argument("--ui-scale", type=float, help="enlarge or shrink the marking window")
+    p.set_defaults(func=cmd_practice)
 
     p = sub.add_parser("evaluate", help="(testing) compare results.json with a synthetic clip's ground truth")
     p.add_argument("results")

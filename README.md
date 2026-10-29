@@ -3,6 +3,11 @@
 Estimate the speed of baseball (or softball) pitches from video, including
 old camcorder tapes digitized to a file. Free, for Windows.
 
+![A pitch from a 2001 Hi8 tape, with the speed shown](docs/images/demo.gif)
+
+*A pitch from a 2001 Hi8 camcorder tape. "~" and "rough" mean the tape only allows a rough
+number (here ±4 mph).*
+
 ![The Pitch Speed window (example tapes)](docs/images/main.png)
 
 **How it works:** you step through the video and mark two moments per pitch,
@@ -30,6 +35,12 @@ You get:
   halves that.
 - Checked against a Pocket Radar on one YouTube video: 14 of 16 hand-marked
   pitches were inside the tool's range. See [Accuracy](#accuracy).
+
+**Practice with known speeds:** the **Practice** button makes a practice
+video whose pitch speeds are known exactly. Mark it like a real tape, and you
+get a score: how close each speed came, and whether you tend to mark the
+release or the catch early or late. (The practice figures are simple shapes,
+so it trains timing, not reading a real pitcher's arm.)
 
 There is also an **experimental automatic mode** that finds the pitches by
 itself on a fixed camera. It has only been tested on computer-made videos so
@@ -85,6 +96,9 @@ anywhere and open `PitchSpeed.exe` in the `PitchSpeed` folder.
   (experimental)...** has only been tested on computer-made videos so far:
   check the pitches it finds. It asks where the camera was, then opens the click-the-points window, finds the
   pitches, and opens the review window.
+- **Practice** makes a video with known speeds (once; "New video" makes another
+  with different pitches), opens it for marking, and shows your score
+  afterwards. From the command line: `pitchspeed practice`.
 - **Check / fix pitches**, **Make clips**, **Make full video** and **Open
   results folder** work on the tape selected in the list. A progress window
   shows each step, with the time left where it is known.
