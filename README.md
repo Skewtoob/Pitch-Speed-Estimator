@@ -266,13 +266,12 @@ spot is magnified 3x. **+** / **-** zoom in and out (whole pictures, 1.5x
 to 8x). **G** or **Esc** goes back to the normal view. Marks you've made
 show on the pictures (R, C, B). G works in `pitchspeed review` too.
 
-**Tip: work backwards from the ball.** The release comes later than it
-looks: while the arm is cocked back and coming over the top, the ball is
-still in the hand. Find the ball in the air a few pictures later, then step
-back with **A** while it is still clear of the hand. The earliest picture
-where it is clear of the hand is the release. If you can't see the ball
-near the hand at all, a rough guide: it leaves when the hand is out in
-front of the head, just before the arm whips down across the body.
+**Careful with the release.** Right after it leaves the hand the ball is
+often in front of the pitcher's body and can't be seen, so the first
+picture where you can *see* it clear of the hand may be a frame or two
+after the real release. Marking there makes the speed read too high. Use
+the arm as well: the ball leaves when the hand is out in front of the head,
+just before the arm whips down across the body.
 
 **How accurate is it?** In a simulation where a quarter of the marks were
 one field off, hand-marked speeds were typically within about 2-3 mph
