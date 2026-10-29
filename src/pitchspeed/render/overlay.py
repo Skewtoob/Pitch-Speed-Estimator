@@ -961,7 +961,7 @@ class _WindowContext:
     def render(self, s0: int, s1: int) -> dict:
         from pitchspeed.io.display import sample_to_display
         t0 = float(self.source.sample_time(s0))
-        written = fillers = 0
+        written = fillers = dropped = 0
         for sample in self.source.iter_samples(s0, s1, color=True):
             missing = round_half_up((float(sample.t) - t0) / self.out_dt) - written
             if missing > self.max_fill:
@@ -971,13 +971,18 @@ class _WindowContext:
                 n_fill = self._fill(t0, written, min(missing, self.max_fill))
                 written += n_fill
                 fillers += n_fill
+            elif missing < 0:                  # more pictures than the output rate holds (variable
+                self.done += 1                 # frame rate): drop this one so the picture keeps
+                dropped += 1                   # source time and stays in sync with the sound
+                continue
             img, A = sample_to_display(sample, self.sar, self.size, is_field=self.interlaced)
             self.writer.write(self.drawer.draw(img, A, sample.s, float(sample.t), sample.frame))
             written += 1
             self.done += 1
             if self.done % 30 == 0:
                 _report_progress(self.progress, self.done, self.total)
-        return {"s_start": s0, "s_end": s1, "t_start": t0, "frames": written, "fillers": fillers}
+        return {"s_start": s0, "s_end": s1, "t_start": t0, "frames": written, "fillers": fillers,
+                "dropped": dropped}
 
 
 def _default_writer(path, width, height, fps, audio_src=None, audio_start_s=0.0, audio_duration_s=None):

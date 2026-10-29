@@ -124,8 +124,10 @@ def video_span(path: str) -> Optional[tuple[float, int]]:
     return max(ts) - min(ts) + (1.0 / rate if rate > 0 else 0.0), len(ts)
 
 
-def _copy(exe: str, src: str, ss: float, duration: float, target: str) -> tuple[Optional[str], str]:
-    """One ffmpeg stream copy into `target` (another free name if it is locked)."""
+def _copy(exe: str, src: str, ss: float, duration: float, target: str) -> tuple[Optional[str], str, str]:
+    """One ffmpeg stream copy into a temporary file next to `target` (another free name if
+    `target` is locked).  Returns (tmp, final_target, error); the caller checks tmp and only then
+    replaces final_target with it, so a bad copy never costs an existing good one."""
     if not can_write(target):
         target = alternative_path(target)
     tmp = os.path.splitext(target)[0] + ".part" + os.path.splitext(target)[1]
@@ -135,18 +137,13 @@ def _copy(exe: str, src: str, ss: float, duration: float, target: str) -> tuple[
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_S, creationflags=_NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as e:
-        return None, f"ffmpeg could not run ({e})"
+        return None, target, f"ffmpeg could not run ({e})"
     ok = p.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0
     if not ok:
         err = p.stderr.decode("utf-8", "replace").strip()[-300:]
         _remove(tmp)
-        return None, f"ffmpeg exit code {p.returncode}" + (f": {err}" if err else "")
-    try:
-        os.replace(tmp, target)
-    except OSError as e:
-        _remove(tmp)
-        return None, f"could not write {os.path.basename(target)}: {e}"
-    return target, ""
+        return None, target, f"ffmpeg exit code {p.returncode}" + (f": {err}" if err else "")
+    return tmp, target, ""
 
 
 def _remove(path: Optional[str]) -> None:
@@ -178,14 +175,19 @@ def cut_original(src: str, t_start: float, duration: float, out_path: str,
         refused = False
         for lead in LEADS_S:
             lead = min(lead, want)
-            path, err = _copy(exe, src, want - lead, float(duration) + lead, target)
-            if path is None:
+            tmp, path, err = _copy(exe, src, want - lead, float(duration) + lead, target)
+            if tmp is None:
                 problem, refused = err, True          # this container did not work: try the next one
                 break
-            span = video_span(path)
+            span = video_span(tmp)
             if span is not None and span[1] > 0 and span[0] >= float(duration) - COVER_TOL_S:
+                try:
+                    os.replace(tmp, path)             # only a checked copy replaces the old file
+                except OSError as e:
+                    _remove(tmp)
+                    return None, f"failed: could not write {os.path.basename(path)}: {e}"
                 return path, "copied" if path == out_path else f"copied as {os.path.basename(path)}"
-            _remove(path)                             # never keep a copy that misses the pitch
+            _remove(tmp)                              # never keep a copy that misses the pitch
             problem = ("the copy held no picture" if span is None or span[1] == 0 else
                        "the copy started after the pitch (the file's key frames are far apart)")
             if lead >= want:                          # cannot start any earlier

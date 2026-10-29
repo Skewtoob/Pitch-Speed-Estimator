@@ -200,6 +200,7 @@ def _apply_settings_flags(args, cf, path: str) -> list[str]:
 def _open_source(video: str, field_order: Optional[str] = None, par: Optional[float] = None):
     from pitchspeed.io.reader import VideoReader
     from pitchspeed.io.interlace import SampleSource, detect_scan
+    print("Reading the video (a long tape can take a few minutes the first time) ...", flush=True)
     reader = VideoReader(video, sar_override=par)
     fo = None if field_order in (None, "auto") else field_order
     scan = detect_scan(reader, override=fo)

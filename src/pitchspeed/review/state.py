@@ -1187,7 +1187,8 @@ class ReviewState:
             return
         target = self._clamp(cur + step)
         before_s = self.s
-        self._set_event(kind, target)
+        point = getattr(e.pitch.catch, "point", None) if kind == "catch" else None
+        self._set_event(kind, target, point=point)     # a nudged B mark stays bat contact
         # e, not current_pitch(): the shown field may now be just over PITCH_MARGIN from the pitch
         moved = self.ev_s(e.pitch.release if kind == "release" else e.pitch.catch)
         self.s = moved if moved is not None else before_s
