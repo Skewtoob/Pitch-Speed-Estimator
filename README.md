@@ -273,6 +273,11 @@ after the real release. Marking there makes the speed read too high. Use
 the arm as well: the ball leaves when the hand is out in front of the head,
 just before the arm whips down across the body.
 
+**Careful with the catch.** The catcher squeezes the glove a little after
+the ball gets there. Mark the first picture where the ball **reaches** the
+glove (it disappears into it, or the glove gets knocked back), not the
+squeeze. Each picture late makes the speed read about 2-5 mph too low.
+
 **How accurate is it?** In a simulation where a quarter of the marks were
 one field off, hand-marked speeds were typically within about 2-3 mph
 (3-4 %), and the shown ± and 90% range matched what really happened. That
