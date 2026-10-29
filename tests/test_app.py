@@ -138,3 +138,17 @@ def test_fastball_average_takes_the_fast_group():
     m, pm, n = fastball_average([80, 81, 79, 82])            # one group: all of them
     assert n == 4 and abs(m - 80.5) < 1e-9
     assert fastball_average([]) == (None, None, 0) and fastball_average([80])[1] is None
+
+
+def test_text_stays_dark_even_when_the_system_uses_dark_mode(qapp):
+    from PySide6.QtGui import QColor, QPalette
+    from pitchspeed.app.main import setup_app
+    dark = QPalette()
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        dark.setColor(role, QColor("white"))
+    qapp.setPalette(dark)                            # what Windows dark mode hands Qt
+    setup_app(qapp)
+    pal = qapp.palette()
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        assert pal.color(role).lightness() < 80
+    assert pal.color(QPalette.ColorRole.Base).lightness() > 200

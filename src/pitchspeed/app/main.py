@@ -12,7 +12,7 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QImage, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox,
@@ -29,6 +29,10 @@ UI_SCALES = [("Normal", 1.0), ("Large", 1.25), ("Larger", 1.5), ("Largest", 2.0)
 ORG, APP = "PitchSpeed", "PitchSpeed"
 STYLE_SHEET = """
 QMainWindow, QDialog { background: #f4f5f7; }
+QWidget { color: #1d2330; }
+QTableWidget, QPlainTextEdit, QComboBox, QComboBox QAbstractItemView { color: #1d2330; background: white;
+    selection-background-color: #2f6fbf; selection-color: white; }
+QRadioButton, QCheckBox { color: #1d2330; }
 QLabel#title { font-size: 22px; font-weight: 600; color: #1d2b4f; }
 QLabel#subtitle { color: #5a6275; }
 QPushButton { padding: 7px 14px; border-radius: 6px; border: 1px solid #c5cad6; background: white; }
@@ -42,6 +46,29 @@ QHeaderView::section { background: #eceff5; padding: 6px; border: none; font-wei
 QProgressBar { border: 1px solid #c5cad6; border-radius: 5px; background: white; height: 18px; text-align: center; }
 QProgressBar::chunk { background: #c8202e; border-radius: 4px; }
 """
+
+
+def light_palette() -> QPalette:
+    """Always the light look: on Windows in dark mode Qt would otherwise pick white text,
+    which the light backgrounds above make invisible."""
+    pal = QPalette()
+    for role, color in ((QPalette.ColorRole.Window, "#f4f5f7"), (QPalette.ColorRole.WindowText, "#1d2330"),
+                        (QPalette.ColorRole.Base, "#ffffff"), (QPalette.ColorRole.AlternateBase, "#f0f2f6"),
+                        (QPalette.ColorRole.Text, "#1d2330"), (QPalette.ColorRole.Button, "#ffffff"),
+                        (QPalette.ColorRole.ButtonText, "#1d2330"), (QPalette.ColorRole.ToolTipBase, "#ffffe0"),
+                        (QPalette.ColorRole.ToolTipText, "#1d2330"), (QPalette.ColorRole.Highlight, "#2f6fbf"),
+                        (QPalette.ColorRole.HighlightedText, "#ffffff"), (QPalette.ColorRole.PlaceholderText, "#808590")):
+        pal.setColor(role, QColor(color))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#a0a5b0"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#a0a5b0"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#a0a5b0"))
+    return pal
+
+
+def setup_app(app) -> None:
+    app.setStyle("Fusion")                        # same look everywhere, ignores the dark system theme
+    app.setPalette(light_palette())
+    app.setStyleSheet(STYLE_SHEET)
 
 
 def resource(name: str) -> str:
@@ -551,7 +578,7 @@ def main(argv: Optional[list] = None) -> int:
     app = QApplication(argv)
     app.setApplicationName("Pitch Speed")
     app.setOrganizationName(ORG)
-    app.setStyleSheet(STYLE_SHEET)
+    setup_app(app)
     if "--selftest" in argv:                     # build check: the window can be made, then quit
         w = MainWindow(QSettings(os.path.join(os.path.expanduser("~"), ".pitchspeed-selftest.ini"),
                                  QSettings.Format.IniFormat))
